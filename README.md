@@ -36,7 +36,8 @@ extern crate queue_file;
 use queue_file::QueueFile;
 
 fn main() {
-    let mut qf = QueueFile::open("example.qf").expect("cannot open queue file");
+    let mut qf = QueueFile::open("example.qf")
+        .expect("cannot open queue file");
 
     qf.add("ELEMENT #1".as_bytes()).expect("add failed");
     qf.add("ELEMENT #2".as_bytes()).expect("add failed");
