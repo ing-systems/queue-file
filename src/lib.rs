@@ -1,19 +1,17 @@
-/*
- * Java version: Copyright (C) 2010 Square, Inc.
- * Rust version: Copyright (C) 2019 ING Systems
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Java version: Copyright (C) 2010 Square, Inc.
+// Rust version: Copyright (C) 2019 ING Systems
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! `queue-file` crate is a feature complete and binary compatible port of `QueueFile` class from
 //! Tape2 by Square, Inc. Check [here](https://github.com/square/tape) the original project.
@@ -53,7 +51,8 @@ error_chain! {
         }
         UnsupportedVersion(detected: u32, supported: u32) {
             description("unsupported version")
-            display("unsupported version {}. supported versions is {} and legacy", detected, supported)
+            display("unsupported version {}. supported versions is {} and legacy",
+                detected, supported)
         }
     }
 }
@@ -142,8 +141,8 @@ pub struct QueueFile {
 }
 
 impl QueueFile {
-    const VERSIONED_HEADER: u32 = 0x8000_0001;
     const INITIAL_LENGTH: u64 = 4096;
+    const VERSIONED_HEADER: u32 = 0x8000_0001;
     const ZEROES: [u8; 4096] = [0; 4096];
 
     fn init(path: &Path, force_legacy: bool) -> Result<()> {
@@ -151,11 +150,8 @@ impl QueueFile {
 
         // Use a temp file so we don't leave a partially-initialized file.
         {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&tmp_path)?;
+            let mut file =
+                OpenOptions::new().read(true).write(true).create(true).open(&tmp_path)?;
 
             file.set_len(QueueFile::INITIAL_LENGTH)?;
             file.seek(SeekFrom::Start(0))?;
@@ -187,9 +183,7 @@ impl QueueFile {
     }
 
     fn open_internal<P: AsRef<Path>>(
-        path: P,
-        overwrite_on_remove: bool,
-        force_legacy: bool,
+        path: P, overwrite_on_remove: bool, force_legacy: bool,
     ) -> Result<QueueFile> {
         if !path.as_ref().exists() {
             QueueFile::init(path.as_ref(), force_legacy)?;
@@ -358,12 +352,8 @@ impl QueueFile {
         // Write data.
         self.ring_write(new_last.pos + Element::HEADER_LENGTH as u64, buf, 0, len)?;
 
-        // Commit the addition. If wasEmpty, first == last.
-        let first_pos = if was_empty {
-            new_last.pos
-        } else {
-            self.first.pos
-        };
+        // Commit the addition. If was empty, first == last.
+        let first_pos = if was_empty { new_last.pos } else { self.first.pos };
         self.write_header(self.file_len, self.elem_cnt + 1, first_pos, new_last.pos)?;
         self.last = new_last;
         self.elem_cnt += 1;
@@ -383,12 +373,7 @@ impl QueueFile {
             let len = self.first.len;
             let mut data = vec![0; len as usize].into_boxed_slice();
 
-            self.ring_read(
-                self.first.pos + Element::HEADER_LENGTH as u64,
-                &mut data,
-                0,
-                len,
-            )?;
+            self.ring_read(self.first.pos + Element::HEADER_LENGTH as u64, &mut data, 0, len)?;
 
             Ok(Some(data))
         }
@@ -429,12 +414,7 @@ impl QueueFile {
         }
 
         // Commit the header.
-        self.write_header(
-            self.file_len,
-            self.elem_cnt - n,
-            new_first_pos,
-            self.last.pos,
-        )?;
+        self.write_header(self.file_len, self.elem_cnt - n, new_first_pos, self.last.pos)?;
         self.elem_cnt -= n;
         self.first = Element::new(new_first_pos, new_first_len);
 
@@ -472,11 +452,7 @@ impl QueueFile {
     pub fn iter(&mut self) -> Iter<'_> {
         let pos = self.first.pos;
 
-        Iter {
-            queue_file: self,
-            next_elem_index: 0,
-            next_elem_pos: pos,
-        }
+        Iter { queue_file: self, next_elem_index: 0, next_elem_pos: pos }
     }
 
     fn used_bytes(&self) -> u64 {
@@ -500,15 +476,11 @@ impl QueueFile {
     }
 
     /// Writes header atomically. The arguments contain the updated values. The struct member fields
-    /// should not have changed yet. This only updates the state in the file. It's up to the caller to
-    /// update the class member variables *after* this call succeeds. Assumes segment writes are
+    /// should not have changed yet. This only updates the state in the file. It's up to the caller
+    /// to update the class member variables *after* this call succeeds. Assumes segment writes are
     /// atomic in the underlying file system.
     fn write_header(
-        &mut self,
-        file_len: u64,
-        elem_cnt: usize,
-        first_pos: u64,
-        last_pos: u64,
+        &mut self, file_len: u64, elem_cnt: usize, first_pos: u64, last_pos: u64,
     ) -> io::Result<()> {
         self.header_buf.clear();
 
@@ -560,11 +532,7 @@ impl QueueFile {
 
     /// Wraps the position if it exceeds the end of the file.
     fn wrap_pos(&self, pos: u64) -> u64 {
-        if pos < self.file_len {
-            pos
-        } else {
-            self.header_len + pos - self.file_len
-        }
+        if pos < self.file_len { pos } else { self.header_len + pos - self.file_len }
     }
 
     /// Writes `n` bytes from buffer to position in file. Automatically wraps write if position is
@@ -591,7 +559,9 @@ impl QueueFile {
 
         while len > 0 {
             let chunk_len = min(len, QueueFile::ZEROES.len() as i64);
+
             self.ring_write(pos, &QueueFile::ZEROES, 0, chunk_len as usize)?;
+
             len -= chunk_len;
             pos += chunk_len as u64;
         }
@@ -670,7 +640,7 @@ impl QueueFile {
 
 // I/O Helpers
 impl QueueFile {
-    const TRANSFER_BUFFER_SIZE: usize = 128 * 1024; // 128KB
+    const TRANSFER_BUFFER_SIZE: usize = 128 * 1024;
 
     fn seek(&mut self, pos: u64) -> io::Result<u64> {
         self.file.seek(SeekFrom::Start(pos))
@@ -681,19 +651,11 @@ impl QueueFile {
     }
 
     fn write_to_file(
-        file: &mut File,
-        sync_writes: bool,
-        buf: &[u8],
-        off: usize,
-        n: usize,
+        file: &mut File, sync_writes: bool, buf: &[u8], off: usize, n: usize,
     ) -> io::Result<()> {
         file.write_all(&buf[off..off + n])?;
 
-        if sync_writes {
-            file.sync_data()
-        } else {
-            Ok(())
-        }
+        if sync_writes { file.sync_data() } else { Ok(()) }
     }
 
     fn write(&mut self, buf: &[u8], off: usize, n: usize) -> io::Result<()> {
@@ -745,8 +707,8 @@ struct Element {
 }
 
 impl Element {
-    const HEADER_LENGTH: usize = 4;
     const EMPTY: Element = Element { pos: 0, len: 0 };
+    const HEADER_LENGTH: usize = 4;
 
     fn new(pos: u64, len: usize) -> Self {
         assert!(
@@ -779,14 +741,10 @@ impl<'a> Iterator for Iter<'a> {
         }
 
         let current = self.queue_file.read_element(self.next_elem_pos).ok()?;
-        self.next_elem_pos = self
-            .queue_file
-            .wrap_pos(current.pos + Element::HEADER_LENGTH as u64);
+        self.next_elem_pos = self.queue_file.wrap_pos(current.pos + Element::HEADER_LENGTH as u64);
 
         let mut data = vec![0; current.len].into_boxed_slice();
-        self.queue_file
-            .ring_read(self.next_elem_pos, &mut data, 0, current.len)
-            .ok()?;
+        self.queue_file.ring_read(self.next_elem_pos, &mut data, 0, current.len).ok()?;
 
         self.next_elem_pos = self
             .queue_file
@@ -826,10 +784,8 @@ mod tests {
 
     fn gen_rand_file_name() -> String {
         let mut rng = thread_rng();
-        let mut file_name = iter::repeat(())
-            .map(|()| rng.sample(Alphanumeric))
-            .take(16)
-            .collect::<String>();
+        let mut file_name =
+            iter::repeat(()).map(|()| rng.sample(Alphanumeric)).take(16).collect::<String>();
 
         file_name.push_str(".qf");
 
@@ -958,13 +914,10 @@ mod tests {
     }
 
     fn add_rand_n_elems(
-        q: &mut VecDeque<Box<[u8]>>,
-        qf: &mut QueueFile,
-        min_n: usize,
-        max_n: usize,
-        min_data_size: usize,
-        max_data_size: usize,
-    ) -> usize {
+        q: &mut VecDeque<Box<[u8]>>, qf: &mut QueueFile, min_n: usize, max_n: usize,
+        min_data_size: usize, max_data_size: usize,
+    ) -> usize
+    {
         let mut rng = thread_rng();
 
         let n = rng.gen_range(min_n, max_n);
@@ -981,20 +934,13 @@ mod tests {
     }
 
     fn verify_rand_n_elems(
-        q: &mut VecDeque<Box<[u8]>>,
-        qf: &mut QueueFile,
-        min_n: usize,
-        max_n: usize,
+        q: &mut VecDeque<Box<[u8]>>, qf: &mut QueueFile, min_n: usize, max_n: usize,
     ) -> usize {
         if qf.is_empty() {
             return 0;
         }
 
-        let n = if qf.size() == 1 {
-            1
-        } else {
-            thread_rng().gen_range(min_n, max_n)
-        };
+        let n = if qf.size() == 1 { 1 } else { thread_rng().gen_range(min_n, max_n) };
 
         for _ in 0..n {
             let d0 = q.pop_front().unwrap();
@@ -1008,16 +954,10 @@ mod tests {
     }
 
     fn simulate_use(
-        path: &Path,
-        mut qf: QueueFile,
-        iters: usize,
-        min_n: usize,
-        max_n: usize,
-        min_data_size: usize,
-        max_data_size: usize,
-        clear_prob: f64,
-        reopen_prob: f64,
-    ) {
+        path: &Path, mut qf: QueueFile, iters: usize, min_n: usize, max_n: usize,
+        min_data_size: usize, max_data_size: usize, clear_prob: f64, reopen_prob: f64,
+    )
+    {
         let mut q: VecDeque<Box<[u8]>> = VecDeque::with_capacity(128);
 
         add_rand_n_elems(&mut q, &mut qf, min_n, max_n, min_data_size, max_data_size);
