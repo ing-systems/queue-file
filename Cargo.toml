@@ -1,0 +1,21 @@
+[package]
+name = "queue-file"
+version = "1.0.0"
+license = "Apache-2.0"
+authors = ["ING Systems <contact@ing-systems.com>"]
+description = "queue-file is a lightning-fast, transactional, file-based FIFO"
+edition = "2018"
+homepage = "https://github.com/ing-systems/queue-file"
+repository = "https://github.com/ing-systems/queue-file"
+readme = "README.md"
+keywords = ["io", "fifo", "queue"]
+categories = ["data-structures"]
+publish = false
+
+[dependencies]
+bytes = "0.4"
+error-chain = "0.12"
+
+[dev-dependencies]
+pretty_assertions = "0.6"
+rand = "0.6"
