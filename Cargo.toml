@@ -10,7 +10,6 @@ repository = "https://github.com/ing-systems/queue-file"
 readme = "README.md"
 keywords = ["io", "fifo", "queue"]
 categories = ["data-structures"]
-publish = false
 
 [dependencies]
 bytes = "0.4"
