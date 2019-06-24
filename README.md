@@ -2,6 +2,7 @@
 
 [![Crate](https://img.shields.io/crates/v/queue-file.svg)](https://crates.io/crates/queue-file)
 [![API](https://docs.rs/queue-file/badge.svg)](https://docs.rs/queue-file)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 queue-file is a lightning-fast, transactional, file-based FIFO.
 
