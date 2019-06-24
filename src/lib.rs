@@ -132,7 +132,7 @@ pub struct QueueFile {
     /// When true, removing an element will also overwrite data with zero bytes.
     /// It's true by default.
     overwrite_on_remove: bool,
-    /// When true,  every write to file will be fallowed by `sync_data()` call.
+    /// When true, every write to file will be fallowed by `sync_data()` call.
     /// It's true by default.
     sync_writes: bool,
     /// Buffer used by `transfer` function.
