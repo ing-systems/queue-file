@@ -9,26 +9,27 @@ sudo: required
 env:
   global:
     - CRATE_NAME=queue-file
+    - DISABLE_TESTS=1
 
 matrix:
   include:
     # Android
-    - env: TARGET=aarch64-linux-android DISABLE_TESTS=1
-    - env: TARGET=arm-linux-androideabi DISABLE_TESTS=1
-    - env: TARGET=armv7-linux-androideabi DISABLE_TESTS=1
-    - env: TARGET=i686-linux-android DISABLE_TESTS=1
-    - env: TARGET=x86_64-linux-android DISABLE_TESTS=1
+    - env: TARGET=aarch64-linux-android
+    - env: TARGET=arm-linux-androideabi
+    - env: TARGET=armv7-linux-androideabi
+    - env: TARGET=i686-linux-android
+    - env: TARGET=x86_64-linux-android
 
     # iOS
-    - env: TARGET=aarch64-apple-ios DISABLE_TESTS=1
+    - env: TARGET=aarch64-apple-ios
       os: osx
-    - env: TARGET=armv7-apple-ios DISABLE_TESTS=1
+    - env: TARGET=armv7-apple-ios
       os: osx
-    - env: TARGET=armv7s-apple-ios DISABLE_TESTS=1
+    - env: TARGET=armv7s-apple-ios
       os: osx
-    - env: TARGET=i386-apple-ios DISABLE_TESTS=1
+    - env: TARGET=i386-apple-ios
       os: osx
-    - env: TARGET=x86_64-apple-ios DISABLE_TESTS=1
+    - env: TARGET=x86_64-apple-ios
       os: osx
 
     # Linux
@@ -44,7 +45,7 @@ matrix:
     - env: TARGET=powerpc-unknown-linux-gnu
     - env: TARGET=powerpc64-unknown-linux-gnu
     - env: TARGET=powerpc64le-unknown-linux-gnu
-    - env: TARGET=s390x-unknown-linux-gnu DISABLE_TESTS=1
+    - env: TARGET=s390x-unknown-linux-gnu
     - env: TARGET=x86_64-unknown-linux-gnu
     - env: TARGET=x86_64-unknown-linux-musl
 
@@ -55,13 +56,13 @@ matrix:
       os: osx
 
     # *BSD
-    - env: TARGET=i686-unknown-freebsd DISABLE_TESTS=1
-    - env: TARGET=x86_64-unknown-freebsd DISABLE_TESTS=1
-    - env: TARGET=x86_64-unknown-netbsd DISABLE_TESTS=1
+    - env: TARGET=i686-unknown-freebsd
+    - env: TARGET=x86_64-unknown-freebsd
+    - env: TARGET=x86_64-unknown-netbsd
 
     # rustc minimum version.
-    - env: TARGET=x86_64-unknown-linux-gnu DISABLE_TESTS=1
-      rust: 1.31.0
+    - env: TARGET=x86_64-unknown-linux-gnu
+      rust: 1.32.0
 
 before_install:
   - set -e
