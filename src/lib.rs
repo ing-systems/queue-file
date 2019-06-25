@@ -365,7 +365,7 @@ impl QueueFile {
         Ok(())
     }
 
-    /// Reads the eldest element. Returns `OK(Some(None))` if the queue is empty.
+    /// Reads the eldest element. Returns `OK(None)` if the queue is empty.
     pub fn peek(&mut self) -> Result<Option<Box<[u8]>>> {
         if self.is_empty() {
             Ok(None)
