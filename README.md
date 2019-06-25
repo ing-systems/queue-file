@@ -12,7 +12,7 @@ Addition and removal from an instance is an O(1) operation and is atomic.
 Writes are synchronous by default; data will be written to disk before an operation returns.
 
 queue-file crate is a feature complete and binary compatible port of `QueueFile` class from
-Tape2 by Square, Inc. Check [here](https://github.com/square/tape) the original project.
+Tape2 by Square, Inc. Check the original project [here](https://github.com/square/tape).
 
 [Documentation](https://docs.rs/queue-file)
 
