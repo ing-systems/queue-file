@@ -304,6 +304,7 @@ impl QueueFile {
         self.sync_writes
     }
 
+    /// If set to true every write to file will be followed by `sync_data()` call.
     pub fn set_sync_writes(&mut self, value: bool) {
         self.sync_writes = value
     }
