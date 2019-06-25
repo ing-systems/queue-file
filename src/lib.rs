@@ -294,6 +294,7 @@ impl QueueFile {
         self.overwrite_on_remove
     }
 
+    /// If set to true removing an element will also overwrite data with zero bytes.
     pub fn set_overwrite_on_remove(&mut self, value: bool) {
         self.overwrite_on_remove = value
     }
