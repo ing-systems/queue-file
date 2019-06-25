@@ -289,6 +289,7 @@ impl QueueFile {
         Ok(queue_file)
     }
 
+    /// Returns true if removing an element will also overwrite data with zero bytes.
     pub fn get_overwrite_on_remove(&self) -> bool {
         self.overwrite_on_remove
     }
