@@ -269,8 +269,6 @@ impl QueueFile {
             )));
         }
 
-        let sync_writes = if cfg!(not(test)) { true } else { false };
-
         let mut queue_file = QueueFile {
             file,
             versioned,
@@ -280,7 +278,7 @@ impl QueueFile {
             first: Element::EMPTY,
             last: Element::EMPTY,
             overwrite_on_remove,
-            sync_writes,
+            sync_writes: cfg!(not(test)),
             header_buf: BytesMut::with_capacity(32),
             transfer_buf: vec![0u8; Self::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
         };
