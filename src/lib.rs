@@ -298,6 +298,7 @@ impl QueueFile {
         self.overwrite_on_remove = value
     }
 
+    /// Returns true if every write to file will be followed by `sync_data()` call.
     pub fn get_sync_writes(&self) -> bool {
         self.sync_writes
     }
