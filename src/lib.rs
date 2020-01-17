@@ -19,11 +19,10 @@
 // `error_chain!` can recurse deeply
 #![recursion_limit = "1024"]
 
-#[macro_use]
-extern crate error_chain;
 #[cfg(test)]
 extern crate pretty_assertions;
 
+use snafu::{ensure, Snafu};
 use std::cmp::min;
 use std::fs::{rename, File, OpenOptions};
 use std::io;
@@ -33,29 +32,25 @@ use std::path::Path;
 
 use bytes::{Buf, BufMut, BytesMut};
 
-error_chain! {
-    foreign_links {
-        Io(::std::io::Error);
-    }
-
-    errors {
-        TooManyElements {
-            description("too many elements")
-        }
-        ElementTooBig {
-            description("element too big")
-        }
-        CorruptedFile(msg: String) {
-            description("corrupted file")
-            display("corrupted file: {}", msg)
-        }
-        UnsupportedVersion(detected: u32, supported: u32) {
-            description("unsupported version")
-            display("unsupported version {}. supported versions is {} and legacy",
-                detected, supported)
-        }
-    }
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(context(false))]
+    Io { source: std::io::Error },
+    #[snafu(display("too many elements"))]
+    TooManyElements {},
+    #[snafu(display("element too big"))]
+    ElementTooBig {},
+    #[snafu(display("corrupted file: {}", msg))]
+    CorruptedFile { msg: String },
+    #[snafu(display(
+        "unsupported version {}. supported versions is {} and legacy",
+        detected,
+        supported
+    ))]
+    UnsupportedVersion { detected: u32, supported: u32 },
 }
+
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// QueueFile is a lightning-fast, transactional, file-based FIFO.
 ///
@@ -196,9 +191,7 @@ impl QueueFile {
         file.seek(SeekFrom::Start(0))?;
         let bytes_read = file.read(&mut buf)?;
 
-        if bytes_read < 32 {
-            bail!(ErrorKind::CorruptedFile("file too short".into()));
-        }
+        ensure!(bytes_read >= 32, CorruptedFile { msg: "file too short" });
 
         let versioned = !force_legacy && (buf[0] & 0x80) != 0;
 
@@ -215,9 +208,7 @@ impl QueueFile {
 
             let version = buf.get_u32() & 0x7FFF_FFFF;
 
-            if version != 1 {
-                bail!(ErrorKind::UnsupportedVersion(version, 1));
-            }
+            ensure!(version == 1, UnsupportedVersion { detected: version, supported: 1u32 });
 
             file_len = buf.get_u64();
             elem_cnt = buf.get_u32() as usize;
@@ -244,30 +235,21 @@ impl QueueFile {
 
         let real_file_len = file.metadata()?.len();
 
-        if file_len > real_file_len {
-            bail!(ErrorKind::CorruptedFile(format!(
+        ensure!(file_len <= real_file_len, CorruptedFile {
+            msg: format!(
                 "file is truncated. expected length was {} but actual length is {}",
                 file_len, real_file_len
-            )));
-        }
-        if file_len <= header_len {
-            bail!(ErrorKind::CorruptedFile(format!(
-                "length stored in header ({}) is invalid",
-                file_len
-            )));
-        }
-        if first_pos > file_len {
-            bail!(ErrorKind::CorruptedFile(format!(
-                "position of the first element ({}) is beyond the file",
-                first_pos
-            )));
-        }
-        if last_pos > file_len {
-            bail!(ErrorKind::CorruptedFile(format!(
-                "position of the last element ({}) is beyond the file",
-                last_pos
-            )));
-        }
+            )
+        });
+        ensure!(file_len >= header_len, CorruptedFile {
+            msg: format!("length stored in header ({}) is invalid", file_len)
+        });
+        ensure!(first_pos <= file_len, CorruptedFile {
+            msg: format!("position of the first element ({}) is beyond the file", first_pos)
+        });
+        ensure!(last_pos <= file_len, CorruptedFile {
+            msg: format!("position of the last element ({}) is beyond the file", last_pos)
+        });
 
         let mut queue_file = QueueFile {
             file,
@@ -321,15 +303,11 @@ impl QueueFile {
 
     /// Adds an element to the end of the queue.
     pub fn add(&mut self, buf: &[u8]) -> Result<()> {
-        if self.elem_cnt + 1 > i32::max_value() as usize {
-            bail!(ErrorKind::TooManyElements);
-        }
+        ensure!(self.elem_cnt + 1 < i32::max_value() as usize, TooManyElements {});
 
         let len = buf.len();
 
-        if len > i32::max_value() as usize {
-            bail!(ErrorKind::ElementTooBig);
-        }
+        ensure!(len <= i32::max_value() as usize, ElementTooBig {});
 
         self.expand_if_necessary(len)?;
 
