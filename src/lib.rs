@@ -31,7 +31,7 @@ use std::io::prelude::*;
 use std::io::SeekFrom;
 use std::path::Path;
 
-use bytes::{Buf, BufMut, BytesMut, IntoBuf};
+use bytes::{Buf, BufMut, BytesMut};
 
 error_chain! {
     foreign_links {
@@ -159,10 +159,10 @@ impl QueueFile {
             let mut buf = BytesMut::with_capacity(16);
 
             if force_legacy {
-                buf.put_u32_be(QueueFile::INITIAL_LENGTH as u32);
+                buf.put_u32(QueueFile::INITIAL_LENGTH as u32);
             } else {
-                buf.put_u32_be(QueueFile::VERSIONED_HEADER);
-                buf.put_u64_be(QueueFile::INITIAL_LENGTH);
+                buf.put_u32(QueueFile::VERSIONED_HEADER);
+                buf.put_u64(QueueFile::INITIAL_LENGTH);
             }
 
             file.write_all(buf.as_ref())?;
@@ -208,21 +208,21 @@ impl QueueFile {
         let first_pos: u64;
         let last_pos: u64;
 
-        let mut buf = buf.into_buf();
+        let mut buf = BytesMut::from(&buf[..]);
 
         if versioned {
             header_len = 32;
 
-            let version = buf.get_u32_be() & 0x7FFF_FFFF;
+            let version = buf.get_u32() & 0x7FFF_FFFF;
 
             if version != 1 {
                 bail!(ErrorKind::UnsupportedVersion(version, 1));
             }
 
-            file_len = buf.get_u64_be();
-            elem_cnt = buf.get_u32_be() as usize;
-            first_pos = buf.get_u64_be();
-            last_pos = buf.get_u64_be();
+            file_len = buf.get_u64();
+            elem_cnt = buf.get_u32() as usize;
+            first_pos = buf.get_u64();
+            last_pos = buf.get_u64();
 
             assert!(file_len <= i64::max_value() as u64);
             assert!(elem_cnt <= i32::max_value() as usize);
@@ -231,10 +231,10 @@ impl QueueFile {
         } else {
             header_len = 16;
 
-            file_len = u64::from(buf.get_u32_be());
-            elem_cnt = buf.get_u32_be() as usize;
-            first_pos = u64::from(buf.get_u32_be());
-            last_pos = u64::from(buf.get_u32_be());
+            file_len = u64::from(buf.get_u32());
+            elem_cnt = buf.get_u32() as usize;
+            first_pos = u64::from(buf.get_u32());
+            last_pos = u64::from(buf.get_u32());
 
             assert!(file_len <= i32::max_value() as u64);
             assert!(elem_cnt <= i32::max_value() as usize);
@@ -493,21 +493,21 @@ impl QueueFile {
             assert!(first_pos <= i64::max_value() as u64);
             assert!(last_pos <= i64::max_value() as u64);
 
-            self.header_buf.put_u32_be(QueueFile::VERSIONED_HEADER);
-            self.header_buf.put_u64_be(file_len);
-            self.header_buf.put_i32_be(elem_cnt as i32);
-            self.header_buf.put_u64_be(first_pos);
-            self.header_buf.put_u64_be(last_pos);
+            self.header_buf.put_u32(QueueFile::VERSIONED_HEADER);
+            self.header_buf.put_u64(file_len);
+            self.header_buf.put_i32(elem_cnt as i32);
+            self.header_buf.put_u64(first_pos);
+            self.header_buf.put_u64(last_pos);
         } else {
             assert!(file_len <= i32::max_value() as u64);
             assert!(elem_cnt <= i32::max_value() as usize);
             assert!(first_pos <= i32::max_value() as u64);
             assert!(last_pos <= i32::max_value() as u64);
 
-            self.header_buf.put_i32_be(file_len as i32);
-            self.header_buf.put_i32_be(elem_cnt as i32);
-            self.header_buf.put_i32_be(first_pos as i32);
-            self.header_buf.put_i32_be(last_pos as i32);
+            self.header_buf.put_i32(file_len as i32);
+            self.header_buf.put_i32(elem_cnt as i32);
+            self.header_buf.put_i32(first_pos as i32);
+            self.header_buf.put_i32(last_pos as i32);
         }
 
         self.seek(0)?;
@@ -778,7 +778,7 @@ mod tests {
     use super::*;
 
     fn gen_rand_data(size: usize) -> Box<[u8]> {
-        let mut buf = vec![0u8; size];;
+        let mut buf = vec![0u8; size];
         thread_rng().fill(buf.as_mut_slice());
 
         buf.into_boxed_slice()

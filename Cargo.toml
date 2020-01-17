@@ -12,9 +12,9 @@ keywords = ["io", "fifo", "queue"]
 categories = ["data-structures"]
 
 [dependencies]
-bytes = "0.4"
+bytes = "0.5"
 error-chain = "0.12"
 
 [dev-dependencies]
 pretty_assertions = "0.6"
-rand = "0.6"
+rand = "0.7"
