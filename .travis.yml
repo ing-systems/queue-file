@@ -23,12 +23,6 @@ matrix:
     # iOS
     - env: TARGET=aarch64-apple-ios
       os: osx
-    - env: TARGET=armv7-apple-ios
-      os: osx
-    - env: TARGET=armv7s-apple-ios
-      os: osx
-    - env: TARGET=i386-apple-ios
-      os: osx
     - env: TARGET=x86_64-apple-ios
       os: osx
 
