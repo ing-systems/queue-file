@@ -16,9 +16,6 @@
 //! `queue-file` crate is a feature complete and binary compatible port of `QueueFile` class from
 //! Tape2 by Square, Inc. Check the original project [here](https://github.com/square/tape).
 
-// `error_chain!` can recurse deeply
-#![recursion_limit = "1024"]
-
 #[cfg(test)]
 extern crate pretty_assertions;
 
