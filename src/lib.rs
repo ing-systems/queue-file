@@ -762,7 +762,7 @@ mod tests {
     fn gen_rand_file_name() -> String {
         let mut rng = thread_rng();
         let mut file_name =
-            iter::repeat(()).map(|()| rng.sample(Alphanumeric)).take(16).collect::<String>();
+            iter::repeat(()).map(|()| rng.sample(Alphanumeric)).map(char::from).take(16).collect::<String>();
 
         file_name.push_str(".qf");
 
@@ -897,10 +897,10 @@ mod tests {
     {
         let mut rng = thread_rng();
 
-        let n = rng.gen_range(min_n, max_n);
+        let n = rng.gen_range(min_n..max_n);
 
         for _ in 0..n {
-            let data_size = rng.gen_range(min_data_size, max_data_size);
+            let data_size = rng.gen_range(min_data_size..max_data_size);
             let data = gen_rand_data(data_size);
 
             assert_eq!(qf.add(data.as_ref()).is_ok(), true);
@@ -917,7 +917,7 @@ mod tests {
             return 0;
         }
 
-        let n = if qf.size() == 1 { 1 } else { thread_rng().gen_range(min_n, max_n) };
+        let n = if qf.size() == 1 { 1 } else { thread_rng().gen_range(min_n..max_n) };
 
         for _ in 0..n {
             let d0 = q.pop_front().unwrap();
