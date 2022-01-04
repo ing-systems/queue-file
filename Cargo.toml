@@ -16,5 +16,5 @@ bytes = "1.0"
 snafu = "0.7"
 
 [dev-dependencies]
-pretty_assertions = "0.7"
+pretty_assertions = "1.0"
 rand = "0.8"
