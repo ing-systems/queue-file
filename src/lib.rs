@@ -188,7 +188,7 @@ impl QueueFile {
         file.seek(SeekFrom::Start(0))?;
         let bytes_read = file.read(&mut buf)?;
 
-        ensure!(bytes_read >= 32, CorruptedFile { msg: "file too short" });
+        ensure!(bytes_read >= 32, CorruptedFileSnafu { msg: "file too short" });
 
         let versioned = !force_legacy && (buf[0] & 0x80) != 0;
 
@@ -205,7 +205,7 @@ impl QueueFile {
 
             let version = buf.get_u32() & 0x7FFF_FFFF;
 
-            ensure!(version == 1, UnsupportedVersion { detected: version, supported: 1u32 });
+            ensure!(version == 1, UnsupportedVersionSnafu { detected: version, supported: 1u32 });
 
             file_len = buf.get_u64();
             elem_cnt = buf.get_u32() as usize;
@@ -232,19 +232,19 @@ impl QueueFile {
 
         let real_file_len = file.metadata()?.len();
 
-        ensure!(file_len <= real_file_len, CorruptedFile {
+        ensure!(file_len <= real_file_len, CorruptedFileSnafu {
             msg: format!(
                 "file is truncated. expected length was {} but actual length is {}",
                 file_len, real_file_len
             )
         });
-        ensure!(file_len >= header_len, CorruptedFile {
+        ensure!(file_len >= header_len, CorruptedFileSnafu {
             msg: format!("length stored in header ({}) is invalid", file_len)
         });
-        ensure!(first_pos <= file_len, CorruptedFile {
+        ensure!(first_pos <= file_len, CorruptedFileSnafu {
             msg: format!("position of the first element ({}) is beyond the file", first_pos)
         });
-        ensure!(last_pos <= file_len, CorruptedFile {
+        ensure!(last_pos <= file_len, CorruptedFileSnafu {
             msg: format!("position of the last element ({}) is beyond the file", last_pos)
         });
 
@@ -300,11 +300,11 @@ impl QueueFile {
 
     /// Adds an element to the end of the queue.
     pub fn add(&mut self, buf: &[u8]) -> Result<()> {
-        ensure!(self.elem_cnt + 1 < i32::max_value() as usize, TooManyElements {});
+        ensure!(self.elem_cnt + 1 < i32::max_value() as usize, TooManyElementsSnafu {});
 
         let len = buf.len();
 
-        ensure!(len <= i32::max_value() as usize, ElementTooBig {});
+        ensure!(len <= i32::max_value() as usize, ElementTooBigSnafu {});
 
         self.expand_if_necessary(len)?;
 
