@@ -298,6 +298,11 @@ impl QueueFile {
         self.elem_cnt
     }
 
+    /// Synchronizes the underlying file, look at [File::sync_all] doc for more info.
+    pub fn sync_all(&mut self) -> Result<()> {
+        Ok(self.file.sync_all()?)
+    }
+
     /// Adds an element to the end of the queue.
     pub fn add(&mut self, buf: &[u8]) -> Result<()> {
         ensure!(self.elem_cnt + 1 < i32::max_value() as usize, TooManyElementsSnafu {});
