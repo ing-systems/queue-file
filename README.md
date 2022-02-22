@@ -22,7 +22,7 @@ To use `queue-file`, first add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-queue-file = "1.1"
+queue-file = "1.3"
 ```
 
 Then, add this to your crate root:
