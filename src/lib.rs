@@ -437,7 +437,14 @@ impl QueueFile {
         Iter { queue_file: self, next_elem_index: 0, next_elem_pos: pos }
     }
 
-    fn used_bytes(&self) -> u64 {
+    /// Returns the amount of bytes used by the backed file.
+    /// Always >= [Self::used_bytes].
+    pub fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
+    /// Returns the amount of bytes used by the queue.
+    pub fn used_bytes(&self) -> u64 {
         if self.elem_cnt == 0 {
             self.header_len
         } else if self.last.pos >= self.first.pos {
