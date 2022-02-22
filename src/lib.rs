@@ -114,6 +114,8 @@ pub struct QueueFile {
     header_len: u64,
     /// Cached file length. Always a power of 2.
     file_len: u64,
+    /// Last seek value
+    last_seek: u64,
     /// Number of elements.
     elem_cnt: usize,
     /// Pointer to first (or eldest) element.
@@ -127,9 +129,7 @@ pub struct QueueFile {
     /// It's true by default.
     sync_writes: bool,
     /// Buffer used by `transfer` function.
-    transfer_buf: Box<[u8]>,
-    /// Buffer used by `write_header` function.
-    header_buf: BytesMut,
+    transfer_buf: Option<Box<[u8]>>,
 }
 
 impl QueueFile {
@@ -146,7 +146,6 @@ impl QueueFile {
                 OpenOptions::new().read(true).write(true).create(true).open(&tmp_path)?;
 
             file.set_len(QueueFile::INITIAL_LENGTH)?;
-            file.seek(SeekFrom::Start(0))?;
 
             let mut buf = BytesMut::with_capacity(16);
 
@@ -185,7 +184,6 @@ impl QueueFile {
 
         let mut buf = [0u8; 32];
 
-        file.seek(SeekFrom::Start(0))?;
         let bytes_read = file.read(&mut buf)?;
 
         ensure!(bytes_read >= 32, CorruptedFileSnafu { msg: "file too short" });
@@ -248,18 +246,20 @@ impl QueueFile {
             msg: format!("position of the last element ({}) is beyond the file", last_pos)
         });
 
+        file.rewind()?;
+
         let mut queue_file = QueueFile {
             file,
             versioned,
             header_len,
             file_len,
+            last_seek: 0,
             elem_cnt,
             first: Element::EMPTY,
             last: Element::EMPTY,
             overwrite_on_remove,
             sync_writes: cfg!(not(test)),
-            header_buf: BytesMut::with_capacity(32),
-            transfer_buf: vec![0u8; Self::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
+            transfer_buf: Some(vec![0u8; Self::TRANSFER_BUFFER_SIZE].into_boxed_slice()),
         };
 
         queue_file.first = queue_file.read_element(first_pos)?;
@@ -324,15 +324,10 @@ impl QueueFile {
         let new_last = Element::new(pos, len);
 
         // Write length.
-        self.ring_write(
-            new_last.pos,
-            &(len as u32).to_be_bytes(),
-            0,
-            Element::HEADER_LENGTH as usize,
-        )?;
+        self.ring_write(new_last.pos, &(len as u32).to_be_bytes())?;
 
         // Write data.
-        self.ring_write(new_last.pos + Element::HEADER_LENGTH as u64, buf, 0, len)?;
+        self.ring_write(new_last.pos + Element::HEADER_LENGTH as u64, buf)?;
 
         // Commit the addition. If was empty, first == last.
         let first_pos = if was_empty { new_last.pos } else { self.first.pos };
@@ -355,7 +350,7 @@ impl QueueFile {
             let len = self.first.len;
             let mut data = vec![0; len as usize].into_boxed_slice();
 
-            self.ring_read(self.first.pos + Element::HEADER_LENGTH as u64, &mut data, 0, len)?;
+            self.ring_read(self.first.pos + Element::HEADER_LENGTH as u64, &mut data)?;
 
             Ok(Some(data))
         }
@@ -391,7 +386,7 @@ impl QueueFile {
                 self.wrap_pos(new_first_pos + Element::HEADER_LENGTH as u64 + new_first_len as u64);
 
             let mut buf: [u8; 4] = [0; 4];
-            self.ring_read(new_first_pos, &mut buf, 0, Element::HEADER_LENGTH)?;
+            self.ring_read(new_first_pos, &mut buf)?;
             new_first_len = u32::from_be_bytes(buf) as usize;
         }
 
@@ -415,7 +410,7 @@ impl QueueFile {
         if self.overwrite_on_remove {
             self.seek(self.header_len)?;
             let len = QueueFile::INITIAL_LENGTH - self.header_len;
-            self.write(&QueueFile::ZEROES, 0, len as usize)?;
+            self.write(&QueueFile::ZEROES[..len as usize])?;
         }
 
         self.elem_cnt = 0;
@@ -471,7 +466,8 @@ impl QueueFile {
     fn write_header(
         &mut self, file_len: u64, elem_cnt: usize, first_pos: u64, last_pos: u64,
     ) -> io::Result<()> {
-        self.header_buf.clear();
+        let mut header = [0; 32];
+        let mut header_buf = &mut header[..];
 
         // Never allow write values that will render file unreadable by Java library.
         if self.versioned {
@@ -480,32 +476,25 @@ impl QueueFile {
             assert!(first_pos <= i64::max_value() as u64);
             assert!(last_pos <= i64::max_value() as u64);
 
-            self.header_buf.put_u32(QueueFile::VERSIONED_HEADER);
-            self.header_buf.put_u64(file_len);
-            self.header_buf.put_i32(elem_cnt as i32);
-            self.header_buf.put_u64(first_pos);
-            self.header_buf.put_u64(last_pos);
+            header_buf.put_u32(QueueFile::VERSIONED_HEADER);
+            header_buf.put_u64(file_len);
+            header_buf.put_i32(elem_cnt as i32);
+            header_buf.put_u64(first_pos);
+            header_buf.put_u64(last_pos);
         } else {
             assert!(file_len <= i32::max_value() as u64);
             assert!(elem_cnt <= i32::max_value() as usize);
             assert!(first_pos <= i32::max_value() as u64);
             assert!(last_pos <= i32::max_value() as u64);
 
-            self.header_buf.put_i32(file_len as i32);
-            self.header_buf.put_i32(elem_cnt as i32);
-            self.header_buf.put_i32(first_pos as i32);
-            self.header_buf.put_i32(last_pos as i32);
+            header_buf.put_i32(file_len as i32);
+            header_buf.put_i32(elem_cnt as i32);
+            header_buf.put_i32(first_pos as i32);
+            header_buf.put_i32(last_pos as i32);
         }
 
         self.seek(0)?;
-        let sync_writes = self.sync_writes;
-        Self::write_to_file(
-            &mut self.file,
-            sync_writes,
-            self.header_buf.as_ref(),
-            0,
-            self.header_len as usize,
-        )
+        self.write(&header.as_ref()[..self.header_len as usize])
     }
 
     fn read_element(&mut self, pos: u64) -> io::Result<Element> {
@@ -513,7 +502,7 @@ impl QueueFile {
             Ok(Element::EMPTY)
         } else {
             let mut buf: [u8; 4] = [0; Element::HEADER_LENGTH];
-            self.ring_read(pos, &mut buf, 0, Element::HEADER_LENGTH)?;
+            self.ring_read(pos, &mut buf)?;
 
             Ok(Element::new(pos, u32::from_be_bytes(buf) as usize))
         }
@@ -521,24 +510,28 @@ impl QueueFile {
 
     /// Wraps the position if it exceeds the end of the file.
     fn wrap_pos(&self, pos: u64) -> u64 {
-        if pos < self.file_len { pos } else { self.header_len + pos - self.file_len }
+        if pos < self.file_len {
+            pos
+        } else {
+            self.header_len + pos - self.file_len
+        }
     }
 
     /// Writes `n` bytes from buffer to position in file. Automatically wraps write if position is
     /// past the end of the file or if buffer overlaps it.
-    fn ring_write(&mut self, pos: u64, buf: &[u8], off: usize, n: usize) -> io::Result<()> {
+    fn ring_write(&mut self, pos: u64, buf: &[u8]) -> io::Result<()> {
         let pos = self.wrap_pos(pos);
 
-        if pos + n as u64 <= self.file_len {
+        if pos + buf.len() as u64 <= self.file_len {
             self.seek(pos)?;
-            self.write(buf, off, n)
+            self.write(buf)
         } else {
             let before_eof = (self.file_len - pos) as usize;
 
             self.seek(pos)?;
-            self.write(buf, off, before_eof)?;
+            self.write(&buf[..before_eof])?;
             self.seek(self.header_len)?;
-            self.write(buf, off + before_eof, n - before_eof)
+            self.write(&buf[before_eof..])
         }
     }
 
@@ -549,7 +542,7 @@ impl QueueFile {
         while len > 0 {
             let chunk_len = min(len, QueueFile::ZEROES.len() as i64);
 
-            self.ring_write(pos, &QueueFile::ZEROES, 0, chunk_len as usize)?;
+            self.ring_write(pos, &QueueFile::ZEROES[..chunk_len as usize])?;
 
             len -= chunk_len;
             pos += chunk_len as u64;
@@ -559,19 +552,19 @@ impl QueueFile {
     }
 
     /// Reads `n` bytes into buffer from file. Wraps if necessary.
-    fn ring_read(&mut self, pos: u64, buf: &mut [u8], off: usize, n: usize) -> io::Result<()> {
+    fn ring_read(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
         let pos = self.wrap_pos(pos);
 
-        if pos + n as u64 <= self.file_len {
+        if pos + buf.len() as u64 <= self.file_len {
             self.seek(pos)?;
-            self.read(buf, off, n)
+            self.read(buf)
         } else {
             let before_eof = (self.file_len - pos) as usize;
 
             self.seek(pos)?;
-            self.read(buf, off, before_eof)?;
+            self.read(&mut buf[..before_eof])?;
             self.seek(self.header_len)?;
-            self.read(buf, off + before_eof, n - before_eof)
+            self.read(&mut buf[before_eof..])
         }
     }
 
@@ -611,10 +604,7 @@ impl QueueFile {
         // Commit the expansion.
         if self.last.pos < self.first.pos {
             let new_last_pos = self.file_len + self.last.pos - self.header_len;
-            self.write_header(new_len, self.elem_cnt, self.first.pos, new_last_pos)?;
             self.last = Element::new(new_last_pos, self.last.len);
-        } else {
-            self.write_header(new_len, self.elem_cnt, self.first.pos, self.last.pos)?;
         }
 
         self.file_len = new_len;
@@ -632,47 +622,51 @@ impl QueueFile {
     const TRANSFER_BUFFER_SIZE: usize = 128 * 1024;
 
     fn seek(&mut self, pos: u64) -> io::Result<u64> {
-        self.file.seek(SeekFrom::Start(pos))
+        if pos == self.last_seek {
+            Ok(pos)
+        } else {
+            self.last_seek = self.file.seek(SeekFrom::Start(pos))?;
+            Ok(pos)
+        }
     }
 
-    fn read(&mut self, buf: &mut [u8], off: usize, n: usize) -> io::Result<()> {
-        self.file.read_exact(&mut buf[off..off + n])
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        self.last_seek += buf.len() as u64;
+        self.file.read_exact(buf)
     }
 
-    fn write_to_file(
-        file: &mut File, sync_writes: bool, buf: &[u8], off: usize, n: usize,
+    fn write(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.last_seek += buf.len() as u64;
+        self.file.write_all(buf)?;
+
+        if self.sync_writes {
+            self.file.sync_data()
+        } else {
+            Ok(())
+        }
+    }
+
+    fn transfer_inner(
+        &mut self, buf: &mut [u8], mut read_pos: u64, mut write_pos: u64, count: u64,
     ) -> io::Result<()> {
-        file.write_all(&buf[off..off + n])?;
+        debug_assert!(read_pos < self.file_len);
+        debug_assert!(write_pos <= self.file_len);
+        debug_assert!(count < self.file_len);
+        debug_assert!(count <= i64::max_value() as u64);
 
-        if sync_writes { file.sync_data() } else { Ok(()) }
-    }
-
-    fn write(&mut self, buf: &[u8], off: usize, n: usize) -> io::Result<()> {
-        Self::write_to_file(&mut self.file, self.sync_writes, buf, off, n)
-    }
-
-    /// Transfer `count` bytes starting from `read_pos` to `write_pos`.
-    fn transfer(&mut self, read_pos: u64, write_pos: u64, count: u64) -> io::Result<()> {
-        assert!(read_pos < self.file_len);
-        assert!(write_pos <= self.file_len);
-        assert!(count < self.file_len);
-        assert!(count <= i64::max_value() as u64);
-
-        let mut read_pos = read_pos;
-        let mut write_pos = write_pos;
         let mut bytes_left = count as i64;
 
         while bytes_left > 0 {
-            self.file.seek(SeekFrom::Start(read_pos))?;
+            self.seek(read_pos)?;
             let bytes_to_read = min(bytes_left as usize, Self::TRANSFER_BUFFER_SIZE);
-            let bytes_read = self.file.read(&mut self.transfer_buf[..bytes_to_read])?;
+            self.read(&mut buf[..bytes_to_read])?;
 
-            self.file.seek(SeekFrom::Start(write_pos))?;
-            self.file.write_all(&self.transfer_buf[..bytes_read])?;
+            self.seek(write_pos)?;
+            self.write(&buf[..bytes_to_read])?;
 
-            read_pos += bytes_read as u64;
-            write_pos += bytes_read as u64;
-            bytes_left -= bytes_read as i64;
+            read_pos += bytes_to_read as u64;
+            write_pos += bytes_to_read as u64;
+            bytes_left -= bytes_to_read as i64;
         }
 
         // Should we `sync_data()` in internal loop instead?
@@ -681,6 +675,15 @@ impl QueueFile {
         }
 
         Ok(())
+    }
+
+    /// Transfer `count` bytes starting from `read_pos` to `write_pos`.
+    fn transfer(&mut self, read_pos: u64, write_pos: u64, count: u64) -> io::Result<()> {
+        let mut buf = self.transfer_buf.take().unwrap();
+        let res = self.transfer_inner(&mut buf, read_pos, write_pos, count);
+        self.transfer_buf = Some(buf);
+
+        res
     }
 
     fn sync_set_len(&mut self, new_len: u64) -> io::Result<()> {
@@ -733,7 +736,7 @@ impl<'a> Iterator for Iter<'a> {
         self.next_elem_pos = self.queue_file.wrap_pos(current.pos + Element::HEADER_LENGTH as u64);
 
         let mut data = vec![0; current.len].into_boxed_slice();
-        self.queue_file.ring_read(self.next_elem_pos, &mut data, 0, current.len).ok()?;
+        self.queue_file.ring_read(self.next_elem_pos, &mut data).ok()?;
 
         self.next_elem_pos = self
             .queue_file
