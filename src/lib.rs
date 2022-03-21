@@ -115,7 +115,7 @@ pub struct QueueFile {
     /// Cached file length. Always a power of 2.
     file_len: u64,
     /// Last seek value
-    last_seek: u64,
+    last_seek: Option<u64>,
     /// Number of elements.
     elem_cnt: usize,
     /// Pointer to first (or eldest) element.
@@ -253,7 +253,7 @@ impl QueueFile {
             versioned,
             header_len,
             file_len,
-            last_seek: 0,
+            last_seek: Some(0),
             elem_cnt,
             first: Element::EMPTY,
             last: Element::EMPTY,
@@ -622,22 +622,34 @@ impl QueueFile {
     const TRANSFER_BUFFER_SIZE: usize = 128 * 1024;
 
     fn seek(&mut self, pos: u64) -> io::Result<u64> {
-        if pos == self.last_seek {
+        if Some(pos) == self.last_seek {
             Ok(pos)
         } else {
-            self.last_seek = self.file.seek(SeekFrom::Start(pos))?;
-            Ok(pos)
+            let res = self.file.seek(SeekFrom::Start(pos));
+            self.last_seek = res.as_ref().ok().copied();
+            res
         }
     }
 
     fn read(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        self.last_seek += buf.len() as u64;
-        self.file.read_exact(buf)
+        if let Some(seek) = &mut self.last_seek {
+            *seek += buf.len() as u64;
+        }
+        let r = self.file.read_exact(buf);
+        if r.is_err() {
+            self.last_seek = None;
+        }
+        r
     }
 
     fn write(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.last_seek += buf.len() as u64;
-        self.file.write_all(buf)?;
+        if let Some(seek) = &mut self.last_seek {
+            *seek += buf.len() as u64;
+        }
+        if let Err(err) = self.file.write_all(buf) {
+            self.last_seek = None;
+            return Err(err);
+        }
 
         if self.sync_writes {
             self.file.sync_data()
