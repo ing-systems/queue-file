@@ -122,6 +122,8 @@ pub struct QueueFile {
     first: Element,
     /// Pointer to last (or newest) element.
     last: Element,
+    /// Minimum number of bytes the file shrinks to.
+    capacity: u64,
     /// When true, removing an element will also overwrite data with zero bytes.
     /// It's true by default.
     overwrite_on_remove: bool,
@@ -133,11 +135,12 @@ pub struct QueueFile {
 }
 
 impl QueueFile {
+    const BLOCK_LENGTH: u64 = 4096;
     const INITIAL_LENGTH: u64 = 4096;
     const VERSIONED_HEADER: u32 = 0x8000_0001;
     const ZEROES: [u8; 4096] = [0; 4096];
 
-    fn init(path: &Path, force_legacy: bool) -> Result<()> {
+    fn init(path: &Path, force_legacy: bool, capacity: u64) -> Result<()> {
         let tmp_path = path.with_extension(".tmp");
 
         // Use a temp file so we don't leave a partially-initialized file.
@@ -145,15 +148,15 @@ impl QueueFile {
             let mut file =
                 OpenOptions::new().read(true).write(true).create(true).open(&tmp_path)?;
 
-            file.set_len(QueueFile::INITIAL_LENGTH)?;
+            file.set_len(capacity)?;
 
             let mut buf = BytesMut::with_capacity(16);
 
             if force_legacy {
-                buf.put_u32(QueueFile::INITIAL_LENGTH as u32);
+                buf.put_u32(capacity as u32);
             } else {
                 buf.put_u32(QueueFile::VERSIONED_HEADER);
-                buf.put_u64(QueueFile::INITIAL_LENGTH);
+                buf.put_u64(capacity);
             }
 
             file.write_all(buf.as_ref())?;
@@ -165,19 +168,23 @@ impl QueueFile {
         Ok(())
     }
 
+    pub fn with_capacity<P: AsRef<Path>>(path: P, capacity: u64) -> Result<QueueFile> {
+        Self::open_internal(path, true, false, capacity)
+    }
+
     pub fn open<P: AsRef<Path>>(path: P) -> Result<QueueFile> {
-        Self::open_internal(path, true, false)
+        Self::with_capacity(path, QueueFile::INITIAL_LENGTH)
     }
 
     pub fn open_legacy<P: AsRef<Path>>(path: P) -> Result<QueueFile> {
-        Self::open_internal(path, true, true)
+        Self::open_internal(path, true, true, QueueFile::INITIAL_LENGTH)
     }
 
     fn open_internal<P: AsRef<Path>>(
-        path: P, overwrite_on_remove: bool, force_legacy: bool,
+        path: P, overwrite_on_remove: bool, force_legacy: bool, capacity: u64,
     ) -> Result<QueueFile> {
         if !path.as_ref().exists() {
-            QueueFile::init(path.as_ref(), force_legacy)?;
+            QueueFile::init(path.as_ref(), force_legacy, capacity)?;
         }
 
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -257,10 +264,15 @@ impl QueueFile {
             elem_cnt,
             first: Element::EMPTY,
             last: Element::EMPTY,
+            capacity,
             overwrite_on_remove,
             sync_writes: cfg!(not(test)),
             transfer_buf: Some(vec![0u8; Self::TRANSFER_BUFFER_SIZE].into_boxed_slice()),
         };
+
+        if queue_file.file_len < queue_file.capacity {
+            queue_file.sync_set_len(queue_file.capacity)?;
+        }
 
         queue_file.first = queue_file.read_element(first_pos)?;
         queue_file.last = queue_file.read_element(last_pos)?;
@@ -405,22 +417,32 @@ impl QueueFile {
     /// Clears this queue. Truncates the file to the initial size.
     pub fn clear(&mut self) -> Result<()> {
         // Commit the header.
-        self.write_header(QueueFile::INITIAL_LENGTH, 0, 0, 0)?;
+        self.write_header(self.capacity, 0, 0, 0)?;
 
         if self.overwrite_on_remove {
             self.seek(self.header_len)?;
-            let len = QueueFile::INITIAL_LENGTH - self.header_len;
-            self.write(&QueueFile::ZEROES[..len as usize])?;
+            let first_block = self.capacity.min(Self::BLOCK_LENGTH) - self.header_len;
+            self.write(&QueueFile::ZEROES[..first_block as usize])?;
+
+            if let Some(left) = self.capacity.checked_sub(Self::BLOCK_LENGTH) {
+                for _ in 0..left / Self::BLOCK_LENGTH {
+                    self.write(&QueueFile::ZEROES)?;
+                }
+                let tail = left % Self::BLOCK_LENGTH;
+                if tail != 0 {
+                    self.write(&QueueFile::ZEROES[..tail as usize])?;
+                }
+            }
         }
 
         self.elem_cnt = 0;
         self.first = Element::EMPTY;
         self.last = Element::EMPTY;
 
-        if self.file_len > QueueFile::INITIAL_LENGTH {
-            self.sync_set_len(QueueFile::INITIAL_LENGTH)?;
+        if self.file_len > self.capacity {
+            self.sync_set_len(self.capacity)?;
         }
-        self.file_len = QueueFile::INITIAL_LENGTH;
+        self.file_len = self.capacity;
 
         Ok(())
     }
@@ -785,20 +807,28 @@ mod tests {
     }
 
     fn new_queue_file(overwrite_on_remove: bool) -> (PathBuf, QueueFile) {
-        new_queue_file_ex(overwrite_on_remove, false)
+        new_queue_file_ex(overwrite_on_remove, false, None)
     }
 
     fn new_legacy_queue_file(overwrite_on_remove: bool) -> (PathBuf, QueueFile) {
-        new_queue_file_ex(overwrite_on_remove, true)
+        new_queue_file_ex(overwrite_on_remove, true, None)
     }
 
-    fn new_queue_file_ex(overwrite_on_remove: bool, force_legacy: bool) -> (PathBuf, QueueFile) {
+    fn new_queue_file_ex(
+        overwrite_on_remove: bool, force_legacy: bool, capacity: Option<u64>,
+    ) -> (PathBuf, QueueFile) {
         let file_name = gen_rand_file_name();
         let path = Path::new(file_name.as_str());
         let mut queue_file = if force_legacy {
+            assert!(capacity.is_none(), "capacity can be set only for non-legacy queue");
             QueueFile::open_legacy(path).unwrap()
         } else {
-            QueueFile::open(path).unwrap()
+            if let Some(capacity) = capacity {
+                QueueFile::with_capacity(path, capacity)
+            } else {
+                QueueFile::open(path)
+            }
+            .unwrap()
         };
 
         queue_file.set_overwrite_on_remove(overwrite_on_remove);
@@ -903,6 +933,52 @@ mod tests {
             REOPEN_PROB,
         );
         remove_file(&path).unwrap_or(());
+    }
+
+    #[test]
+    fn queue_capacity_preserved() {
+        for is_overwrite in [false, true] {
+            eprintln!("is_overwrite = {is_overwrite}");
+
+            let initial_size = 517;
+            let (p, mut qf) = new_queue_file_ex(is_overwrite, false, Some(initial_size));
+
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), initial_size);
+
+            for i in 0u32..40 {
+                qf.add(&i.to_be_bytes()).unwrap();
+            }
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), initial_size);
+
+            for i in 0u32..40 {
+                qf.add(&i.to_be_bytes()).unwrap();
+            }
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), initial_size * 2);
+
+            qf.clear().unwrap();
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), initial_size);
+
+            remove_file(&p).unwrap_or(());
+        }
+    }
+
+    #[test]
+    fn existing_queue_extended_on_new_capacity() {
+        for is_overwrite in [false, true] {
+            eprintln!("is_overwrite = {is_overwrite}");
+            let initial_size = 200;
+            let (p, qf) = new_queue_file_ex(is_overwrite, false, Some(initial_size));
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), initial_size);
+
+            drop(qf);
+
+            let initial_size2 = 350;
+            let qf = QueueFile::with_capacity(&p, initial_size2).unwrap();
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), initial_size2);
+            drop(qf);
+
+            remove_file(&p).unwrap_or(());
+        }
     }
 
     fn add_rand_n_elems(
