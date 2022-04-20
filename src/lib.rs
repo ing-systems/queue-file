@@ -130,8 +130,19 @@ pub struct QueueFile {
     /// When true, every write to file will be followed by `sync_data()` call.
     /// It's true by default.
     sync_writes: bool,
+    /// When true, skips header update upon adding.
+    /// It's false by default.
+    skip_write_header_on_add: bool,
     /// Buffer used by `transfer` function.
     transfer_buf: Option<Box<[u8]>>,
+}
+
+impl Drop for QueueFile {
+    fn drop(&mut self) {
+        if self.skip_write_header_on_add {
+            let _ = self.sync_header();
+        }
+    }
 }
 
 impl QueueFile {
@@ -267,6 +278,7 @@ impl QueueFile {
             capacity,
             overwrite_on_remove,
             sync_writes: cfg!(not(test)),
+            skip_write_header_on_add: false,
             transfer_buf: Some(vec![0u8; Self::TRANSFER_BUFFER_SIZE].into_boxed_slice()),
         };
 
@@ -300,6 +312,16 @@ impl QueueFile {
         self.sync_writes = value
     }
 
+    /// Returns true if skips header update upon adding enabled.
+    pub fn get_skip_write_header_on_add(&self) -> bool {
+        self.skip_write_header_on_add
+    }
+
+    /// If set to true skips header update upon adding.
+    pub fn set_skip_write_header_on_add(&mut self, value: bool) {
+        self.skip_write_header_on_add = value
+    }
+
     /// Returns true if this queue contains no entries.
     pub fn is_empty(&self) -> bool {
         self.elem_cnt == 0
@@ -312,6 +334,10 @@ impl QueueFile {
 
     /// Synchronizes the underlying file, look at [File::sync_all] doc for more info.
     pub fn sync_all(&mut self) -> Result<()> {
+        if self.skip_write_header_on_add {
+            self.sync_header()?;
+        }
+
         Ok(self.file.sync_all()?)
     }
 
@@ -341,9 +367,11 @@ impl QueueFile {
         // Write data.
         self.ring_write(new_last.pos + Element::HEADER_LENGTH as u64, buf)?;
 
-        // Commit the addition. If was empty, first == last.
-        let first_pos = if was_empty { new_last.pos } else { self.first.pos };
-        self.write_header(self.file_len, self.elem_cnt + 1, first_pos, new_last.pos)?;
+        if !self.skip_write_header_on_add {
+            // Commit the addition. If was empty, first == last.
+            let first_pos = if was_empty { new_last.pos } else { self.first.pos };
+            self.write_header(self.file_len, self.elem_cnt + 1, first_pos, new_last.pos)?;
+        }
         self.last = new_last;
         self.elem_cnt += 1;
 
@@ -479,6 +507,10 @@ impl QueueFile {
 
     fn remaining_bytes(&self) -> u64 {
         self.file_len - self.used_bytes()
+    }
+
+    fn sync_header(&mut self) -> io::Result<()> {
+        self.write_header(self.file_len(), self.size(), self.first.pos, self.last.pos)
     }
 
     /// Writes header atomically. The arguments contain the updated values. The struct member fields
