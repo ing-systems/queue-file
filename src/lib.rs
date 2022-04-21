@@ -126,6 +126,8 @@ pub struct QueueFile {
     /// When true, skips header update upon adding.
     /// It's false by default.
     skip_write_header_on_add: bool,
+    /// Write buffering.
+    write_buf: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -289,6 +291,7 @@ impl QueueFile {
             capacity,
             overwrite_on_remove,
             skip_write_header_on_add: false,
+            write_buf: Vec::new(),
         };
 
         if file_len < capacity {
@@ -370,11 +373,14 @@ impl QueueFile {
 
         let new_last = Element::new(pos, len);
 
-        // Write length.
-        self.ring_write(new_last.pos, &(len as u32).to_be_bytes())?;
+        self.write_buf.clear();
+        // Add length.
+        self.write_buf.extend(&(len as u32).to_be_bytes());
+        // Add data.
+        self.write_buf.extend(buf);
 
-        // Write data.
-        self.ring_write(new_last.pos + Element::HEADER_LENGTH as u64, buf)?;
+        // Make actual write.
+        self.ring_write_buf(new_last.pos)?;
 
         if !self.skip_write_header_on_add {
             // Commit the addition. If was empty, first == last.
@@ -578,30 +584,33 @@ impl QueueFile {
 
     /// Writes `n` bytes from buffer to position in file. Automatically wraps write if position is
     /// past the end of the file or if buffer overlaps it.
-    fn ring_write(&mut self, pos: u64, buf: &[u8]) -> io::Result<()> {
+    fn ring_write_buf(&mut self, pos: u64) -> io::Result<()> {
         let pos = self.wrap_pos(pos);
 
-        if pos + buf.len() as u64 <= self.file_len() {
+        if pos + self.write_buf.len() as u64 <= self.file_len() {
             self.inner.seek(pos)?;
-            self.inner.write(buf)
+            self.inner.write(&self.write_buf)
         } else {
             let before_eof = (self.file_len() - pos) as usize;
 
             self.inner.seek(pos)?;
-            self.inner.write(&buf[..before_eof])?;
+            self.inner.write(&self.write_buf[..before_eof])?;
             self.inner.seek(self.header_len)?;
-            self.inner.write(&buf[before_eof..])
+            self.inner.write(&self.write_buf[before_eof..])
         }
     }
 
     fn ring_erase(&mut self, pos: u64, n: usize) -> io::Result<()> {
         let mut pos = pos;
-        let mut len = n as i64;
+        let mut len = n;
 
+        self.write_buf.clear();
+        self.write_buf.extend(QueueFile::ZEROES);
         while len > 0 {
-            let chunk_len = min(len, QueueFile::ZEROES.len() as i64);
+            let chunk_len = min(len, QueueFile::ZEROES.len());
+            self.write_buf.truncate(chunk_len);
 
-            self.ring_write(pos, &QueueFile::ZEROES[..chunk_len as usize])?;
+            self.ring_write_buf(pos)?;
 
             len -= chunk_len;
             pos += chunk_len as u64;
