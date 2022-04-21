@@ -107,15 +107,11 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// ```
 #[derive(Debug)]
 pub struct QueueFile {
-    file: File,
+    inner: QueueFileInner,
     /// True when using the versioned header format. Otherwise use the legacy format.
     versioned: bool,
     /// The header length in bytes: 16 or 32.
     header_len: u64,
-    /// Cached file length. Always a power of 2.
-    file_len: u64,
-    /// Last seek value
-    last_seek: Option<u64>,
     /// Number of elements.
     elem_cnt: usize,
     /// Pointer to first (or eldest) element.
@@ -127,14 +123,23 @@ pub struct QueueFile {
     /// When true, removing an element will also overwrite data with zero bytes.
     /// It's true by default.
     overwrite_on_remove: bool,
-    /// When true, every write to file will be followed by `sync_data()` call.
-    /// It's true by default.
-    sync_writes: bool,
     /// When true, skips header update upon adding.
     /// It's false by default.
     skip_write_header_on_add: bool,
+}
+
+#[derive(Debug)]
+struct QueueFileInner {
+    file: File,
+    /// Cached file length. Always a power of 2.
+    file_len: u64,
+    /// Last seek value
+    last_seek: Option<u64>,
     /// Buffer used by `transfer` function.
     transfer_buf: Option<Box<[u8]>>,
+    /// When true, every write to file will be followed by `sync_data()` call.
+    /// It's true by default.
+    sync_writes: bool,
 }
 
 impl Drop for QueueFile {
@@ -267,23 +272,27 @@ impl QueueFile {
         file.rewind()?;
 
         let mut queue_file = QueueFile {
-            file,
+            inner: QueueFileInner {
+                file,
+                file_len,
+                last_seek: Some(0),
+                transfer_buf: Some(
+                    vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
+                ),
+                sync_writes: cfg!(not(test)),
+            },
             versioned,
             header_len,
-            file_len,
-            last_seek: Some(0),
             elem_cnt,
             first: Element::EMPTY,
             last: Element::EMPTY,
             capacity,
             overwrite_on_remove,
-            sync_writes: cfg!(not(test)),
             skip_write_header_on_add: false,
-            transfer_buf: Some(vec![0u8; Self::TRANSFER_BUFFER_SIZE].into_boxed_slice()),
         };
 
-        if queue_file.file_len < queue_file.capacity {
-            queue_file.sync_set_len(queue_file.capacity)?;
+        if file_len < capacity {
+            queue_file.inner.sync_set_len(queue_file.capacity)?;
         }
 
         queue_file.first = queue_file.read_element(first_pos)?;
@@ -304,12 +313,12 @@ impl QueueFile {
 
     /// Returns true if every write to file will be followed by `sync_data()` call.
     pub fn get_sync_writes(&self) -> bool {
-        self.sync_writes
+        self.inner.sync_writes
     }
 
     /// If set to true every write to file will be followed by `sync_data()` call.
     pub fn set_sync_writes(&mut self, value: bool) {
-        self.sync_writes = value
+        self.inner.sync_writes = value
     }
 
     /// Returns true if skips header update upon adding enabled.
@@ -338,7 +347,7 @@ impl QueueFile {
             self.sync_header()?;
         }
 
-        Ok(self.file.sync_all()?)
+        Ok(self.inner.file.sync_all()?)
     }
 
     /// Adds an element to the end of the queue.
@@ -370,7 +379,7 @@ impl QueueFile {
         if !self.skip_write_header_on_add {
             // Commit the addition. If was empty, first == last.
             let first_pos = if was_empty { new_last.pos } else { self.first.pos };
-            self.write_header(self.file_len, self.elem_cnt + 1, first_pos, new_last.pos)?;
+            self.write_header(self.file_len(), self.elem_cnt + 1, first_pos, new_last.pos)?;
         }
         self.last = new_last;
         self.elem_cnt += 1;
@@ -431,7 +440,7 @@ impl QueueFile {
         }
 
         // Commit the header.
-        self.write_header(self.file_len, self.elem_cnt - n, new_first_pos, self.last.pos)?;
+        self.write_header(self.file_len(), self.elem_cnt - n, new_first_pos, self.last.pos)?;
         self.elem_cnt -= n;
         self.first = Element::new(new_first_pos, new_first_len);
 
@@ -448,17 +457,17 @@ impl QueueFile {
         self.write_header(self.capacity, 0, 0, 0)?;
 
         if self.overwrite_on_remove {
-            self.seek(self.header_len)?;
+            self.inner.seek(self.header_len)?;
             let first_block = self.capacity.min(Self::BLOCK_LENGTH) - self.header_len;
-            self.write(&QueueFile::ZEROES[..first_block as usize])?;
+            self.inner.write(&QueueFile::ZEROES[..first_block as usize])?;
 
             if let Some(left) = self.capacity.checked_sub(Self::BLOCK_LENGTH) {
                 for _ in 0..left / Self::BLOCK_LENGTH {
-                    self.write(&QueueFile::ZEROES)?;
+                    self.inner.write(&QueueFile::ZEROES)?;
                 }
                 let tail = left % Self::BLOCK_LENGTH;
                 if tail != 0 {
-                    self.write(&QueueFile::ZEROES[..tail as usize])?;
+                    self.inner.write(&QueueFile::ZEROES[..tail as usize])?;
                 }
             }
         }
@@ -467,10 +476,10 @@ impl QueueFile {
         self.first = Element::EMPTY;
         self.last = Element::EMPTY;
 
-        if self.file_len > self.capacity {
-            self.sync_set_len(self.capacity)?;
+        if self.file_len() > self.capacity {
+            self.inner.sync_set_len(self.capacity)?;
         }
-        self.file_len = self.capacity;
+        self.inner.file_len = self.capacity;
 
         Ok(())
     }
@@ -485,7 +494,7 @@ impl QueueFile {
     /// Returns the amount of bytes used by the backed file.
     /// Always >= [Self::used_bytes].
     pub fn file_len(&self) -> u64 {
-        self.file_len
+        self.inner.file_len
     }
 
     /// Returns the amount of bytes used by the queue.
@@ -500,13 +509,13 @@ impl QueueFile {
                 + self.header_len
         } else {
             // tail < head. The queue wraps.
-            self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64 + self.file_len
+            self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64 + self.file_len()
                 - self.first.pos
         }
     }
 
     fn remaining_bytes(&self) -> u64 {
-        self.file_len - self.used_bytes()
+        self.file_len() - self.used_bytes()
     }
 
     fn sync_header(&mut self) -> io::Result<()> {
@@ -547,8 +556,8 @@ impl QueueFile {
             header_buf.put_i32(last_pos as i32);
         }
 
-        self.seek(0)?;
-        self.write(&header.as_ref()[..self.header_len as usize])
+        self.inner.seek(0)?;
+        self.inner.write(&header.as_ref()[..self.header_len as usize])
     }
 
     fn read_element(&mut self, pos: u64) -> io::Result<Element> {
@@ -564,11 +573,7 @@ impl QueueFile {
 
     /// Wraps the position if it exceeds the end of the file.
     fn wrap_pos(&self, pos: u64) -> u64 {
-        if pos < self.file_len {
-            pos
-        } else {
-            self.header_len + pos - self.file_len
-        }
+        if pos < self.file_len() { pos } else { self.header_len + pos - self.file_len() }
     }
 
     /// Writes `n` bytes from buffer to position in file. Automatically wraps write if position is
@@ -576,16 +581,16 @@ impl QueueFile {
     fn ring_write(&mut self, pos: u64, buf: &[u8]) -> io::Result<()> {
         let pos = self.wrap_pos(pos);
 
-        if pos + buf.len() as u64 <= self.file_len {
-            self.seek(pos)?;
-            self.write(buf)
+        if pos + buf.len() as u64 <= self.file_len() {
+            self.inner.seek(pos)?;
+            self.inner.write(buf)
         } else {
-            let before_eof = (self.file_len - pos) as usize;
+            let before_eof = (self.file_len() - pos) as usize;
 
-            self.seek(pos)?;
-            self.write(&buf[..before_eof])?;
-            self.seek(self.header_len)?;
-            self.write(&buf[before_eof..])
+            self.inner.seek(pos)?;
+            self.inner.write(&buf[..before_eof])?;
+            self.inner.seek(self.header_len)?;
+            self.inner.write(&buf[before_eof..])
         }
     }
 
@@ -609,16 +614,16 @@ impl QueueFile {
     fn ring_read(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
         let pos = self.wrap_pos(pos);
 
-        if pos + buf.len() as u64 <= self.file_len {
-            self.seek(pos)?;
-            self.read(buf)
+        if pos + buf.len() as u64 <= self.file_len() {
+            self.inner.seek(pos)?;
+            self.inner.read(buf)
         } else {
-            let before_eof = (self.file_len - pos) as usize;
+            let before_eof = (self.file_len() - pos) as usize;
 
-            self.seek(pos)?;
-            self.read(&mut buf[..before_eof])?;
-            self.seek(self.header_len)?;
-            self.read(&mut buf[before_eof..])
+            self.inner.seek(pos)?;
+            self.inner.read(&mut buf[..before_eof])?;
+            self.inner.seek(self.header_len)?;
+            self.inner.read(&mut buf[before_eof..])
         }
     }
 
@@ -631,7 +636,7 @@ impl QueueFile {
             return Ok(());
         }
 
-        let mut prev_len = self.file_len;
+        let mut prev_len = self.file_len();
         let mut new_len = prev_len;
 
         while rem_bytes < elem_len as u64 {
@@ -640,7 +645,7 @@ impl QueueFile {
             prev_len = new_len;
         }
 
-        self.sync_set_len(new_len)?;
+        self.inner.sync_set_len(new_len)?;
 
         // // Calculate the position of the tail end of the data in the ring buffer
         let end_of_last_elem =
@@ -651,17 +656,17 @@ impl QueueFile {
         if end_of_last_elem <= self.first.pos {
             count = end_of_last_elem - self.header_len;
 
-            let write_pos = self.seek(self.file_len)?;
-            self.transfer(self.header_len, write_pos, count)?;
+            let write_pos = self.inner.seek(self.file_len())?;
+            self.inner.transfer(self.header_len, write_pos, count)?;
         }
 
         // Commit the expansion.
         if self.last.pos < self.first.pos {
-            let new_last_pos = self.file_len + self.last.pos - self.header_len;
+            let new_last_pos = self.file_len() + self.last.pos - self.header_len;
             self.last = Element::new(new_last_pos, self.last.len);
         }
 
-        self.file_len = new_len;
+        self.inner.file_len = new_len;
 
         if self.overwrite_on_remove {
             self.ring_erase(self.header_len, count as usize)?;
@@ -672,7 +677,7 @@ impl QueueFile {
 }
 
 // I/O Helpers
-impl QueueFile {
+impl QueueFileInner {
     const TRANSFER_BUFFER_SIZE: usize = 128 * 1024;
 
     fn seek(&mut self, pos: u64) -> io::Result<u64> {
@@ -705,11 +710,7 @@ impl QueueFile {
             return Err(err);
         }
 
-        if self.sync_writes {
-            self.file.sync_data()
-        } else {
-            Ok(())
-        }
+        if self.sync_writes { self.file.sync_data() } else { Ok(()) }
     }
 
     fn transfer_inner(
@@ -842,8 +843,11 @@ mod tests {
 
     fn gen_rand_file_name() -> String {
         let mut rng = thread_rng();
-        let mut file_name =
-            iter::repeat(()).map(|()| rng.sample(Alphanumeric)).map(char::from).take(16).collect::<String>();
+        let mut file_name = iter::repeat(())
+            .map(|()| rng.sample(Alphanumeric))
+            .map(char::from)
+            .take(16)
+            .collect::<String>();
 
         file_name.push_str(".qf");
 
@@ -1028,8 +1032,7 @@ mod tests {
     fn add_rand_n_elems(
         q: &mut VecDeque<Box<[u8]>>, qf: &mut QueueFile, min_n: usize, max_n: usize,
         min_data_size: usize, max_data_size: usize,
-    ) -> usize
-    {
+    ) -> usize {
         let mut rng = thread_rng();
 
         let n = rng.gen_range(min_n..max_n);
@@ -1068,8 +1071,7 @@ mod tests {
     fn simulate_use(
         path: &Path, mut qf: QueueFile, iters: usize, min_n: usize, max_n: usize,
         min_data_size: usize, max_data_size: usize, clear_prob: f64, reopen_prob: f64,
-    )
-    {
+    ) {
         let mut q: VecDeque<Box<[u8]>> = VecDeque::with_capacity(128);
 
         add_rand_n_elems(&mut q, &mut qf, min_n, max_n, min_data_size, max_data_size);
