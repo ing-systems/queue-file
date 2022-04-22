@@ -353,6 +353,62 @@ impl QueueFile {
         Ok(self.inner.file.sync_all()?)
     }
 
+    pub fn add_n(
+        &mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>> + Clone,
+    ) -> Result<()> {
+        let (count, total_len) = elems
+            .clone()
+            .into_iter()
+            .fold((0, 0), |(c, l), elem| (c + 1, l + Element::HEADER_LENGTH + elem.as_ref().len()));
+
+        if count == 0 {
+            return Ok(());
+        }
+
+        ensure!(self.elem_cnt + count < i32::max_value() as usize, TooManyElementsSnafu {});
+        self.expand_if_necessary(total_len as u64)?;
+
+        let was_empty = self.is_empty();
+        let mut pos = if was_empty {
+            self.header_len
+        } else {
+            self.wrap_pos(self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64)
+        };
+
+        let mut first_added = None;
+        let mut last_added = None;
+        self.write_buf.clear();
+
+        for elem in elems {
+            let elem = elem.as_ref();
+            let len = elem.len();
+            ensure!(len <= i32::max_value() as usize, ElementTooBigSnafu {});
+
+            if first_added.is_none() {
+                first_added = Some(Element::new(pos, len));
+            }
+            last_added = Some(Element::new(pos, len));
+
+            self.write_buf.extend(&(len as u32).to_be_bytes());
+            self.write_buf.extend(elem);
+
+            pos = self.wrap_pos(pos + Element::HEADER_LENGTH as u64 + len as u64);
+        }
+
+        let first_added = first_added.unwrap();
+        self.ring_write_buf(first_added.pos)?;
+
+        if was_empty {
+            self.first = first_added;
+        }
+        self.last = last_added.unwrap();
+
+        self.write_header(self.file_len(), self.elem_cnt + count, self.first.pos, self.last.pos)?;
+        self.elem_cnt += count;
+
+        Ok(())
+    }
+
     /// Adds an element to the end of the queue.
     pub fn add(&mut self, buf: &[u8]) -> Result<()> {
         ensure!(self.elem_cnt + 1 < i32::max_value() as usize, TooManyElementsSnafu {});
@@ -361,7 +417,7 @@ impl QueueFile {
 
         ensure!(len <= i32::max_value() as usize, ElementTooBigSnafu {});
 
-        self.expand_if_necessary(len)?;
+        self.expand_if_necessary((Element::HEADER_LENGTH + len) as u64)?;
 
         // Insert a new element after the current last element.
         let was_empty = self.is_empty();
@@ -637,18 +693,17 @@ impl QueueFile {
     }
 
     /// If necessary, expands the file to accommodate an additional element of the given length.
-    fn expand_if_necessary(&mut self, data_len: usize) -> io::Result<()> {
-        let elem_len = Element::HEADER_LENGTH + data_len;
+    fn expand_if_necessary(&mut self, data_len: u64) -> io::Result<()> {
         let mut rem_bytes = self.remaining_bytes();
 
-        if rem_bytes >= elem_len as u64 {
+        if rem_bytes >= data_len {
             return Ok(());
         }
 
         let mut prev_len = self.file_len();
         let mut new_len = prev_len;
 
-        while rem_bytes < elem_len as u64 {
+        while rem_bytes < data_len {
             rem_bytes += prev_len;
             new_len = prev_len << 1;
             prev_len = new_len;
@@ -1112,5 +1167,43 @@ mod tests {
 
         assert_eq!(q.is_empty(), true);
         assert_eq!(qf.is_empty(), true);
+    }
+
+    #[test]
+    fn add_n_works() {
+        let (path, mut qf) = new_queue_file(true);
+
+        let data = vec![vec![1, 2, 3], vec![4, 5, 6]];
+
+        qf.add_n(data.iter()).unwrap();
+
+        let stored = qf.iter().map(Vec::from).collect::<Vec<_>>();
+        assert_eq!(data, stored);
+
+        qf.remove_n(1).unwrap();
+
+        let stored = qf.iter().map(Vec::from).collect::<Vec<_>>();
+        assert_eq!(&data[1..], stored);
+
+        qf.remove_n(1).unwrap();
+
+        let stored = qf.iter().map(Vec::from).collect::<Vec<_>>();
+        assert_eq!(Vec::<Vec<u8>>::new(), stored);
+
+        let data = vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8]];
+
+        qf.add_n(data.iter()).unwrap();
+
+        let stored = qf.iter().map(Vec::from).collect::<Vec<_>>();
+        assert_eq!(data, stored);
+
+        let data: Vec<Vec<_>> = (0..=5).map(|i| vec![i, i, i, i, i, i, i, i, i, i]).collect();
+
+        qf.add_n(data.iter()).unwrap();
+
+        let stored = qf.iter().map(Vec::from).collect::<Vec<_>>();
+        assert_eq!(&data, &stored[3..]);
+
+        remove_file(&path).unwrap_or(());
     }
 }
