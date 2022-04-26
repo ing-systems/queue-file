@@ -8,7 +8,7 @@
 
 queue-file is a lightning-fast, transactional, file-based FIFO.
 
-Addition and removal from an instance is an O(1) operation and is atomic.
+Addition and removal of an element from the queue is an O(1) operation and is atomic.
 Writes are synchronous by default; data will be written to disk before an operation returns.
 
 queue-file crate is a feature complete and binary compatible port of `QueueFile` class from
@@ -22,20 +22,12 @@ To use `queue-file`, first add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-queue-file = "1.3"
-```
-
-Then, add this to your crate root:
-
-```rust
-extern crate queue_file;
+queue-file = "1"
 ```
 
 ## Example
 
 ```rust
-extern crate queue_file;
-
 use queue_file::QueueFile;
 
 fn main() {
