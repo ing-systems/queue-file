@@ -25,6 +25,7 @@ use std::fs::{rename, File, OpenOptions};
 use std::io;
 use std::io::prelude::*;
 use std::io::SeekFrom;
+use std::mem::ManuallyDrop;
 use std::path::Path;
 
 use bytes::{Buf, BufMut, BytesMut};
@@ -132,7 +133,7 @@ pub struct QueueFile {
 
 #[derive(Debug)]
 struct QueueFileInner {
-    file: File,
+    file: ManuallyDrop<File>,
     /// Cached file length. Always a power of 2.
     file_len: u64,
     /// Last seek value
@@ -148,6 +149,10 @@ impl Drop for QueueFile {
     fn drop(&mut self) {
         if self.skip_write_header_on_add {
             let _ = self.sync_header();
+        }
+
+        unsafe {
+            ManuallyDrop::drop(&mut self.inner.file);
         }
     }
 }
@@ -275,7 +280,7 @@ impl QueueFile {
 
         let mut queue_file = QueueFile {
             inner: QueueFileInner {
-                file,
+                file: ManuallyDrop::new(file),
                 file_len,
                 last_seek: Some(0),
                 transfer_buf: Some(
@@ -574,6 +579,17 @@ impl QueueFile {
             self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64 + self.file_len()
                 - self.first.pos
         }
+    }
+
+    pub fn into_inner_file(mut self) -> File {
+        if self.skip_write_header_on_add {
+            let _ = self.sync_header();
+        }
+
+        let file = unsafe { ManuallyDrop::take(&mut self.inner.file) };
+        std::mem::forget(self);
+
+        file
     }
 
     fn remaining_bytes(&self) -> u64 {
