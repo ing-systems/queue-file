@@ -50,6 +50,7 @@ fn existing_queue_extended_on_new_capacity(is_overwrite: bool) {
 #[derive(Debug, Clone)]
 enum Action {
     Add(Vec<u8>),
+    Read { skip: usize, take: usize },
     Remove(usize),
 }
 
@@ -64,19 +65,34 @@ impl quickcheck::Arbitrary for Action {
         match self {
             Self::Add(v) => Box::new(v.shrink().map(Self::Add)),
             Self::Remove(n) => Box::new(n.shrink().map(Self::Remove)),
+            Self::Read { skip, take } => Box::new(
+                take.shrink().zip(skip.shrink()).map(|(take, skip)| Self::Read { take, skip }),
+            ),
         }
     }
 }
 
 #[track_caller]
 fn collect_queue_items(qf: &mut QueueFile) -> Vec<Vec<u8>> {
-    qf.iter().map(Vec::from).collect::<Vec<_>>()
+    collect_queue_items_partial(qf, 0, qf.size() + 1)
+}
+
+#[track_caller]
+fn collect_queue_items_partial(qf: &mut QueueFile, skip: usize, take: usize) -> Vec<Vec<u8>> {
+    qf.iter().skip(skip).take(take).map(Vec::from).collect::<Vec<_>>()
 }
 
 #[track_caller]
 fn compare_with_vecdeque(qf: &mut QueueFile, vd: &VecDeque<Vec<u8>>) {
-    let left = collect_queue_items(qf);
-    let right = vd.iter().cloned().collect::<Vec<_>>();
+    compare_with_vecdeque_partial(qf, vd, 0, vd.len() + 1);
+}
+
+#[track_caller]
+fn compare_with_vecdeque_partial(
+    qf: &mut QueueFile, vd: &VecDeque<Vec<u8>>, skip: usize, take: usize,
+) {
+    let left = collect_queue_items_partial(qf, skip, take);
+    let right = vd.iter().skip(skip).take(take).cloned().collect::<Vec<_>>();
     assert_eq!(left, right);
 }
 
@@ -92,6 +108,7 @@ fn legacy_queue_is_vecdeque(actions: Vec<Action>) {
                 qf.add(&v).unwrap();
                 vd.push_back(v);
             }
+            Action::Read { take, skip } => compare_with_vecdeque_partial(&mut qf, &vd, skip, take),
             Action::Remove(n) => {
                 vd.drain(..n.min(vd.len()));
                 qf.remove_n(n).unwrap();
@@ -115,6 +132,7 @@ fn queue_with_skip_header_update_is_vecdeque(actions: Vec<Action>) {
                 qf.add(&v).unwrap();
                 vd.push_back(v);
             }
+            Action::Read { take, skip } => compare_with_vecdeque_partial(&mut qf, &vd, skip, take),
             Action::Remove(n) => {
                 vd.drain(..n.min(vd.len()));
                 qf.remove_n(n).unwrap();
@@ -144,6 +162,7 @@ fn queue_is_vecdeque(actions: Vec<Action>) {
                 qf.add(&v).unwrap();
                 vd.push_back(v);
             }
+            Action::Read { take, skip } => compare_with_vecdeque_partial(&mut qf, &vd, skip, take),
             Action::Remove(n) => {
                 vd.drain(..n.min(vd.len()));
                 qf.remove_n(n).unwrap();
@@ -174,6 +193,7 @@ fn add_n_works(actions: Vec<Action>) {
     for action in actions {
         match action {
             Action::Add(v) => adds.push(v),
+            Action::Read { take, skip } => compare_with_vecdeque_partial(&mut qf, &vd, skip, take),
             Action::Remove(n) => {
                 add_n_check!();
 
