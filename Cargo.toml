@@ -16,5 +16,7 @@ bytes = "1.0"
 snafu = "0.7"
 
 [dev-dependencies]
-pretty_assertions = "1.0"
-rand = "0.8"
+auto-delete-path = "0.2.0"
+quickcheck = "1.0.3"
+quickcheck_macros = "1.0.0"
+test-case = "2.1.0"
