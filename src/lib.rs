@@ -134,8 +134,14 @@ struct QueueFileInner {
     file: ManuallyDrop<File>,
     /// Cached file length. Always a power of 2.
     file_len: u64,
-    /// Last seek value
+    /// Intention seek offset.
+    expected_seek: u64,
+    /// Real last seek offset.
     last_seek: Option<u64>,
+    /// Offset for the next read from buffer.
+    read_buffer_offset: Option<u64>,
+    /// Buffer for reads.
+    read_buffer: Vec<u8>,
     /// Buffer used by `transfer` function.
     transfer_buf: Option<Box<[u8]>>,
     /// When true, every write to file will be followed by `sync_data()` call.
@@ -158,6 +164,7 @@ impl Drop for QueueFile {
 impl QueueFile {
     const BLOCK_LENGTH: u64 = 4096;
     const INITIAL_LENGTH: u64 = 4096;
+    const READ_BUFFER_SIZE: usize = 4096;
     const VERSIONED_HEADER: u32 = 0x8000_0001;
     const ZEROES: [u8; 4096] = [0; 4096];
 
@@ -274,13 +281,14 @@ impl QueueFile {
             msg: format!("position of the last element ({}) is beyond the file", last_pos)
         });
 
-        file.rewind()?;
-
         let mut queue_file = QueueFile {
             inner: QueueFileInner {
                 file: ManuallyDrop::new(file),
                 file_len,
-                last_seek: Some(0),
+                expected_seek: 0,
+                last_seek: Some(32),
+                read_buffer_offset: None,
+                read_buffer: vec![0; Self::READ_BUFFER_SIZE],
                 transfer_buf: Some(
                     vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
                 ),
@@ -335,6 +343,14 @@ impl QueueFile {
     /// If set to true skips header update upon adding.
     pub fn set_skip_write_header_on_add(&mut self, value: bool) {
         self.skip_write_header_on_add = value
+    }
+
+    /// Changes buffer size used for data reading.
+    pub fn set_read_buffer_size(&mut self, size: usize) {
+        if self.inner.read_buffer.len() < size {
+            self.inner.read_buffer_offset = None;
+        }
+        self.inner.read_buffer.resize(size, 0);
     }
 
     /// Returns true if this queue contains no entries.
@@ -759,36 +775,132 @@ impl QueueFileInner {
     const TRANSFER_BUFFER_SIZE: usize = 128 * 1024;
 
     fn seek(&mut self, pos: u64) -> io::Result<u64> {
-        if Some(pos) == self.last_seek {
-            Ok(pos)
-        } else {
-            let res = self.file.seek(SeekFrom::Start(pos));
-            self.last_seek = res.as_ref().ok().copied();
-            res
+        self.expected_seek = pos;
+        Ok(pos)
+    }
+
+    fn real_seek(&mut self) -> io::Result<u64> {
+        if Some(self.expected_seek) == self.last_seek {
+            return Ok(self.expected_seek);
         }
+
+        let res = self.file.seek(SeekFrom::Start(self.expected_seek));
+        self.last_seek = res.as_ref().ok().copied();
+        res
     }
 
     fn read(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        if let Some(seek) = &mut self.last_seek {
-            *seek += buf.len() as u64;
+        if buf.len() == 0 {
+            return Ok(());
         }
-        let r = self.file.read_exact(buf);
-        if r.is_err() {
-            self.last_seek = None;
+
+        let size = buf.len();
+
+        let not_enough_data = if let Some(left) = self.read_buffer.len().checked_sub(size) {
+            self.read_buffer_offset
+                .and_then(|o| self.expected_seek.checked_sub(o))
+                .and_then(|skip| left.checked_sub(skip as usize))
+                .is_none()
+        } else {
+            self.read_buffer.resize(size, 0);
+            true
+        };
+
+        if not_enough_data {
+            use std::io::{Error, ErrorKind};
+
+            self.real_seek()?;
+
+            let mut read = 0;
+            let mut res = Ok(());
+            while !buf.is_empty() {
+                match self.file.read(&mut self.read_buffer[read..]) {
+                    Ok(0) => break,
+                    Ok(n) => read += n as usize,
+                    Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        res = Err(e);
+                        break;
+                    }
+                }
+            }
+
+            if res.is_ok() && read < size {
+                res = Err(Error::new(ErrorKind::UnexpectedEof, "failed to fill whole buffer"));
+            }
+
+            if let Err(err) = res {
+                self.read_buffer_offset = None;
+                self.last_seek = None;
+                return Err(err);
+            }
+
+            self.read_buffer_offset = Some(self.expected_seek);
+
+            if let Some(seek) = &mut self.last_seek {
+                *seek += read as u64;
+            }
         }
-        r
+
+        let start = (self.expected_seek - self.read_buffer_offset.unwrap()) as usize;
+
+        buf.copy_from_slice(&self.read_buffer[start..start + size]);
+
+        Ok(())
     }
 
     fn write(&mut self, buf: &[u8]) -> io::Result<()> {
-        if let Some(seek) = &mut self.last_seek {
-            *seek += buf.len() as u64;
-        }
+        self.real_seek()?;
+
         if let Err(err) = self.file.write_all(buf) {
             self.last_seek = None;
             return Err(err);
         }
 
-        if self.sync_writes { self.file.sync_data() } else { Ok(()) }
+        if let Some(seek) = &mut self.last_seek {
+            *seek += buf.len() as u64;
+        }
+
+        if let Some(read_buffer_offset) = self.read_buffer_offset {
+            let write_size_u64 = buf.len() as u64;
+            let read_buffer_end_offset = read_buffer_offset + self.read_buffer.len() as u64;
+            let read_buffered = read_buffer_offset..read_buffer_end_offset;
+
+            let has_start = read_buffered.contains(&self.expected_seek);
+            let has_end = read_buffered.contains(&(self.expected_seek + write_size_u64));
+
+            match (has_start, has_end) {
+                // rd_buf_offset .. exp_seek .. exp_seek+buf.len .. rd_buf_end
+                // need to copy whole write buffer
+                (true, true) => {
+                    let start = (self.expected_seek - read_buffer_offset) as usize;
+                    self.read_buffer[start..start + buf.len()].copy_from_slice(buf);
+                }
+                // exp_seek .. rd_buf_offset .. exp_seek+buf.len .. rd_buf_end
+                // need to copy only a tail of write buffer
+                (false, true) => {
+                    let need_to_skip = (read_buffer_offset - self.expected_seek) as usize;
+                    let need_to_copy = buf.len() - need_to_skip;
+                    self.read_buffer[..need_to_copy].copy_from_slice(&buf[need_to_skip..]);
+                }
+                // rd_buf_offset .. exp_seek .. rd_buf_end .. exp_seek+buf.len
+                // need to copy only a head of write buffer
+                (true, false) => {
+                    let need_to_skip = (self.expected_seek - read_buffer_offset) as usize;
+                    let need_to_copy = self.read_buffer.len() - need_to_skip;
+                    self.read_buffer[need_to_skip..need_to_skip + need_to_copy]
+                        .copy_from_slice(&buf[..need_to_copy]);
+                }
+                // nothing to do, read & write buffers do not overlap
+                (false, false) => {}
+            }
+        }
+
+        if self.sync_writes {
+            self.file.sync_data()?;
+        }
+
+        Ok(())
     }
 
     fn transfer_inner(
