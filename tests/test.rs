@@ -174,6 +174,29 @@ fn queue_is_vecdeque(actions: Vec<Action>) {
 }
 
 #[quickcheck]
+fn queue_is_vecdeque_no_intermediate_comparisons(actions: Vec<Action>) {
+    let path = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::open(&path).unwrap();
+    let mut vd = VecDeque::new();
+
+    for action in actions {
+        match action {
+            Action::Add(v) => {
+                qf.add(&v).unwrap();
+                vd.push_back(v);
+            }
+            Action::Read { take, skip } => compare_with_vecdeque_partial(&mut qf, &vd, skip, take),
+            Action::Remove(n) => {
+                vd.drain(..n.min(vd.len()));
+                qf.remove_n(n).unwrap();
+            }
+        }
+    }
+
+    compare_with_vecdeque(&mut qf, &vd);
+}
+
+#[quickcheck]
 fn add_n_works(actions: Vec<Action>) {
     let path = auto_delete_path::AutoDeletePath::temp();
     let mut qf = QueueFile::open(&path).unwrap();
