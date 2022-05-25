@@ -569,7 +569,14 @@ impl QueueFile {
     pub fn iter(&mut self) -> Iter<'_> {
         let pos = self.first.pos;
 
-        Iter { queue_file: self, next_elem_index: 0, next_elem_pos: pos }
+        Iter {
+            // We are using write buffer for reducing number of allocations.
+            // BorrowedIter doesn't modify any data and will return it back on drop.
+            buffer: std::mem::take(&mut self.write_buf),
+            queue_file: self,
+            next_elem_index: 0,
+            next_elem_pos: pos,
+        }
     }
 
     /// Returns the amount of bytes used by the backed file.
@@ -977,6 +984,7 @@ impl Element {
 
 pub struct Iter<'a> {
     queue_file: &'a mut QueueFile,
+    buffer: Vec<u8>,
     next_elem_index: usize,
     next_elem_pos: u64,
 }
@@ -985,27 +993,43 @@ impl<'a> Iterator for Iter<'a> {
     type Item = Box<[u8]>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.queue_file.is_empty() || self.next_elem_index >= self.queue_file.elem_cnt {
-            return None;
-        }
+        let buffer = self.borrowed_next()?;
 
-        let current = self.queue_file.read_element(self.next_elem_pos).ok()?;
-        self.next_elem_pos = self.queue_file.wrap_pos(current.pos + Element::HEADER_LENGTH as u64);
-
-        let mut data = vec![0; current.len].into_boxed_slice();
-        self.queue_file.ring_read(self.next_elem_pos, &mut data).ok()?;
-
-        self.next_elem_pos = self
-            .queue_file
-            .wrap_pos(current.pos + Element::HEADER_LENGTH as u64 + current.len as u64);
-        self.next_elem_index += 1;
-
-        Some(data)
+        Some(buffer.to_vec().into_boxed_slice())
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let elems_left = self.queue_file.elem_cnt - self.next_elem_index;
 
         (elems_left, Some(elems_left))
+    }
+}
+
+impl Iter<'_> {
+    pub fn borrowed_next(&mut self) -> Option<&[u8]> {
+        if self.next_elem_index >= self.queue_file.elem_cnt {
+            return None;
+        }
+
+        let current = self.queue_file.read_element(self.next_elem_pos).ok()?;
+        self.next_elem_pos = self.queue_file.wrap_pos(current.pos + Element::HEADER_LENGTH as u64);
+
+        if current.len > self.buffer.len() {
+            self.buffer.resize(current.len, 0);
+        }
+        self.queue_file.ring_read(self.next_elem_pos, &mut self.buffer[..current.len]).ok()?;
+
+        self.next_elem_pos = self
+            .queue_file
+            .wrap_pos(current.pos + Element::HEADER_LENGTH as u64 + current.len as u64);
+        self.next_elem_index += 1;
+
+        Some(&self.buffer[..current.len])
+    }
+}
+
+impl Drop for Iter<'_> {
+    fn drop(&mut self) {
+        self.queue_file.write_buf = std::mem::take(&mut self.buffer);
     }
 }
