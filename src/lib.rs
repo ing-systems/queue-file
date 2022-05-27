@@ -560,7 +560,6 @@ impl QueueFile {
         if self.file_len() > self.capacity {
             self.inner.sync_set_len(self.capacity)?;
         }
-        self.inner.file_len = self.capacity;
 
         Ok(())
     }
@@ -737,7 +736,8 @@ impl QueueFile {
             return Ok(());
         }
 
-        let mut prev_len = self.file_len();
+        let orig_file_len = self.file_len();
+        let mut prev_len = orig_file_len;
         let mut new_len = prev_len;
 
         while rem_bytes < data_len {
@@ -746,28 +746,25 @@ impl QueueFile {
             prev_len = new_len;
         }
 
-        self.inner.sync_set_len(new_len)?;
-
         // // Calculate the position of the tail end of the data in the ring buffer
         let end_of_last_elem =
             self.wrap_pos(self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64);
+        self.inner.sync_set_len(new_len)?;
         let mut count = 0u64;
 
         // If the buffer is split, we need to make it contiguous
         if end_of_last_elem <= self.first.pos {
             count = end_of_last_elem - self.header_len;
 
-            let write_pos = self.inner.seek(self.file_len())?;
+            let write_pos = self.inner.seek(orig_file_len)?;
             self.inner.transfer(self.header_len, write_pos, count)?;
         }
 
         // Commit the expansion.
         if self.last.pos < self.first.pos {
-            let new_last_pos = self.file_len() + self.last.pos - self.header_len;
+            let new_last_pos = orig_file_len + self.last.pos - self.header_len;
             self.last = Element::new(new_last_pos, self.last.len);
         }
-
-        self.inner.file_len = new_len;
 
         if self.overwrite_on_remove {
             self.ring_erase(self.header_len, count as usize)?;
@@ -952,6 +949,7 @@ impl QueueFileInner {
 
     fn sync_set_len(&mut self, new_len: u64) -> io::Result<()> {
         self.file.set_len(new_len)?;
+        self.file_len = new_len;
         self.file.sync_all()
     }
 }
