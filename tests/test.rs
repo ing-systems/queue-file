@@ -56,9 +56,14 @@ enum Action {
 
 impl quickcheck::Arbitrary for Action {
     fn arbitrary(mut g: &mut quickcheck::Gen) -> Self {
-        let is_add = bool::arbitrary(&mut g);
+        let kind = u32::arbitrary(&mut g);
 
-        if is_add { Self::Add(Vec::arbitrary(g)) } else { Self::Remove(usize::arbitrary(g)) }
+        match kind % 3 {
+            0 => Self::Add(Vec::arbitrary(g)),
+            1 => Self::Remove(usize::arbitrary(g)),
+            2 => Self::Read { skip: usize::arbitrary(&mut g), take: usize::arbitrary(&mut g) },
+            _ => unreachable!(),
+        }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
