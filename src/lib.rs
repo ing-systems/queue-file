@@ -870,7 +870,8 @@ impl QueueFileInner {
             let read_buffered = read_buffer_offset..read_buffer_end_offset;
 
             let has_start = read_buffered.contains(&self.expected_seek);
-            let has_end = read_buffered.contains(&(self.expected_seek + write_size_u64));
+            let buf_end = self.expected_seek + write_size_u64;
+            let has_end = read_buffered.contains(&buf_end);
 
             match (has_start, has_end) {
                 // rd_buf_offset .. exp_seek .. exp_seek+buf.len .. rd_buf_end
@@ -893,6 +894,17 @@ impl QueueFileInner {
                     let need_to_copy = self.read_buffer.len() - need_to_skip;
                     self.read_buffer[need_to_skip..need_to_skip + need_to_copy]
                         .copy_from_slice(&buf[..need_to_copy]);
+                }
+                // exp_seek .. rd_buf_offset .. rd_buf_end .. exp_seek+buf.len
+                // read buffer is inside writing range, need to rewrite it completely
+                (false, false)
+                    if (self.expected_seek + 1..buf_end).contains(&read_buffer_offset) =>
+                {
+                    let need_to_skip = (read_buffer_offset - self.expected_seek) as usize;
+                    let need_to_copy = self.read_buffer.len();
+
+                    self.read_buffer[..]
+                        .copy_from_slice(&buf[need_to_skip..need_to_skip + need_to_copy]);
                 }
                 // nothing to do, read & write buffers do not overlap
                 (false, false) => {}
