@@ -196,14 +196,41 @@ impl QueueFile {
         Ok(())
     }
 
+    /// Open or create [QueueFile] at `path` with specified minimal file size.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use queue_file::QueueFile;
+    /// # let path = auto_delete_path::AutoDeletePath::temp();
+    /// let qf = QueueFile::with_capacity(path, 120).expect("failed to open queue");
+    /// ```
     pub fn with_capacity<P: AsRef<Path>>(path: P, capacity: u64) -> Result<QueueFile> {
         Self::open_internal(path, true, false, capacity)
     }
 
+    /// Open or create [QueueFile] at `path`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use queue_file::QueueFile;
+    /// # let path = auto_delete_path::AutoDeletePath::temp();
+    /// let qf = QueueFile::open(path).expect("failed to open queue");
+    /// ```
     pub fn open<P: AsRef<Path>>(path: P) -> Result<QueueFile> {
         Self::with_capacity(path, QueueFile::INITIAL_LENGTH)
     }
 
+    /// Open or create [QueueFile] at `path` forcing legacy format.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use queue_file::QueueFile;
+    /// # let path = auto_delete_path::AutoDeletePath::temp();
+    /// let qf = QueueFile::open_legacy(path).expect("failed to open queue");
+    /// ```
     pub fn open_legacy<P: AsRef<Path>>(path: P) -> Result<QueueFile> {
         Self::open_internal(path, true, true, QueueFile::INITIAL_LENGTH)
     }
@@ -565,6 +592,19 @@ impl QueueFile {
     }
 
     /// Returns an iterator over elements in this queue.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use queue_file::QueueFile;
+    /// # let path = auto_delete_path::AutoDeletePath::temp();
+    /// let mut qf = QueueFile::open(path).expect("failed to open queue");
+    /// let items = vec![vec![1, 2], vec![], vec![3]];
+    /// qf.add_n(&items).expect("failed to add elements to queue");
+    ///
+    /// let stored = qf.iter().map(Vec::from).collect::<Vec<_>>();
+    /// assert_eq!(items, stored);
+    /// ```
     pub fn iter(&mut self) -> Iter<'_> {
         let pos = self.first.pos;
 
@@ -601,6 +641,7 @@ impl QueueFile {
         }
     }
 
+    /// Returns underlying file of the queue.
     pub fn into_inner_file(mut self) -> File {
         if self.skip_write_header_on_add {
             let _ = self.sync_header();
@@ -991,6 +1032,7 @@ impl Element {
     }
 }
 
+/// Iterator over items in the queue.
 pub struct Iter<'a> {
     queue_file: &'a mut QueueFile,
     buffer: Vec<u8>,
@@ -1015,6 +1057,9 @@ impl<'a> Iterator for Iter<'a> {
 }
 
 impl Iter<'_> {
+    /// Returns the next element in the queue.
+    /// Similar to `Iter::next` but returned value bounded to internal buffer,
+    /// i.e not allocated at each call.
     pub fn borrowed_next(&mut self) -> Option<&[u8]> {
         if self.next_elem_index >= self.queue_file.elem_cnt {
             return None;
