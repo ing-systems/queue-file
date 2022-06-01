@@ -756,7 +756,7 @@ impl QueueFile {
         if end_of_last_elem <= self.first.pos {
             count = end_of_last_elem - self.header_len;
 
-            self.inner.transfer(self.header_len, self.file_len(), count)?;
+            self.inner.transfer(self.header_len, orig_file_len, count)?;
         }
 
         // Commit the expansion.
