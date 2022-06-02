@@ -787,6 +787,8 @@ impl QueueFile {
             prev_len = new_len;
         }
 
+        let bytes_used_before = self.used_bytes();
+
         // // Calculate the position of the tail end of the data in the ring buffer
         let end_of_last_elem =
             self.wrap_pos(self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64);
@@ -809,6 +811,9 @@ impl QueueFile {
         if self.overwrite_on_remove {
             self.ring_erase(self.header_len, count as usize)?;
         }
+
+        let bytes_used_after = self.used_bytes();
+        debug_assert_eq!(bytes_used_before, bytes_used_after);
 
         Ok(())
     }
