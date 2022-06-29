@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use quickcheck_macros::quickcheck;
 use test_case::test_case;
 
-use queue_file::QueueFile;
+use queue_file::{OffsetCacheKind, QueueFile};
 
 #[test_case(true; "with overwrite")]
 #[test_case(false; "with no overwrite")]
@@ -227,6 +227,32 @@ fn small_queue_is_vecdeque(actions: Vec<Action>) {
 }
 
 #[quickcheck]
+fn small_queue_is_vecdeque_cached_offsets(actions: Vec<Action>) {
+    let path = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::with_capacity(&path, 32 + 32).unwrap();
+    qf.set_overwrite_on_remove(false);
+    qf.set_read_buffer_size(7);
+    qf.set_cache_offset_policy(Some(OffsetCacheKind::Quadratic));
+    let mut vd = VecDeque::new();
+
+    for action in actions {
+        match action {
+            Action::Add(v) => {
+                qf.add(&v).unwrap();
+                vd.push_back(v);
+            }
+            Action::Read { take, skip } => compare_with_vecdeque_partial(&mut qf, &vd, skip, take),
+            Action::Remove(n) => {
+                vd.drain(..n.min(vd.len()));
+                qf.remove_n(n).unwrap();
+            }
+        }
+
+        compare_with_vecdeque(&mut qf, &vd);
+    }
+}
+
+#[quickcheck]
 fn add_n_works(actions: Vec<Action>) {
     let path = auto_delete_path::AutoDeletePath::temp();
     let mut qf = QueueFile::open(&path).unwrap();
@@ -259,4 +285,25 @@ fn add_n_works(actions: Vec<Action>) {
     }
 
     add_n_check!();
+}
+
+#[test]
+fn iter_nth() {
+    let path = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::open(&path).unwrap();
+
+    let a = vec![1];
+    let b = vec![2, 3];
+    let c = vec![4, 5, 6];
+    qf.add_n(vec![a.clone(), b.clone(), c.clone()]).unwrap();
+
+    assert_eq!(qf.iter().nth(0), Some(a.into_boxed_slice()));
+    assert_eq!(qf.iter().nth(1), Some(b.clone().into_boxed_slice()));
+    assert_eq!(qf.iter().nth(2), Some(c.clone().into_boxed_slice()));
+    assert_eq!(qf.iter().skip(0).nth(1), Some(b.clone().into_boxed_slice()));
+    assert_eq!(qf.iter().skip(0).nth(2), Some(c.clone().into_boxed_slice()));
+    assert_eq!(qf.iter().skip(1).nth(0), Some(b.clone().into_boxed_slice()));
+    assert_eq!(qf.iter().skip(1).nth(1), Some(c.clone().into_boxed_slice()));
+    assert_eq!(qf.iter().nth(3), None);
+    assert_eq!(qf.iter().nth(123), None);
 }

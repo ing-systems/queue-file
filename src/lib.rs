@@ -127,6 +127,26 @@ pub struct QueueFile {
     skip_write_header_on_add: bool,
     /// Write buffering.
     write_buf: Vec<u8>,
+    /// Offset cache idx->Element. Sorted in ascending order, always unique.
+    /// Indices form perfect squares though may skew after removal.
+    cached_offsets: Vec<(usize, Element)>,
+    /// Offset caching policy.
+    offset_cache_kind: Option<OffsetCacheKind>,
+}
+
+/// Policy for offset caching if enabled.
+/// Notice that offsets frequency might be skewed due after series of adding/removal.
+/// This shall not affect functional properties, only performance one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OffsetCacheKind {
+    /// Linear offseting.
+    ///
+    /// Next offset would be cached after `offset` additions.
+    Linear { offset: usize },
+    /// Quadratic offseting.
+    ///
+    /// Cached offsets form a sequence of perfect squares (e.g. cached 1st, 4th, 9th, .. offsets).
+    Quadratic,
 }
 
 #[derive(Debug)]
@@ -330,6 +350,8 @@ impl QueueFile {
             overwrite_on_remove,
             skip_write_header_on_add: false,
             write_buf: Vec::new(),
+            cached_offsets: vec![],
+            offset_cache_kind: None,
         };
 
         if file_len < capacity {
@@ -380,6 +402,18 @@ impl QueueFile {
         self.inner.read_buffer.resize(size, 0);
     }
 
+    pub fn get_cache_offset_policy(&self) -> Option<OffsetCacheKind> {
+        self.offset_cache_kind
+    }
+
+    pub fn set_cache_offset_policy(&mut self, kind: impl Into<Option<OffsetCacheKind>>) {
+        self.offset_cache_kind = kind.into();
+
+        if self.offset_cache_kind.is_none() {
+            self.cached_offsets.clear();
+        }
+    }
+
     /// Returns true if this queue contains no entries.
     pub fn is_empty(&self) -> bool {
         self.elem_cnt == 0
@@ -397,6 +431,26 @@ impl QueueFile {
         }
 
         Ok(self.inner.file.sync_all()?)
+    }
+
+    fn cache_last_offset(&mut self) {
+        debug_assert!(self.elem_cnt != 0);
+        let i = self.elem_cnt - 1;
+        if let Some((index, elem)) = self.cached_offsets.last() {
+            if *index == i {
+                debug_assert_eq!(elem.pos, self.last.pos);
+                debug_assert_eq!(elem.len, self.last.len);
+                return;
+            }
+        }
+        self.cached_offsets.push((i, self.last));
+    }
+
+    fn cached_index_up_to(&self, i: usize) -> Option<usize> {
+        self.cached_offsets
+            .binary_search_by(|(idx, _)| idx.cmp(&i))
+            .map(Some)
+            .unwrap_or_else(|i| i.checked_sub(1))
     }
 
     pub fn add_n(
@@ -452,51 +506,30 @@ impl QueueFile {
         self.write_header(self.file_len(), self.elem_cnt + count, self.first.pos, self.last.pos)?;
         self.elem_cnt += count;
 
+        if let Some(kind) = self.offset_cache_kind {
+            let last_index = self.elem_cnt - 1;
+            let need_to_cache = match kind {
+                OffsetCacheKind::Linear { offset } => {
+                    let last_cached_index = self.cached_offsets.last().map_or(0, |(idx, _)| *idx);
+                    last_index - last_cached_index >= offset
+                }
+                OffsetCacheKind::Quadratic => {
+                    let x = (last_index as f64).sqrt() as usize;
+                    x > 1 && (self.elem_cnt - count..=last_index).contains(&(x * x))
+                }
+            };
+
+            if need_to_cache {
+                self.cache_last_offset();
+            }
+        }
+
         Ok(())
     }
 
     /// Adds an element to the end of the queue.
     pub fn add(&mut self, buf: &[u8]) -> Result<()> {
-        ensure!(self.elem_cnt + 1 < i32::max_value() as usize, TooManyElementsSnafu {});
-
-        let len = buf.len();
-
-        ensure!(len <= i32::max_value() as usize, ElementTooBigSnafu {});
-
-        self.expand_if_necessary((Element::HEADER_LENGTH + len) as u64)?;
-
-        // Insert a new element after the current last element.
-        let was_empty = self.is_empty();
-        let pos = if was_empty {
-            self.header_len
-        } else {
-            self.wrap_pos(self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64)
-        };
-
-        let new_last = Element::new(pos, len);
-
-        self.write_buf.clear();
-        // Add length.
-        self.write_buf.extend(&(len as u32).to_be_bytes());
-        // Add data.
-        self.write_buf.extend(buf);
-
-        // Make actual write.
-        self.ring_write_buf(new_last.pos)?;
-
-        if !self.skip_write_header_on_add {
-            // Commit the addition. If was empty, first == last.
-            let first_pos = if was_empty { new_last.pos } else { self.first.pos };
-            self.write_header(self.file_len(), self.elem_cnt + 1, first_pos, new_last.pos)?;
-        }
-        self.last = new_last;
-        self.elem_cnt += 1;
-
-        if was_empty {
-            self.first = self.last;
-        }
-
-        Ok(())
+        self.add_n(std::iter::once(buf))
     }
 
     /// Reads the eldest element. Returns `OK(None)` if the queue is empty.
@@ -524,11 +557,18 @@ impl QueueFile {
             return Ok(());
         }
 
-        let n = min(n, self.elem_cnt);
-
-        if n == self.elem_cnt {
+        if n >= self.elem_cnt {
             return self.clear();
         }
+
+        debug_assert!(
+            self.cached_offsets
+                .iter()
+                .zip(self.cached_offsets.iter().skip(1))
+                .all(|(a, b)| a.0 < b.0),
+            "{:?}",
+            self.cached_offsets
+        );
 
         let erase_start_pos = self.first.pos;
         let mut erase_total_len = 0usize;
@@ -537,7 +577,28 @@ impl QueueFile {
         let mut new_first_pos = self.first.pos;
         let mut new_first_len = self.first.len;
 
-        for _ in 0..n {
+        let cached_index = self.cached_index_up_to(n - 1);
+        let to_remove = if let Some(i) = cached_index {
+            let (index, elem) = self.cached_offsets[i];
+
+            if let Some(index) = index.checked_sub(1) {
+                erase_total_len += Element::HEADER_LENGTH * index;
+                erase_total_len += (elem.pos
+                    + if self.first.pos < elem.pos {
+                        0
+                    } else {
+                        self.file_len() - self.first.pos - self.header_len
+                    }) as usize;
+            }
+
+            new_first_pos = elem.pos;
+            new_first_len = elem.len;
+            n - index
+        } else {
+            n
+        };
+
+        for _ in 0..to_remove {
             erase_total_len += Element::HEADER_LENGTH + new_first_len;
             new_first_pos =
                 self.wrap_pos(new_first_pos + Element::HEADER_LENGTH as u64 + new_first_len as u64);
@@ -551,6 +612,11 @@ impl QueueFile {
         self.write_header(self.file_len(), self.elem_cnt - n, new_first_pos, self.last.pos)?;
         self.elem_cnt -= n;
         self.first = Element::new(new_first_pos, new_first_len);
+
+        if let Some(cached_index) = cached_index {
+            self.cached_offsets.drain(..=cached_index);
+        }
+        self.cached_offsets.iter_mut().for_each(|(i, _)| *i -= n);
 
         if self.overwrite_on_remove {
             self.ring_erase(erase_start_pos, erase_total_len)?;
@@ -579,6 +645,8 @@ impl QueueFile {
                 }
             }
         }
+
+        self.cached_offsets.clear();
 
         self.elem_cnt = 0;
         self.first = Element::EMPTY;
@@ -789,7 +857,7 @@ impl QueueFile {
 
         let bytes_used_before = self.used_bytes();
 
-        // // Calculate the position of the tail end of the data in the ring buffer
+        // Calculate the position of the tail end of the data in the ring buffer
         let end_of_last_elem =
             self.wrap_pos(self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64);
         self.inner.sync_set_len(new_len)?;
@@ -807,6 +875,9 @@ impl QueueFile {
             let new_last_pos = orig_file_len + self.last.pos - self.header_len;
             self.last = Element::new(new_last_pos, self.last.len);
         }
+
+        // TODO: cached offsets might be recalculated after transfer
+        self.cached_offsets.clear();
 
         if self.overwrite_on_remove {
             self.ring_erase(self.header_len, count as usize)?;
@@ -1058,6 +1129,31 @@ impl<'a> Iterator for Iter<'a> {
         let elems_left = self.queue_file.elem_cnt - self.next_elem_index;
 
         (elems_left, Some(elems_left))
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        if self.queue_file.elem_cnt - self.next_elem_index < n {
+            self.next_elem_index = self.queue_file.elem_cnt;
+            return None;
+        }
+
+        let left = if let Some(i) = self.queue_file.cached_index_up_to(n) {
+            let (index, elem) = self.queue_file.cached_offsets[i];
+            if index > self.next_elem_index {
+                self.next_elem_index = index;
+                self.next_elem_pos = elem.pos;
+            }
+
+            n - self.next_elem_index
+        } else {
+            n
+        };
+
+        for _ in 0..left {
+            self.next();
+        }
+
+        self.next()
     }
 }
 
