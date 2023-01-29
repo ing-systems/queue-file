@@ -910,7 +910,7 @@ impl QueueFileInner {
     }
 
     fn read(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        if buf.len() == 0 {
+        if buf.is_empty() {
             return Ok(());
         }
 
