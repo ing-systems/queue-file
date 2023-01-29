@@ -314,18 +314,17 @@ impl QueueFile {
 
         ensure!(file_len <= real_file_len, CorruptedFileSnafu {
             msg: format!(
-                "file is truncated. expected length was {} but actual length is {}",
-                file_len, real_file_len
+                "file is truncated. expected length was {file_len} but actual length is {real_file_len}"
             )
         });
         ensure!(file_len >= header_len, CorruptedFileSnafu {
-            msg: format!("length stored in header ({}) is invalid", file_len)
+            msg: format!("length stored in header ({file_len}) is invalid")
         });
         ensure!(first_pos <= file_len, CorruptedFileSnafu {
-            msg: format!("position of the first element ({}) is beyond the file", first_pos)
+            msg: format!("position of the first element ({first_pos}) is beyond the file")
         });
         ensure!(last_pos <= file_len, CorruptedFileSnafu {
-            msg: format!("position of the last element ({}) is beyond the file", last_pos)
+            msg: format!("position of the last element ({last_pos}) is beyond the file")
         });
 
         let mut queue_file = QueueFile {
