@@ -538,7 +538,7 @@ impl QueueFile {
             Ok(None)
         } else {
             let len = self.first.len;
-            let mut data = vec![0; len as usize].into_boxed_slice();
+            let mut data = vec![0; len].into_boxed_slice();
 
             self.ring_read(self.first.pos + Element::HEADER_LENGTH as u64, &mut data)?;
 
@@ -936,7 +936,7 @@ impl QueueFileInner {
             while !buf.is_empty() {
                 match self.file.read(&mut self.read_buffer[read..]) {
                     Ok(0) => break,
-                    Ok(n) => read += n as usize,
+                    Ok(n) => read += n,
                     Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
                     Err(e) => {
                         res = Err(e);
