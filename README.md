@@ -3,7 +3,6 @@
 [![Crate](https://img.shields.io/crates/v/queue-file.svg)](https://crates.io/crates/queue-file)
 [![API](https://docs.rs/queue-file/badge.svg)](https://docs.rs/queue-file)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Build Status](https://travis-ci.org/ing-systems/queue-file.svg?branch=master)](https://travis-ci.org/ing-systems/queue-file)
 [![Windows Build Status](https://ci.appveyor.com/api/projects/status/loj512o2qo6q0rwg?svg=true)](https://ci.appveyor.com/project/khrs/queue-file)
 
 queue-file is a lightning-fast, transactional, file-based FIFO.
