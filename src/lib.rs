@@ -369,7 +369,7 @@ impl QueueFile {
         self.overwrite_on_remove
     }
 
-    /// Use `overwrite_on_remove` instead.
+    /// Use [`QueueFile::overwrite_on_remove`] instead.
     #[deprecated]
     pub fn get_overwrite_on_remove(&self) -> bool {
         self.overwrite_on_remove()
@@ -387,7 +387,7 @@ impl QueueFile {
         self.inner.sync_writes
     }
 
-    /// Use `sync_writes` instead.
+    /// Use [`QueueFile::sync_writes`] instead.
     #[deprecated]
     pub fn get_sync_writes(&self) -> bool {
         self.sync_writes()
@@ -405,7 +405,7 @@ impl QueueFile {
         self.skip_write_header_on_add
     }
 
-    /// Use `skip_write_header_on_add` instead.
+    /// Use [`QueueFile::skip_write_header_on_add`] instead.
     #[deprecated]
     pub fn get_skip_write_header_on_add(&self) -> bool {
         self.skip_write_header_on_add()
@@ -430,7 +430,7 @@ impl QueueFile {
         self.offset_cache_kind
     }
 
-    /// Use `cache_offset_policy` instead.
+    /// Use [`QueueFile::cache_offset_policy`] instead.
     #[deprecated]
     pub fn get_cache_offset_policy(&self) -> Option<OffsetCacheKind> {
         self.cache_offset_policy()
