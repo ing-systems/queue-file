@@ -16,7 +16,6 @@
 //! `queue-file` crate is a feature complete and binary compatible port of `QueueFile` class from
 //! Tape2 by Square, Inc. Check the original project [here](https://github.com/square/tape).
 
-use snafu::{ensure, Snafu};
 use std::cmp::min;
 use std::fs::{rename, File, OpenOptions};
 use std::io;
@@ -26,6 +25,7 @@ use std::mem::ManuallyDrop;
 use std::path::Path;
 
 use bytes::{Buf, BufMut, BytesMut};
+use snafu::{ensure, Snafu};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

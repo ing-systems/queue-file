@@ -1,15 +1,16 @@
 version = "Two"
-edition = "2018"
+edition = "2021"
 
 max_width = 100
-error_on_line_overflow = true
-error_on_unformatted = true
+error_on_line_overflow = false
+error_on_unformatted = false
 
 normalize_comments = true
 
 use_small_heuristics = "Max"
-fn_args_layout = "Compressed"
+fn_params_layout = "Compressed"
 overflow_delimited_expr = true
 where_single_line = true
 
 reorder_impl_items = true
+group_imports = "StdExternalCrate"

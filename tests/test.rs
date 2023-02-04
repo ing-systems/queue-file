@@ -1,9 +1,8 @@
 use std::collections::VecDeque;
 
+use queue_file::{OffsetCacheKind, QueueFile};
 use quickcheck_macros::quickcheck;
 use test_case::test_case;
-
-use queue_file::{OffsetCacheKind, QueueFile};
 
 #[test_case(true; "with overwrite")]
 #[test_case(false; "with no overwrite")]
