@@ -137,7 +137,7 @@ pub struct QueueFile {
 /// Policy for offset caching if enabled.
 /// Notice that offsets frequency might be skewed due after series of adding/removal.
 /// This shall not affect functional properties, only performance one.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OffsetCacheKind {
     /// Linear offseting.
     ///
@@ -378,7 +378,7 @@ impl QueueFile {
     /// If set to true removing an element will also overwrite data with zero bytes.
     #[inline]
     pub fn set_overwrite_on_remove(&mut self, value: bool) {
-        self.overwrite_on_remove = value
+        self.overwrite_on_remove = value;
     }
 
     /// Returns true if every write to file will be followed by `sync_data()` call.
@@ -396,7 +396,7 @@ impl QueueFile {
     /// If set to true every write to file will be followed by `sync_data()` call.
     #[inline]
     pub fn set_sync_writes(&mut self, value: bool) {
-        self.inner.sync_writes = value
+        self.inner.sync_writes = value;
     }
 
     /// Returns true if skips header update upon adding enabled.
@@ -414,7 +414,7 @@ impl QueueFile {
     /// If set to true skips header update upon adding.
     #[inline]
     pub fn set_skip_write_header_on_add(&mut self, value: bool) {
-        self.skip_write_header_on_add = value
+        self.skip_write_header_on_add = value;
     }
 
     /// Changes buffer size used for data reading.
@@ -457,7 +457,7 @@ impl QueueFile {
         self.elem_cnt
     }
 
-    /// Synchronizes the underlying file, look at [File::sync_all] doc for more info.
+    /// Synchronizes the underlying file, look at [`File::sync_all`] doc for more info.
     pub fn sync_all(&mut self) -> Result<()> {
         if self.skip_write_header_on_add {
             self.sync_header()?;
