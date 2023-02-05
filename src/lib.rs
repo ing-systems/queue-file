@@ -547,8 +547,6 @@ impl QueueFile {
             let elem = elem.as_ref();
             let len = elem.len();
 
-            ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu {});
-
             if first_added.is_none() {
                 first_added = Some(Element::new(pos, len)?);
             }
@@ -1194,9 +1192,7 @@ impl Element {
         ensure!(i64::try_from(pos).is_ok(), CorruptedFileSnafu {
             msg: "element position must be less or equal to i64::MAX"
         });
-        ensure!(i32::try_from(len).is_ok(), CorruptedFileSnafu {
-            msg: "element length must be less or equal to i32::MAX"
-        });
+        ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu);
 
         Ok(Self { pos, len })
     }
