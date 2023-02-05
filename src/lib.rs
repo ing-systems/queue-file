@@ -479,11 +479,11 @@ impl QueueFile {
         self.cached_offsets.push((i, self.last));
     }
 
+    #[inline]
     fn cached_index_up_to(&self, i: usize) -> Option<usize> {
         self.cached_offsets
             .binary_search_by(|(idx, _)| idx.cmp(&i))
-            .map(Some)
-            .unwrap_or_else(|i| i.checked_sub(1))
+            .map_or_else(|i| i.checked_sub(1), Some)
     }
 
     pub fn add_n(
