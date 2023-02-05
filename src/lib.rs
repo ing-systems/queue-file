@@ -666,7 +666,7 @@ impl QueueFile {
         self.write_header(self.capacity, 0, 0, 0)?;
 
         if self.overwrite_on_remove {
-            self.inner.seek(self.header_len)?;
+            self.inner.seek(self.header_len);
             let first_block = self.capacity.min(Self::BLOCK_LENGTH) - self.header_len;
             self.inner.write(&Self::ZEROES[..first_block as usize])?;
 
@@ -801,7 +801,7 @@ impl QueueFile {
             header_buf.put_i32(last_pos as i32);
         }
 
-        self.inner.seek(0)?;
+        self.inner.seek(0);
         self.inner.write(&header.as_ref()[..self.header_len as usize])
     }
 
@@ -828,14 +828,14 @@ impl QueueFile {
         let pos = self.wrap_pos(pos);
 
         if pos + self.write_buf.len() as u64 <= self.file_len() {
-            self.inner.seek(pos)?;
+            self.inner.seek(pos);
             self.inner.write(&self.write_buf)
         } else {
             let before_eof = (self.file_len() - pos) as usize;
 
-            self.inner.seek(pos)?;
+            self.inner.seek(pos);
             self.inner.write(&self.write_buf[..before_eof])?;
-            self.inner.seek(self.header_len)?;
+            self.inner.seek(self.header_len);
             self.inner.write(&self.write_buf[before_eof..])
         }
     }
@@ -864,14 +864,14 @@ impl QueueFile {
         let pos = self.wrap_pos(pos);
 
         if pos + buf.len() as u64 <= self.file_len() {
-            self.inner.seek(pos)?;
+            self.inner.seek(pos);
             self.inner.read(buf)
         } else {
             let before_eof = (self.file_len() - pos) as usize;
 
-            self.inner.seek(pos)?;
+            self.inner.seek(pos);
             self.inner.read(&mut buf[..before_eof])?;
-            self.inner.seek(self.header_len)?;
+            self.inner.seek(self.header_len);
             self.inner.read(&mut buf[before_eof..])
         }
     }
@@ -933,9 +933,11 @@ impl QueueFile {
 impl QueueFileInner {
     const TRANSFER_BUFFER_SIZE: usize = 128 * 1024;
 
-    fn seek(&mut self, pos: u64) -> io::Result<u64> {
+    #[inline]
+    fn seek(&mut self, pos: u64) -> u64 {
         self.expected_seek = pos;
-        Ok(pos)
+
+        pos
     }
 
     fn real_seek(&mut self) -> io::Result<u64> {
@@ -1085,11 +1087,11 @@ impl QueueFileInner {
         let mut bytes_left = count as i64;
 
         while bytes_left > 0 {
-            self.seek(read_pos)?;
+            self.seek(read_pos);
             let bytes_to_read = min(bytes_left as usize, Self::TRANSFER_BUFFER_SIZE);
             self.read(&mut buf[..bytes_to_read])?;
 
-            self.seek(write_pos)?;
+            self.seek(write_pos);
             self.write(&buf[..bytes_to_read])?;
 
             read_pos += bytes_to_read as u64;
