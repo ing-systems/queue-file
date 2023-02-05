@@ -16,6 +16,16 @@
 //! `queue-file` crate is a feature complete and binary compatible port of `QueueFile` class from
 //! Tape2 by Square, Inc. Check the original project [here](https://github.com/square/tape).
 
+#![warn(clippy::pedantic)]
+#![warn(clippy::nursery)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::must_use_candidate)]
+
 use std::cmp::min;
 use std::fs::{rename, File, OpenOptions};
 use std::io;
