@@ -55,12 +55,12 @@ enum Action {
 
 impl quickcheck::Arbitrary for Action {
     fn arbitrary(mut g: &mut quickcheck::Gen) -> Self {
-        let kind = u32::arbitrary(&mut g);
+        let kind = u32::arbitrary(g);
 
         match kind % 3 {
             0 => Self::Add(Vec::arbitrary(g)),
             1 => Self::Remove(usize::arbitrary(g)),
-            2 => Self::Read { skip: usize::arbitrary(&mut g), take: usize::arbitrary(&mut g) },
+            2 => Self::Read { skip: usize::arbitrary(g), take: usize::arbitrary(g) },
             _ => unreachable!(),
         }
     }
@@ -296,13 +296,13 @@ fn iter_nth() {
     let c = vec![4, 5, 6];
     qf.add_n(vec![a.clone(), b.clone(), c.clone()]).unwrap();
 
-    assert_eq!(qf.iter().nth(0), Some(a.into_boxed_slice()));
+    assert_eq!(qf.iter().next(), Some(a.into_boxed_slice()));
     assert_eq!(qf.iter().nth(1), Some(b.clone().into_boxed_slice()));
     assert_eq!(qf.iter().nth(2), Some(c.clone().into_boxed_slice()));
     assert_eq!(qf.iter().skip(0).nth(1), Some(b.clone().into_boxed_slice()));
     assert_eq!(qf.iter().skip(0).nth(2), Some(c.clone().into_boxed_slice()));
-    assert_eq!(qf.iter().skip(1).nth(0), Some(b.clone().into_boxed_slice()));
-    assert_eq!(qf.iter().skip(1).nth(1), Some(c.clone().into_boxed_slice()));
+    assert_eq!(qf.iter().skip(1).next(), Some(b.into_boxed_slice()));
+    assert_eq!(qf.iter().skip(1).nth(1), Some(c.into_boxed_slice()));
     assert_eq!(qf.iter().nth(3), None);
     assert_eq!(qf.iter().nth(123), None);
 }

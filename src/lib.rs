@@ -203,7 +203,7 @@ impl QueueFile {
             if force_legacy {
                 buf.put_u32(capacity as u32);
             } else {
-                buf.put_u32(QueueFile::VERSIONED_HEADER);
+                buf.put_u32(Self::VERSIONED_HEADER);
                 buf.put_u64(capacity);
             }
 
@@ -225,7 +225,7 @@ impl QueueFile {
     /// # let path = auto_delete_path::AutoDeletePath::temp();
     /// let qf = QueueFile::with_capacity(path, 120).expect("failed to open queue");
     /// ```
-    pub fn with_capacity<P: AsRef<Path>>(path: P, capacity: u64) -> Result<QueueFile> {
+    pub fn with_capacity<P: AsRef<Path>>(path: P, capacity: u64) -> Result<Self> {
         Self::open_internal(path, true, false, capacity)
     }
 
@@ -238,8 +238,8 @@ impl QueueFile {
     /// # let path = auto_delete_path::AutoDeletePath::temp();
     /// let qf = QueueFile::open(path).expect("failed to open queue");
     /// ```
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<QueueFile> {
-        Self::with_capacity(path, QueueFile::INITIAL_LENGTH)
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::with_capacity(path, Self::INITIAL_LENGTH)
     }
 
     /// Open or create [QueueFile] at `path` forcing legacy format.
@@ -251,15 +251,15 @@ impl QueueFile {
     /// # let path = auto_delete_path::AutoDeletePath::temp();
     /// let qf = QueueFile::open_legacy(path).expect("failed to open queue");
     /// ```
-    pub fn open_legacy<P: AsRef<Path>>(path: P) -> Result<QueueFile> {
-        Self::open_internal(path, true, true, QueueFile::INITIAL_LENGTH)
+    pub fn open_legacy<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_internal(path, true, true, Self::INITIAL_LENGTH)
     }
 
     fn open_internal<P: AsRef<Path>>(
         path: P, overwrite_on_remove: bool, force_legacy: bool, capacity: u64,
-    ) -> Result<QueueFile> {
+    ) -> Result<Self> {
         if !path.as_ref().exists() {
-            QueueFile::init(path.as_ref(), force_legacy, capacity)?;
+            Self::init(path.as_ref(), force_legacy, capacity)?;
         }
 
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -327,7 +327,7 @@ impl QueueFile {
             msg: format!("position of the last element ({last_pos}) is beyond the file")
         });
 
-        let mut queue_file = QueueFile {
+        let mut queue_file = Self {
             inner: QueueFileInner {
                 file: ManuallyDrop::new(file),
                 file_len,
@@ -668,15 +668,15 @@ impl QueueFile {
         if self.overwrite_on_remove {
             self.inner.seek(self.header_len)?;
             let first_block = self.capacity.min(Self::BLOCK_LENGTH) - self.header_len;
-            self.inner.write(&QueueFile::ZEROES[..first_block as usize])?;
+            self.inner.write(&Self::ZEROES[..first_block as usize])?;
 
             if let Some(left) = self.capacity.checked_sub(Self::BLOCK_LENGTH) {
                 for _ in 0..left / Self::BLOCK_LENGTH {
-                    self.inner.write(&QueueFile::ZEROES)?;
+                    self.inner.write(&Self::ZEROES)?;
                 }
                 let tail = left % Self::BLOCK_LENGTH;
                 if tail != 0 {
-                    self.inner.write(&QueueFile::ZEROES[..tail as usize])?;
+                    self.inner.write(&Self::ZEROES[..tail as usize])?;
                 }
             }
         }
@@ -784,7 +784,7 @@ impl QueueFile {
             assert!(first_pos <= i64::max_value() as u64);
             assert!(last_pos <= i64::max_value() as u64);
 
-            header_buf.put_u32(QueueFile::VERSIONED_HEADER);
+            header_buf.put_u32(Self::VERSIONED_HEADER);
             header_buf.put_u64(file_len);
             header_buf.put_i32(elem_cnt as i32);
             header_buf.put_u64(first_pos);
@@ -845,9 +845,9 @@ impl QueueFile {
         let mut len = n;
 
         self.write_buf.clear();
-        self.write_buf.extend(QueueFile::ZEROES);
+        self.write_buf.extend(Self::ZEROES);
         while len > 0 {
-            let chunk_len = min(len, QueueFile::ZEROES.len());
+            let chunk_len = min(len, Self::ZEROES.len());
             self.write_buf.truncate(chunk_len);
 
             self.ring_write_buf(pos)?;
@@ -1128,7 +1128,7 @@ struct Element {
 }
 
 impl Element {
-    const EMPTY: Element = Element { pos: 0, len: 0 };
+    const EMPTY: Self = Self { pos: 0, len: 0 };
     const HEADER_LENGTH: usize = 4;
 
     fn new(pos: u64, len: usize) -> Self {
@@ -1143,7 +1143,7 @@ impl Element {
             i32::max_value()
         );
 
-        Element { pos, len }
+        Self { pos, len }
     }
 }
 
