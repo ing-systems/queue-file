@@ -292,10 +292,18 @@ impl QueueFile {
             first_pos = buf.get_u64();
             last_pos = buf.get_u64();
 
-            assert!(i64::try_from(file_len).is_ok());
-            assert!(i32::try_from(elem_cnt).is_ok());
-            assert!(i64::try_from(first_pos).is_ok());
-            assert!(i64::try_from(last_pos).is_ok());
+            ensure!(i64::try_from(file_len).is_ok(), CorruptedFileSnafu {
+                msg: "file length in header is greater than i64::MAX"
+            });
+            ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
+                msg: "element count in header is greater than i32::MAX"
+            });
+            ensure!(i64::try_from(first_pos).is_ok(), CorruptedFileSnafu {
+                msg: "first element position in header is greater than i64::MAX"
+            });
+            ensure!(i64::try_from(last_pos).is_ok(), CorruptedFileSnafu {
+                msg: "last element position in header is greater than i64::MAX"
+            });
         } else {
             header_len = 16;
 
@@ -304,10 +312,18 @@ impl QueueFile {
             first_pos = u64::from(buf.get_u32());
             last_pos = u64::from(buf.get_u32());
 
-            assert!(i32::try_from(file_len).is_ok());
-            assert!(i32::try_from(elem_cnt).is_ok());
-            assert!(i32::try_from(first_pos).is_ok());
-            assert!(i32::try_from(last_pos).is_ok());
+            ensure!(i32::try_from(file_len).is_ok(), CorruptedFileSnafu {
+                msg: "file length in header is greater than i32::MAX"
+            });
+            ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
+                msg: "element count in header is greater than i32::MAX"
+            });
+            ensure!(i32::try_from(first_pos).is_ok(), CorruptedFileSnafu {
+                msg: "first element position in header is greater than i32::MAX"
+            });
+            ensure!(i32::try_from(last_pos).is_ok(), CorruptedFileSnafu {
+                msg: "last element position in header is greater than i32::MAX"
+            });
         }
 
         let real_file_len = file.metadata()?.len();
