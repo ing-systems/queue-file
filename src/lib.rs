@@ -494,14 +494,18 @@ impl QueueFile {
 
     fn cache_last_offset(&mut self) {
         debug_assert!(self.elem_cnt != 0);
+
         let i = self.elem_cnt - 1;
+
         if let Some((index, elem)) = self.cached_offsets.last() {
             if *index == i {
                 debug_assert_eq!(elem.pos, self.last.pos);
                 debug_assert_eq!(elem.len, self.last.len);
+
                 return;
             }
         }
+
         self.cached_offsets.push((i, self.last));
     }
 
@@ -525,6 +529,7 @@ impl QueueFile {
         }
 
         ensure!(self.elem_cnt + count < i32::max_value() as usize, TooManyElementsSnafu {});
+
         self.expand_if_necessary(total_len as u64)?;
 
         let was_empty = self.is_empty();
@@ -536,11 +541,13 @@ impl QueueFile {
 
         let mut first_added = None;
         let mut last_added = None;
+
         self.write_buf.clear();
 
         for elem in elems {
             let elem = elem.as_ref();
             let len = elem.len();
+
             ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu {});
 
             if first_added.is_none() {
@@ -700,7 +707,9 @@ impl QueueFile {
                 for _ in 0..left / Self::BLOCK_LENGTH {
                     self.inner.write(&Self::ZEROES)?;
                 }
+
                 let tail = left % Self::BLOCK_LENGTH;
+
                 if tail != 0 {
                     self.inner.write(&Self::ZEROES[..tail as usize])?;
                 }
@@ -872,6 +881,7 @@ impl QueueFile {
 
         self.write_buf.clear();
         self.write_buf.extend(Self::ZEROES);
+
         while len > 0 {
             let chunk_len = min(len, Self::ZEROES.len());
             self.write_buf.truncate(chunk_len);
@@ -926,6 +936,7 @@ impl QueueFile {
         let end_of_last_elem =
             self.wrap_pos(self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64);
         self.inner.sync_set_len(new_len)?;
+
         let mut count = 0u64;
 
         // If the buffer is split, we need to make it contiguous
@@ -973,6 +984,7 @@ impl QueueFileInner {
 
         let res = self.file.seek(SeekFrom::Start(self.expected_seek));
         self.last_seek = res.as_ref().ok().copied();
+
         res
     }
 
@@ -990,6 +1002,7 @@ impl QueueFileInner {
                 .is_none()
         } else {
             self.read_buffer.resize(size, 0);
+
             true
         };
 
@@ -1000,6 +1013,7 @@ impl QueueFileInner {
 
             let mut read = 0;
             let mut res = Ok(());
+
             while !buf.is_empty() {
                 match self.file.read(&mut self.read_buffer[read..]) {
                     Ok(0) => break,
@@ -1019,6 +1033,7 @@ impl QueueFileInner {
             if let Err(err) = res {
                 self.read_buffer_offset = None;
                 self.last_seek = None;
+
                 return Err(err);
             }
 
@@ -1041,6 +1056,7 @@ impl QueueFileInner {
 
         if let Err(err) = self.file.write_all(buf) {
             self.last_seek = None;
+
             return Err(err);
         }
 
@@ -1062,6 +1078,7 @@ impl QueueFileInner {
                 // need to copy whole write buffer
                 (true, true) => {
                     let start = (self.expected_seek - read_buffer_offset) as usize;
+
                     self.read_buffer[start..start + buf.len()].copy_from_slice(buf);
                 }
                 // exp_seek .. rd_buf_offset .. exp_seek+buf.len .. rd_buf_end
@@ -1069,6 +1086,7 @@ impl QueueFileInner {
                 (false, true) => {
                     let need_to_skip = (read_buffer_offset - self.expected_seek) as usize;
                     let need_to_copy = buf.len() - need_to_skip;
+
                     self.read_buffer[..need_to_copy].copy_from_slice(&buf[need_to_skip..]);
                 }
                 // rd_buf_offset .. exp_seek .. rd_buf_end .. exp_seek+buf.len
@@ -1076,6 +1094,7 @@ impl QueueFileInner {
                 (true, false) => {
                     let need_to_skip = (self.expected_seek - read_buffer_offset) as usize;
                     let need_to_copy = self.read_buffer.len() - need_to_skip;
+
                     self.read_buffer[need_to_skip..need_to_skip + need_to_copy]
                         .copy_from_slice(&buf[..need_to_copy]);
                 }
@@ -1201,6 +1220,7 @@ impl<'a> Iterator for Iter<'a> {
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         if self.queue_file.elem_cnt - self.next_elem_index < n {
             self.next_elem_index = self.queue_file.elem_cnt;
+
             return None;
         }
 
