@@ -365,13 +365,13 @@ impl QueueFile {
 
     /// Returns true if removing an element will also overwrite data with zero bytes.
     #[inline]
-    pub fn overwrite_on_remove(&self) -> bool {
+    pub const fn overwrite_on_remove(&self) -> bool {
         self.overwrite_on_remove
     }
 
     /// Use [`QueueFile::overwrite_on_remove`] instead.
     #[deprecated]
-    pub fn get_overwrite_on_remove(&self) -> bool {
+    pub const fn get_overwrite_on_remove(&self) -> bool {
         self.overwrite_on_remove()
     }
 
@@ -383,13 +383,13 @@ impl QueueFile {
 
     /// Returns true if every write to file will be followed by `sync_data()` call.
     #[inline]
-    pub fn sync_writes(&self) -> bool {
+    pub const fn sync_writes(&self) -> bool {
         self.inner.sync_writes
     }
 
     /// Use [`QueueFile::sync_writes`] instead.
     #[deprecated]
-    pub fn get_sync_writes(&self) -> bool {
+    pub const fn get_sync_writes(&self) -> bool {
         self.sync_writes()
     }
 
@@ -401,13 +401,13 @@ impl QueueFile {
 
     /// Returns true if skips header update upon adding enabled.
     #[inline]
-    pub fn skip_write_header_on_add(&self) -> bool {
+    pub const fn skip_write_header_on_add(&self) -> bool {
         self.skip_write_header_on_add
     }
 
     /// Use [`QueueFile::skip_write_header_on_add`] instead.
     #[deprecated]
-    pub fn get_skip_write_header_on_add(&self) -> bool {
+    pub const fn get_skip_write_header_on_add(&self) -> bool {
         self.skip_write_header_on_add()
     }
 
@@ -426,13 +426,13 @@ impl QueueFile {
     }
 
     #[inline]
-    pub fn cache_offset_policy(&self) -> Option<OffsetCacheKind> {
+    pub const fn cache_offset_policy(&self) -> Option<OffsetCacheKind> {
         self.offset_cache_kind
     }
 
     /// Use [`QueueFile::cache_offset_policy`] instead.
     #[deprecated]
-    pub fn get_cache_offset_policy(&self) -> Option<OffsetCacheKind> {
+    pub const fn get_cache_offset_policy(&self) -> Option<OffsetCacheKind> {
         self.cache_offset_policy()
     }
 
@@ -447,13 +447,13 @@ impl QueueFile {
 
     /// Returns true if this queue contains no entries.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.elem_cnt == 0
     }
 
     /// Returns the number of elements in this queue.
     #[inline]
-    pub fn size(&self) -> usize {
+    pub const fn size(&self) -> usize {
         self.elem_cnt
     }
 
@@ -724,13 +724,13 @@ impl QueueFile {
     /// Returns the amount of bytes used by the backed file.
     /// Always >= [`Self::used_bytes`].
     #[inline]
-    pub fn file_len(&self) -> u64 {
+    pub const fn file_len(&self) -> u64 {
         self.inner.file_len
     }
 
     /// Returns the amount of bytes used by the queue.
     #[inline]
-    pub fn used_bytes(&self) -> u64 {
+    pub const fn used_bytes(&self) -> u64 {
         if self.elem_cnt == 0 {
             self.header_len
         } else if self.last.pos >= self.first.pos {
@@ -759,7 +759,7 @@ impl QueueFile {
     }
 
     #[inline]
-    fn remaining_bytes(&self) -> u64 {
+    const fn remaining_bytes(&self) -> u64 {
         self.file_len() - self.used_bytes()
     }
 
@@ -818,7 +818,7 @@ impl QueueFile {
 
     /// Wraps the position if it exceeds the end of the file.
     #[inline]
-    fn wrap_pos(&self, pos: u64) -> u64 {
+    const fn wrap_pos(&self, pos: u64) -> u64 {
         if pos < self.file_len() { pos } else { self.header_len + pos - self.file_len() }
     }
 
