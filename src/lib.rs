@@ -29,8 +29,7 @@
 use std::cmp::min;
 use std::fs::{rename, File, OpenOptions};
 use std::io;
-use std::io::prelude::*;
-use std::io::SeekFrom;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::ManuallyDrop;
 use std::path::Path;
 
@@ -798,7 +797,7 @@ impl QueueFile {
         self.file_len() - self.used_bytes()
     }
 
-    fn sync_header(&mut self) -> io::Result<()> {
+    fn sync_header(&mut self) -> Result<()> {
         self.write_header(self.file_len(), self.size(), self.first.pos, self.last.pos)
     }
 
@@ -808,16 +807,24 @@ impl QueueFile {
     /// atomic in the underlying file system.
     fn write_header(
         &mut self, file_len: u64, elem_cnt: usize, first_pos: u64, last_pos: u64,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         let mut header = [0; 32];
         let mut header_buf = &mut header[..];
 
         // Never allow write values that will render file unreadable by Java library.
         if self.versioned {
-            assert!(i64::try_from(file_len).is_ok());
-            assert!(i32::try_from(elem_cnt).is_ok());
-            assert!(i64::try_from(first_pos).is_ok());
-            assert!(i64::try_from(last_pos).is_ok());
+            ensure!(i64::try_from(file_len).is_ok(), CorruptedFileSnafu {
+                msg: "file length in header will exceed i64::MAX"
+            });
+            ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
+                msg: "element count in header will exceed i32::MAX"
+            });
+            ensure!(i64::try_from(first_pos).is_ok(), CorruptedFileSnafu {
+                msg: "first element position in header will exceed i64::MAX"
+            });
+            ensure!(i64::try_from(last_pos).is_ok(), CorruptedFileSnafu {
+                msg: "last element position in header will exceed i64::MAX"
+            });
 
             header_buf.put_u32(Self::VERSIONED_HEADER);
             header_buf.put_u64(file_len);
@@ -825,10 +832,18 @@ impl QueueFile {
             header_buf.put_u64(first_pos);
             header_buf.put_u64(last_pos);
         } else {
-            assert!(i32::try_from(file_len).is_ok());
-            assert!(i32::try_from(elem_cnt).is_ok());
-            assert!(i32::try_from(first_pos).is_ok());
-            assert!(i32::try_from(last_pos).is_ok());
+            ensure!(i32::try_from(file_len).is_ok(), CorruptedFileSnafu {
+                msg: "file length in header will exceed i32::MAX"
+            });
+            ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
+                msg: "element count in header will exceed i32::MAX"
+            });
+            ensure!(i32::try_from(first_pos).is_ok(), CorruptedFileSnafu {
+                msg: "first element position in header will exceed i32::MAX"
+            });
+            ensure!(i32::try_from(last_pos).is_ok(), CorruptedFileSnafu {
+                msg: "last element position in header will exceed i32::MAX"
+            });
 
             header_buf.put_i32(file_len as i32);
             header_buf.put_i32(elem_cnt as i32);
@@ -859,7 +874,7 @@ impl QueueFile {
 
     /// Writes `n` bytes from buffer to position in file. Automatically wraps write if position is
     /// past the end of the file or if buffer overlaps it.
-    fn ring_write_buf(&mut self, pos: u64) -> io::Result<()> {
+    fn ring_write_buf(&mut self, pos: u64) -> Result<()> {
         let pos = self.wrap_pos(pos);
 
         if pos + self.write_buf.len() as u64 <= self.file_len() {
@@ -875,7 +890,7 @@ impl QueueFile {
         }
     }
 
-    fn ring_erase(&mut self, pos: u64, n: usize) -> io::Result<()> {
+    fn ring_erase(&mut self, pos: u64, n: usize) -> Result<()> {
         let mut pos = pos;
         let mut len = n;
 
@@ -913,7 +928,7 @@ impl QueueFile {
     }
 
     /// If necessary, expands the file to accommodate an additional element of the given length.
-    fn expand_if_necessary(&mut self, data_len: u64) -> io::Result<()> {
+    fn expand_if_necessary(&mut self, data_len: u64) -> Result<()> {
         let mut rem_bytes = self.remaining_bytes();
 
         if rem_bytes >= data_len {
@@ -1051,14 +1066,10 @@ impl QueueFileInner {
         Ok(())
     }
 
-    fn write(&mut self, buf: &[u8]) -> io::Result<()> {
+    fn write(&mut self, buf: &[u8]) -> Result<()> {
         self.real_seek()?;
 
-        if let Err(err) = self.file.write_all(buf) {
-            self.last_seek = None;
-
-            return Err(err);
-        }
+        self.file.write_all(buf)?;
 
         if let Some(seek) = &mut self.last_seek {
             *seek += buf.len() as u64;
@@ -1123,7 +1134,7 @@ impl QueueFileInner {
 
     fn transfer_inner(
         &mut self, buf: &mut [u8], mut read_pos: u64, mut write_pos: u64, count: u64,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         debug_assert!(read_pos < self.file_len);
         debug_assert!(write_pos <= self.file_len);
         debug_assert!(count < self.file_len);
@@ -1153,7 +1164,7 @@ impl QueueFileInner {
     }
 
     /// Transfer `count` bytes starting from `read_pos` to `write_pos`.
-    fn transfer(&mut self, read_pos: u64, write_pos: u64, count: u64) -> io::Result<()> {
+    fn transfer(&mut self, read_pos: u64, write_pos: u64, count: u64) -> Result<()> {
         let mut buf = self.transfer_buf.take().unwrap();
         let res = self.transfer_inner(&mut buf, read_pos, write_pos, count);
         self.transfer_buf = Some(buf);
