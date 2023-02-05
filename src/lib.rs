@@ -550,9 +550,9 @@ impl QueueFile {
             ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu {});
 
             if first_added.is_none() {
-                first_added = Some(Element::new(pos, len));
+                first_added = Some(Element::new(pos, len)?);
             }
-            last_added = Some(Element::new(pos, len));
+            last_added = Some(Element::new(pos, len)?);
 
             self.write_buf.extend(&(len as u32).to_be_bytes());
             self.write_buf.extend(elem);
@@ -678,7 +678,7 @@ impl QueueFile {
         // Commit the header.
         self.write_header(self.file_len(), self.elem_cnt - n, new_first_pos, self.last.pos)?;
         self.elem_cnt -= n;
-        self.first = Element::new(new_first_pos, new_first_len);
+        self.first = Element::new(new_first_pos, new_first_len)?;
 
         if let Some(cached_index) = cached_index {
             self.cached_offsets.drain(..=cached_index);
@@ -855,14 +855,14 @@ impl QueueFile {
         self.inner.write(&header.as_ref()[..self.header_len as usize])
     }
 
-    fn read_element(&mut self, pos: u64) -> io::Result<Element> {
+    fn read_element(&mut self, pos: u64) -> Result<Element> {
         if pos == 0 {
             Ok(Element::EMPTY)
         } else {
             let mut buf: [u8; 4] = [0; Element::HEADER_LENGTH];
             self.ring_read(pos, &mut buf)?;
 
-            Ok(Element::new(pos, u32::from_be_bytes(buf) as usize))
+            Element::new(pos, u32::from_be_bytes(buf) as usize)
         }
     }
 
@@ -964,7 +964,7 @@ impl QueueFile {
         // Commit the expansion.
         if self.last.pos < self.first.pos {
             let new_last_pos = orig_file_len + self.last.pos - self.header_len;
-            self.last = Element::new(new_last_pos, self.last.len);
+            self.last = Element::new(new_last_pos, self.last.len)?;
         }
 
         // TODO: cached offsets might be recalculated after transfer
@@ -1189,19 +1189,16 @@ impl Element {
     const EMPTY: Self = Self { pos: 0, len: 0 };
     const HEADER_LENGTH: usize = 4;
 
-    fn new(pos: u64, len: usize) -> Self {
-        assert!(
-            i64::try_from(pos).is_ok(),
-            "element position must be less than {}",
-            i64::max_value()
-        );
-        assert!(
-            i32::try_from(len).is_ok(),
-            "element length must be less than {}",
-            i32::max_value()
-        );
+    #[inline]
+    fn new(pos: u64, len: usize) -> Result<Self> {
+        ensure!(i64::try_from(pos).is_ok(), CorruptedFileSnafu {
+            msg: "element position must be less or equal to i64::MAX"
+        });
+        ensure!(i32::try_from(len).is_ok(), CorruptedFileSnafu {
+            msg: "element length must be less or equal to i32::MAX"
+        });
 
-        Self { pos, len }
+        Ok(Self { pos, len })
     }
 }
 
