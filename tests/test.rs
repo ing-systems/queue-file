@@ -54,7 +54,7 @@ enum Action {
 }
 
 impl quickcheck::Arbitrary for Action {
-    fn arbitrary(mut g: &mut quickcheck::Gen) -> Self {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
         let kind = u32::arbitrary(g);
 
         match kind % 3 {
@@ -301,7 +301,7 @@ fn iter_nth() {
     assert_eq!(qf.iter().nth(2), Some(c.clone().into_boxed_slice()));
     assert_eq!(qf.iter().skip(0).nth(1), Some(b.clone().into_boxed_slice()));
     assert_eq!(qf.iter().skip(0).nth(2), Some(c.clone().into_boxed_slice()));
-    assert_eq!(qf.iter().skip(1).next(), Some(b.into_boxed_slice()));
+    assert_eq!(qf.iter().nth(1), Some(b.into_boxed_slice()));
     assert_eq!(qf.iter().skip(1).nth(1), Some(c.into_boxed_slice()));
     assert_eq!(qf.iter().nth(3), None);
     assert_eq!(qf.iter().nth(123), None);

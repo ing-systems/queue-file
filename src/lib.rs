@@ -292,10 +292,10 @@ impl QueueFile {
             first_pos = buf.get_u64();
             last_pos = buf.get_u64();
 
-            assert!(file_len <= i64::max_value() as u64);
-            assert!(elem_cnt <= i32::max_value() as usize);
-            assert!(first_pos <= i64::max_value() as u64);
-            assert!(last_pos <= i64::max_value() as u64);
+            assert!(i64::try_from(file_len).is_ok());
+            assert!(i32::try_from(elem_cnt).is_ok());
+            assert!(i64::try_from(first_pos).is_ok());
+            assert!(i64::try_from(last_pos).is_ok());
         } else {
             header_len = 16;
 
@@ -304,10 +304,10 @@ impl QueueFile {
             first_pos = u64::from(buf.get_u32());
             last_pos = u64::from(buf.get_u32());
 
-            assert!(file_len <= i32::max_value() as u64);
-            assert!(elem_cnt <= i32::max_value() as usize);
-            assert!(first_pos <= i32::max_value() as u64);
-            assert!(last_pos <= i32::max_value() as u64);
+            assert!(i32::try_from(file_len).is_ok());
+            assert!(i32::try_from(elem_cnt).is_ok());
+            assert!(i32::try_from(first_pos).is_ok());
+            assert!(i32::try_from(last_pos).is_ok());
         }
 
         let real_file_len = file.metadata()?.len();
@@ -515,7 +515,7 @@ impl QueueFile {
         for elem in elems {
             let elem = elem.as_ref();
             let len = elem.len();
-            ensure!(len <= i32::max_value() as usize, ElementTooBigSnafu {});
+            ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu {});
 
             if first_added.is_none() {
                 first_added = Some(Element::new(pos, len));
@@ -779,10 +779,10 @@ impl QueueFile {
 
         // Never allow write values that will render file unreadable by Java library.
         if self.versioned {
-            assert!(file_len <= i64::max_value() as u64);
-            assert!(elem_cnt <= i32::max_value() as usize);
-            assert!(first_pos <= i64::max_value() as u64);
-            assert!(last_pos <= i64::max_value() as u64);
+            assert!(i64::try_from(file_len).is_ok());
+            assert!(i32::try_from(elem_cnt).is_ok());
+            assert!(i64::try_from(first_pos).is_ok());
+            assert!(i64::try_from(last_pos).is_ok());
 
             header_buf.put_u32(Self::VERSIONED_HEADER);
             header_buf.put_u64(file_len);
@@ -790,10 +790,10 @@ impl QueueFile {
             header_buf.put_u64(first_pos);
             header_buf.put_u64(last_pos);
         } else {
-            assert!(file_len <= i32::max_value() as u64);
-            assert!(elem_cnt <= i32::max_value() as usize);
-            assert!(first_pos <= i32::max_value() as u64);
-            assert!(last_pos <= i32::max_value() as u64);
+            assert!(i32::try_from(file_len).is_ok());
+            assert!(i32::try_from(elem_cnt).is_ok());
+            assert!(i32::try_from(first_pos).is_ok());
+            assert!(i32::try_from(last_pos).is_ok());
 
             header_buf.put_i32(file_len as i32);
             header_buf.put_i32(elem_cnt as i32);
@@ -1080,7 +1080,7 @@ impl QueueFileInner {
         debug_assert!(read_pos < self.file_len);
         debug_assert!(write_pos <= self.file_len);
         debug_assert!(count < self.file_len);
-        debug_assert!(count <= i64::max_value() as u64);
+        debug_assert!(i64::try_from(count).is_ok());
 
         let mut bytes_left = count as i64;
 
@@ -1133,12 +1133,12 @@ impl Element {
 
     fn new(pos: u64, len: usize) -> Self {
         assert!(
-            pos <= i64::max_value() as u64,
+            i64::try_from(pos).is_ok(),
             "element position must be less than {}",
             i64::max_value()
         );
         assert!(
-            len <= i32::max_value() as usize,
+            i32::try_from(len).is_ok(),
             "element length must be less than {}",
             i32::max_value()
         );
