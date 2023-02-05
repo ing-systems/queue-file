@@ -47,7 +47,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// QueueFile is a lightning-fast, transactional, file-based FIFO.
+/// `QueueFile` is a lightning-fast, transactional, file-based FIFO.
 ///
 /// Addition and removal from an instance is an O(1) operation and is atomic.
 /// Writes are synchronous by default; data will be written to disk before an operation returns.
@@ -216,7 +216,7 @@ impl QueueFile {
         Ok(())
     }
 
-    /// Open or create [QueueFile] at `path` with specified minimal file size.
+    /// Open or create [`QueueFile`] at `path` with specified minimal file size.
     ///
     /// # Example
     ///
@@ -229,7 +229,7 @@ impl QueueFile {
         Self::open_internal(path, true, false, capacity)
     }
 
-    /// Open or create [QueueFile] at `path`.
+    /// Open or create [`QueueFile`] at `path`.
     ///
     /// # Example
     ///
@@ -242,7 +242,7 @@ impl QueueFile {
         Self::with_capacity(path, Self::INITIAL_LENGTH)
     }
 
-    /// Open or create [QueueFile] at `path` forcing legacy format.
+    /// Open or create [`QueueFile`] at `path` forcing legacy format.
     ///
     /// # Example
     ///
@@ -722,7 +722,7 @@ impl QueueFile {
     }
 
     /// Returns the amount of bytes used by the backed file.
-    /// Always >= [Self::used_bytes].
+    /// Always >= [`Self::used_bytes`].
     #[inline]
     pub fn file_len(&self) -> u64 {
         self.inner.file_len
