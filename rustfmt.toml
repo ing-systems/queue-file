@@ -3,14 +3,14 @@ edition = "2021"
 
 max_width = 100
 error_on_line_overflow = false
-error_on_unformatted = false
+error_on_unformatted = true
 
 normalize_comments = true
 
 use_small_heuristics = "Max"
 fn_params_layout = "Compressed"
 overflow_delimited_expr = true
-where_single_line = true
-
 reorder_impl_items = true
+
 group_imports = "StdExternalCrate"
+imports_granularity = "Module"

@@ -2,7 +2,7 @@ default:
   @just --list --unsorted --color=always | rg -v "    default"
 
 # Format source code
-format:
+fmt:
     cargo +nightly fmt
 
 clippy:

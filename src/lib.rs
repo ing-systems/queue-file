@@ -432,7 +432,6 @@ impl QueueFile {
         self.skip_write_header_on_add
     }
 
-
     #[deprecated(since = "1.4.7", note = "Use `skip_write_header_on_add` instead.")]
     pub const fn get_skip_write_header_on_add(&self) -> bool {
         self.skip_write_header_on_add()
