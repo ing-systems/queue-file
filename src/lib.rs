@@ -16,8 +16,12 @@
 //! `queue-file` crate is a feature complete and binary compatible port of `QueueFile` class from
 //! Tape2 by Square, Inc. Check the original project [here](https://github.com/square/tape).
 
-#![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
+#![warn(clippy::pedantic)]
+#![warn(clippy::mutex_atomic)]
+#![warn(clippy::rc_buffer)]
+#![warn(clippy::rc_mutex)]
+// #![warn(clippy::unwrap_used)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_precision_loss)]
@@ -394,8 +398,7 @@ impl QueueFile {
         self.overwrite_on_remove
     }
 
-    /// Use [`QueueFile::overwrite_on_remove`] instead.
-    #[deprecated]
+    #[deprecated(since = "1.4.7", note = "Use `overwrite_on_remove` instead.")]
     pub const fn get_overwrite_on_remove(&self) -> bool {
         self.overwrite_on_remove()
     }
@@ -412,8 +415,7 @@ impl QueueFile {
         self.inner.sync_writes
     }
 
-    /// Use [`QueueFile::sync_writes`] instead.
-    #[deprecated]
+    #[deprecated(since = "1.4.7", note = "Use `sync_writes` instead.")]
     pub const fn get_sync_writes(&self) -> bool {
         self.sync_writes()
     }
@@ -430,8 +432,8 @@ impl QueueFile {
         self.skip_write_header_on_add
     }
 
-    /// Use [`QueueFile::skip_write_header_on_add`] instead.
-    #[deprecated]
+
+    #[deprecated(since = "1.4.7", note = "Use `skip_write_header_on_add` instead.")]
     pub const fn get_skip_write_header_on_add(&self) -> bool {
         self.skip_write_header_on_add()
     }
@@ -455,8 +457,7 @@ impl QueueFile {
         self.offset_cache_kind
     }
 
-    /// Use [`QueueFile::cache_offset_policy`] instead.
-    #[deprecated]
+    #[deprecated(since = "1.4.7", note = "Use `cache_offset_policy` instead.")]
     pub const fn get_cache_offset_policy(&self) -> Option<OffsetCacheKind> {
         self.cache_offset_policy()
     }
