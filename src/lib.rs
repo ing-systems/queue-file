@@ -1217,6 +1217,7 @@ impl Element {
 }
 
 /// Iterator over items in the queue.
+#[derive(Debug)]
 pub struct Iter<'a> {
     queue_file: &'a mut QueueFile,
     buffer: Vec<u8>,
