@@ -16,19 +16,37 @@
 //! `queue-file` crate is a feature complete and binary compatible port of `QueueFile` class from
 //! Tape2 by Square, Inc. Check the original project [here](https://github.com/square/tape).
 
-#![warn(clippy::nursery)]
-#![warn(clippy::pedantic)]
-#![warn(clippy::mutex_atomic)]
-#![warn(clippy::rc_buffer)]
-#![warn(clippy::rc_mutex)]
-// #![warn(clippy::unwrap_used)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::cast_possible_wrap)]
-#![allow(clippy::cast_precision_loss)]
-#![allow(clippy::cast_sign_loss)]
-#![allow(clippy::missing_errors_doc)]
-#![allow(clippy::missing_panics_doc)]
-#![allow(clippy::must_use_candidate)]
+#![forbid(non_ascii_idents)]
+#![deny(
+    macro_use_extern_crate,
+    missing_copy_implementations,
+    missing_debug_implementations,
+    rust_2018_idioms,
+    rust_2021_compatibility,
+    trivial_casts,
+    trivial_numeric_casts,
+    unused_extern_crates,
+    unused_import_braces,
+    unused_qualifications
+)]
+#![warn(
+    clippy::nursery,
+    clippy::pedantic,
+    clippy::mutex_atomic,
+    clippy::rc_buffer,
+    clippy::rc_mutex,
+    // clippy::expect_used,
+    // clippy::unwrap_used,
+)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate
+)]
 
 use std::cmp::min;
 use std::fs::{rename, File, OpenOptions};
