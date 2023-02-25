@@ -52,6 +52,10 @@ fn main() {
 }
 ```
 
+## MSRV
+
+Current MSRV is 1.58.1
+
 ## License
 
 This project is licensed under the [Apache 2.0 license](LICENSE).

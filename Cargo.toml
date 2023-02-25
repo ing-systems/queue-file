@@ -10,6 +10,7 @@ repository = "https://github.com/ing-systems/queue-file"
 readme = "README.md"
 keywords = ["io", "fifo", "queue"]
 categories = ["data-structures"]
+rust-version = "1.58.1"
 
 [dependencies]
 bytes = "1.0"
