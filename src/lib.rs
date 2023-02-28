@@ -49,6 +49,7 @@
 )]
 
 use std::cmp::min;
+use std::collections::VecDeque;
 use std::fs::{rename, File, OpenOptions};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -160,7 +161,7 @@ pub struct QueueFile {
     write_buf: Vec<u8>,
     /// Offset cache idx->Element. Sorted in ascending order, always unique.
     /// Indices form perfect squares though may skew after removal.
-    cached_offsets: Vec<(usize, Element)>,
+    cached_offsets: VecDeque<(usize, Element)>,
     /// Offset caching policy.
     offset_cache_kind: Option<OffsetCacheKind>,
 }
@@ -396,7 +397,7 @@ impl QueueFile {
             overwrite_on_remove,
             skip_write_header_on_add: false,
             write_buf: Vec::new(),
-            cached_offsets: vec![],
+            cached_offsets: VecDeque::new(),
             offset_cache_kind: None,
         };
 
@@ -514,7 +515,7 @@ impl QueueFile {
 
         let i = self.elem_cnt - 1;
 
-        if let Some((index, elem)) = self.cached_offsets.last() {
+        if let Some((index, elem)) = self.cached_offsets.back() {
             if *index == i {
                 debug_assert_eq!(elem.pos, self.last.pos);
                 debug_assert_eq!(elem.len, self.last.len);
@@ -523,7 +524,7 @@ impl QueueFile {
             }
         }
 
-        self.cached_offsets.push((i, self.last));
+        self.cached_offsets.push_back((i, self.last));
     }
 
     #[inline]
@@ -591,7 +592,7 @@ impl QueueFile {
             let last_index = self.elem_cnt - 1;
             let need_to_cache = match kind {
                 OffsetCacheKind::Linear { offset } => {
-                    let last_cached_index = self.cached_offsets.last().map_or(0, |(idx, _)| *idx);
+                    let last_cached_index = self.cached_offsets.back().map_or(0, |(idx, _)| *idx);
                     last_index - last_cached_index >= offset
                 }
                 OffsetCacheKind::Quadratic => {
