@@ -510,21 +510,42 @@ impl QueueFile {
         Ok(self.inner.file.sync_all()?)
     }
 
+    fn cache_last_offset_if_needed(&mut self, count: usize) {
+        let need_to_cache = self.offset_cache_kind.map_or(false, |kind| {
+            let last_index = self.elem_cnt - 1;
+
+            match kind {
+                OffsetCacheKind::Linear { offset } => {
+                    let last_cached_index = self.cached_offsets.back().map_or(0, |(idx, _)| *idx);
+                    last_index - last_cached_index >= offset
+                }
+                OffsetCacheKind::Quadratic => {
+                    let x = (last_index as f64).sqrt() as usize;
+                    x > 1 && (self.elem_cnt - count..=last_index).contains(&(x * x))
+                }
+            }
+        });
+
+        if need_to_cache {
+            self.cache_last_offset();
+        }
+    }
+
     fn cache_last_offset(&mut self) {
         debug_assert!(self.elem_cnt != 0);
 
-        let i = self.elem_cnt - 1;
+        let index = self.elem_cnt - 1;
 
-        if let Some((index, elem)) = self.cached_offsets.back() {
-            if *index == i {
-                debug_assert_eq!(elem.pos, self.last.pos);
-                debug_assert_eq!(elem.len, self.last.len);
+        if let Some((last_cached_index, last_cached_elem)) = self.cached_offsets.back() {
+            if *last_cached_index == index {
+                debug_assert_eq!(last_cached_elem.pos, self.last.pos);
+                debug_assert_eq!(last_cached_elem.len, self.last.len);
 
                 return;
             }
         }
 
-        self.cached_offsets.push_back((i, self.last));
+        self.cached_offsets.push_back((index, self.last));
     }
 
     #[inline]
@@ -588,23 +609,7 @@ impl QueueFile {
         self.write_header(self.file_len(), self.elem_cnt + count, self.first.pos, self.last.pos)?;
         self.elem_cnt += count;
 
-        if let Some(kind) = self.offset_cache_kind {
-            let last_index = self.elem_cnt - 1;
-            let need_to_cache = match kind {
-                OffsetCacheKind::Linear { offset } => {
-                    let last_cached_index = self.cached_offsets.back().map_or(0, |(idx, _)| *idx);
-                    last_index - last_cached_index >= offset
-                }
-                OffsetCacheKind::Quadratic => {
-                    let x = (last_index as f64).sqrt() as usize;
-                    x > 1 && (self.elem_cnt - count..=last_index).contains(&(x * x))
-                }
-            };
-
-            if need_to_cache {
-                self.cache_last_offset();
-            }
-        }
+        self.cache_last_offset_if_needed(count);
 
         Ok(())
     }
@@ -1289,6 +1294,8 @@ impl Iter<'_> {
             .queue_file
             .wrap_pos(current.pos + Element::HEADER_LENGTH as u64 + current.len as u64);
         self.next_elem_index += 1;
+
+        self.queue_file.cache_last_offset_if_needed(self.next_elem_index);
 
         Some(&self.buffer[..current.len])
     }
