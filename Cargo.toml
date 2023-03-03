@@ -1,6 +1,6 @@
 [package]
 name = "queue-file"
-version = "1.4.8"
+version = "1.4.9"
 license = "Apache-2.0"
 authors = ["ING Systems <contact@ing-systems.com>"]
 description = "queue-file is a lightning-fast, transactional, file-based FIFO"
