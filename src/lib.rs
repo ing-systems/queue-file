@@ -510,7 +510,11 @@ impl QueueFile {
         Ok(self.inner.file.sync_all()?)
     }
 
-    fn cache_last_offset_if_needed(&mut self, count: usize) {
+    fn cache_last_offset_if_needed(&mut self, affected_items: usize) {
+        if self.elem_cnt == 0 {
+            return;
+        }
+
         let need_to_cache = self.offset_cache_kind.map_or(false, |kind| {
             let last_index = self.elem_cnt - 1;
 
@@ -521,7 +525,7 @@ impl QueueFile {
                 }
                 OffsetCacheKind::Quadratic => {
                     let x = (last_index as f64).sqrt() as usize;
-                    x > 1 && (self.elem_cnt - count..=last_index).contains(&(x * x))
+                    x > 1 && (self.elem_cnt - affected_items..=last_index).contains(&(x * x))
                 }
             }
         });
@@ -1295,7 +1299,7 @@ impl Iter<'_> {
             .wrap_pos(current.pos + Element::HEADER_LENGTH as u64 + current.len as u64);
         self.next_elem_index += 1;
 
-        self.queue_file.cache_last_offset_if_needed(self.next_elem_index);
+        self.queue_file.cache_last_offset_if_needed(1);
 
         Some(&self.buffer[..current.len])
     }
