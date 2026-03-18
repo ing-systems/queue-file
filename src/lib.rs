@@ -498,6 +498,12 @@ enum SyncContext {
     AppendBatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredSyncPhase {
+    BacklinkRewrite,
+    AppendBatch,
+}
+
 impl Drop for QueueFile {
     fn drop(&mut self) {
         if self.skip_write_header_on_add {
@@ -1946,33 +1952,25 @@ impl QueueFile {
     fn with_batched_backlink_rewrite_sync<T>(
         &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
-        let sync_writes = self.inner.sync_writes;
-        let sync_context = self.inner.sync_context;
-        self.inner.sync_writes = false;
-        self.inner.sync_context = SyncContext::BacklinkRewrite;
-
-        let result = f(self);
-
-        self.inner.sync_context = sync_context;
-        self.inner.sync_writes = sync_writes;
-
-        let value = result?;
-
-        if sync_writes {
-            self.inner.file.sync_data()?;
-            maybe_inject_failpoint("v2_after_backlink_rewrite_flush")?;
-        }
-
-        Ok(value)
+        self.with_deferred_sync(DeferredSyncPhase::BacklinkRewrite, f)
     }
 
     fn with_batched_v2_append_sync<T>(
         &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
+        self.with_deferred_sync(DeferredSyncPhase::AppendBatch, f)
+    }
+
+    fn with_deferred_sync<T>(
+        &mut self, phase: DeferredSyncPhase, f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         let sync_writes = self.inner.sync_writes;
         let sync_context = self.inner.sync_context;
         self.inner.sync_writes = false;
-        self.inner.sync_context = SyncContext::AppendBatch;
+        self.inner.sync_context = match phase {
+            DeferredSyncPhase::BacklinkRewrite => SyncContext::BacklinkRewrite,
+            DeferredSyncPhase::AppendBatch => SyncContext::AppendBatch,
+        };
 
         let result = f(self);
 
@@ -1983,7 +1981,10 @@ impl QueueFile {
 
         if sync_writes {
             self.inner.file.sync_data()?;
-            maybe_inject_failpoint("v2_after_add_batch_flush")?;
+            maybe_inject_failpoint(match phase {
+                DeferredSyncPhase::BacklinkRewrite => "v2_after_backlink_rewrite_flush",
+                DeferredSyncPhase::AppendBatch => "v2_after_add_batch_flush",
+            })?;
         }
 
         Ok(value)
