@@ -172,6 +172,39 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+// ── Header slot ──────────────────────────────────────────────────────────────
+
+/// One of the two on-disk header slots used by the V2 format.
+///
+/// The V2 format maintains two 56-byte slots at fixed offsets so that header
+/// writes are atomic: data is always written to the *inactive* slot before the
+/// active pointer is flipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderSlot {
+    /// Slot A at file offset [`V2_SLOT_A_OFFSET`].
+    A,
+    /// Slot B at file offset [`V2_SLOT_B_OFFSET`].
+    B,
+}
+
+impl HeaderSlot {
+    /// Returns the other slot.
+    const fn toggle(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::A,
+        }
+    }
+
+    /// Returns the file offset of this slot.
+    const fn offset(self) -> u64 {
+        match self {
+            Self::A => V2_SLOT_A_OFFSET,
+            Self::B => V2_SLOT_B_OFFSET,
+        }
+    }
+}
+
 // ── Format state ─────────────────────────────────────────────────────────────
 
 /// Which on-disk format this queue file uses, including any format-specific mutable state.
@@ -182,7 +215,7 @@ enum FormatState {
     /// 32-byte header; the previous default Rust format.
     V1,
     /// Dual 56-byte slots + element headers/footers with CRC-32 integrity.
-    V2 { active_slot: u8, generation: u64, next_seq: u64 },
+    V2 { active_slot: HeaderSlot, generation: u64, next_seq: u64 },
 }
 
 // ── V2 slot data ─────────────────────────────────────────────────────────────
@@ -209,7 +242,7 @@ struct LegacyHeaderState {
 
 #[derive(Debug, Clone, Copy)]
 struct V2OpenState {
-    active_slot: u8,
+    active_slot: HeaderSlot,
     slot: SlotData,
     elem_cnt: usize,
 }
@@ -334,18 +367,18 @@ fn read_slot(inner: &QueueFileInner, offset: u64) -> Result<[u8; V2_SLOT_LEN]> {
 /// Both invalid → error. One valid → use it. Both valid → higher generation wins (A wins ties).
 fn elect_canonical_slot(
     slot_a: Option<SlotData>, slot_b: Option<SlotData>,
-) -> Result<(u8, SlotData)> {
+) -> Result<(HeaderSlot, SlotData)> {
     match (slot_a, slot_b) {
         (None, None) => {
             Err(Error::CorruptedFile { msg: "both v2 header slots are invalid".to_owned() })
         }
-        (Some(a), None) => Ok((0, a)),
-        (None, Some(b)) => Ok((1, b)),
+        (Some(a), None) => Ok((HeaderSlot::A, a)),
+        (None, Some(b)) => Ok((HeaderSlot::B, b)),
         (Some(a), Some(b)) => {
             if a.generation >= b.generation {
-                Ok((0, a))
+                Ok((HeaderSlot::A, a))
             } else {
-                Ok((1, b))
+                Ok((HeaderSlot::B, b))
             }
         }
     }
@@ -543,7 +576,7 @@ impl QueueFile {
     }
 
     #[inline]
-    const fn v2_state(&self) -> Option<(u8, u64, u64)> {
+    const fn v2_state(&self) -> Option<(HeaderSlot, u64, u64)> {
         match self.format {
             FormatState::V2 { active_slot, generation, next_seq } => {
                 Some((active_slot, generation, next_seq))
@@ -553,7 +586,7 @@ impl QueueFile {
     }
 
     #[inline]
-    fn v2_state_mut(&mut self) -> Option<(&mut u8, &mut u64, &mut u64)> {
+    fn v2_state_mut(&mut self) -> Option<(&mut HeaderSlot, &mut u64, &mut u64)> {
         match &mut self.format {
             FormatState::V2 { active_slot, generation, next_seq } => {
                 Some((active_slot, generation, next_seq))
@@ -1784,7 +1817,7 @@ impl QueueFile {
             let (active_slot, generation, next_seq) = self.v2_state().ok_or_else(|| {
                 Error::CorruptedFile { msg: "operation requires V2 format state".to_owned() }
             })?;
-            (1 - active_slot, generation, next_seq)
+            (active_slot.toggle(), generation, next_seq)
         };
 
         let slot_data = SlotData {
@@ -1798,7 +1831,7 @@ impl QueueFile {
 
         let slot_bytes = build_slot_bytes(&slot_data);
 
-        let offset = if next_slot == 0 { V2_SLOT_A_OFFSET } else { V2_SLOT_B_OFFSET };
+        let offset = next_slot.offset();
 
         // Write directly to absolute offset (not ring buffer).
         self.inner.seek(offset);
