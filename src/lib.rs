@@ -42,7 +42,7 @@
 //! * **V2** (dual 56-byte slots, default): created by [`QueueFile::open`] and
 //!   [`QueueFile::with_capacity`]. Supports per-element CRC integrity, sequence numbers, and
 //!   backlink recovery. Files created by older versions are automatically migrated on open.
-//! * **Versioned** (32 bytes): the previous default format, now migrated to V2 on open.
+//! * **V1** (32 bytes): the previous default format, now migrated to V2 on open.
 //! * **Legacy** (16 bytes): created by [`QueueFile::open_legacy`]. Binary-compatible with the
 //!   original Java `QueueFile`. Supports files up to `i32::MAX` bytes only.
 //!
@@ -177,7 +177,7 @@ enum Format {
     /// 16-byte header; binary-compatible with the Java `QueueFile`.
     Legacy,
     /// 32-byte header; the previous default Rust format.
-    Versioned,
+    V1,
     /// Dual 56-byte slots + element headers/footers with CRC-32 integrity.
     V2,
 }
@@ -649,7 +649,7 @@ impl QueueFile {
             return Self::open_internal_full(path, overwrite_on_remove, false, capacity, false);
         }
 
-        let format = if versioned { Format::Versioned } else { Format::Legacy };
+        let format = if versioned { Format::V1 } else { Format::Legacy };
 
         let mut queue_file = Self {
             inner: QueueFileInner {
@@ -1628,7 +1628,7 @@ impl QueueFile {
         let mut header = [0u8; 32];
         let mut header_buf: &mut [u8] = &mut header;
 
-        if matches!(self.format, Format::Versioned) {
+        if matches!(self.format, Format::V1) {
             ensure!(
                 i64::try_from(file_len).is_ok(),
                 CorruptedFileSnafu { msg: "file length in header will exceed i64::MAX" }
