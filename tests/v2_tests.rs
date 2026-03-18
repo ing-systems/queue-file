@@ -78,15 +78,12 @@ fn parse_slot_fields(bytes: &[u8]) -> ParsedSlot {
     }
 }
 
-struct FailpointGuard {
-    _lock: MutexGuard<'static, ()>,
-}
+struct FailpointGuard;
 
 impl FailpointGuard {
     fn set(name: &str) -> Self {
-        let lock = FAILPOINT_LOCK.lock().unwrap();
         std::env::set_var(FAILPOINT_ENV, name);
-        Self { _lock: lock }
+        Self
     }
 }
 
@@ -108,11 +105,16 @@ fn fill_wrapped_queue_until_next_add_expands(qf: &mut QueueFile) {
     }
 }
 
+fn lock_failpoint_env() -> MutexGuard<'static, ()> {
+    FAILPOINT_LOCK.lock().unwrap()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// A fresh v2 file should have valid magic at slot A.
 #[test]
 fn v2_fresh_file_both_slots_valid() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -135,6 +137,7 @@ fn v2_fresh_file_both_slots_valid() {
 /// Corrupt A → elect B (gen=2, 1 elem) → "hello" only.
 #[test]
 fn v2_slot_a_corrupt_slot_b_valid() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -155,6 +158,7 @@ fn v2_slot_a_corrupt_slot_b_valid() {
 /// Corrupt slot B; reopening should succeed using slot A.
 #[test]
 fn v2_slot_b_corrupt_slot_a_valid() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -174,6 +178,7 @@ fn v2_slot_b_corrupt_slot_a_valid() {
 /// Corrupt both slots; opening should fail.
 #[test]
 fn v2_both_slots_corrupt() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -192,6 +197,7 @@ fn v2_both_slots_corrupt() {
 /// After 2 adds: A=(gen=3, 2 elem), B=(gen=2, 1 elem). Corrupt A → elect B (1 elem).
 #[test]
 fn v2_nonzero_flags_invalid() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -213,6 +219,7 @@ fn v2_nonzero_flags_invalid() {
 /// A slot with a flipped CRC byte should be treated as invalid.
 #[test]
 fn v2_crc_mismatch_invalid() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -233,6 +240,7 @@ fn v2_crc_mismatch_invalid() {
 /// Corrupting the element header CRC should cause open or peek to fail.
 #[test]
 fn v2_element_header_crc_mismatch() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -268,6 +276,7 @@ fn v2_element_header_crc_mismatch() {
 /// Corrupting the element footer magic should cause peek/read to fail.
 #[test]
 fn v2_element_footer_magic_mismatch() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -294,6 +303,7 @@ fn v2_element_footer_magic_mismatch() {
 /// Corrupting the element footer CRC should cause peek/read to fail.
 #[test]
 fn v2_element_footer_crc_mismatch() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -319,6 +329,7 @@ fn v2_element_footer_crc_mismatch() {
 /// Changing the footer sequence field should cause peek/read to fail.
 #[test]
 fn v2_footer_sequence_mismatch() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -344,6 +355,7 @@ fn v2_footer_sequence_mismatch() {
 /// Corrupt `next_seq` in the active slot so tail seq check fails.
 #[test]
 fn v2_tail_sequence_mismatch() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -386,6 +398,7 @@ fn v2_tail_sequence_mismatch() {
 /// Corrupt the first element's header magic; recovery via backlinks should succeed.
 #[test]
 fn v2_head_recovery() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -430,6 +443,7 @@ fn v2_head_recovery() {
 /// A backlink cycle should be rejected during bounded recovery.
 #[test]
 fn v2_backlink_cycle() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -482,6 +496,7 @@ fn v2_backlink_cycle() {
 
 #[test]
 fn v2_recover_head_after_dequeues_with_historical_backlink() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -512,6 +527,7 @@ fn v2_recover_head_after_dequeues_with_historical_backlink() {
 
 #[test]
 fn v2_recovery_fails_when_prev_zero_appears_before_live_count() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -536,6 +552,7 @@ fn v2_recovery_fails_when_prev_zero_appears_before_live_count() {
 /// A sequence discontinuity in backlinks should cause recovery to fail.
 #[test]
 fn v2_backlink_sequence_discontinuity() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     {
         let mut qf = QueueFile::open(&p).unwrap();
@@ -593,6 +610,7 @@ fn v2_backlink_sequence_discontinuity() {
 /// After clear and re-add, sequence numbers must be monotonically increasing.
 #[test]
 fn v2_clear_preserves_next_seq() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
 
     let mut qf = QueueFile::open(&p).unwrap();
@@ -615,6 +633,7 @@ fn v2_clear_preserves_next_seq() {
 /// Fill queue to force wrapping, trigger expansion, and verify data is intact.
 #[test]
 fn v2_wrapped_expansion() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
 
     let mut qf = QueueFile::open(&p).unwrap();
@@ -641,6 +660,7 @@ fn v2_wrapped_expansion() {
 
 #[test]
 fn v2_relocation_commit_happens_before_erasing_old_wrapped_bytes() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     let mut qf = QueueFile::open(&p).unwrap();
     fill_wrapped_queue_until_next_add_expands(&mut qf);
@@ -675,6 +695,7 @@ fn v2_relocation_commit_happens_before_erasing_old_wrapped_bytes() {
 
 #[test]
 fn v2_reopens_relocated_pre_add_queue_after_cleanup_before_final_add_commit() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     let mut qf = QueueFile::open(&p).unwrap();
     fill_wrapped_queue_until_next_add_expands(&mut qf);
@@ -694,6 +715,7 @@ fn v2_reopens_relocated_pre_add_queue_after_cleanup_before_final_add_commit() {
 
 #[test]
 fn v2_backlink_rewrite_batch_suppresses_per_header_syncs() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     let mut qf = QueueFile::open(&p).unwrap();
     qf.set_sync_writes(true);
@@ -708,6 +730,7 @@ fn v2_backlink_rewrite_batch_suppresses_per_header_syncs() {
 
 #[test]
 fn v2_backlink_rewrite_flush_happens_before_relocation_commit() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     let mut qf = QueueFile::open(&p).unwrap();
     qf.set_sync_writes(true);
@@ -737,6 +760,7 @@ fn v2_backlink_rewrite_flush_happens_before_relocation_commit() {
 /// Opening a v0 (legacy) file with `open()` should migrate it to v2.
 #[test]
 fn v2_migrate_v0() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
 
     // Create a legacy (v0) queue.
@@ -764,6 +788,7 @@ fn v2_migrate_v0() {
 /// Opening a v1 (versioned) file with `open()` should migrate it to v2.
 #[test]
 fn v2_migrate_v1() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
 
     // Create a v1 queue by bypassing migration (open_internal_full with allow_migration=false).
@@ -800,6 +825,7 @@ fn v2_migrate_v1() {
 /// `open_legacy` must NOT trigger migration; it should create/use a v0 file.
 #[test]
 fn v2_open_legacy_creates_v0() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
 
     let mut qf = QueueFile::open_legacy(&p).unwrap();
@@ -814,6 +840,7 @@ fn v2_open_legacy_creates_v0() {
 /// Basic quickcheck-like property test: v2 queue behaves like VecDeque.
 #[test]
 fn v2_queue_like_vecdeque() {
+    let _lock = lock_failpoint_env();
     use std::collections::VecDeque;
 
     let p = temp_path();
@@ -859,6 +886,7 @@ fn v2_queue_like_vecdeque() {
 /// A cross-format fixture test: known v2 bytes can be re-parsed correctly.
 #[test]
 fn v2_cross_format_fixture() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
 
     {
@@ -895,6 +923,7 @@ fn v2_cross_format_fixture() {
 /// Test that `add_n` batch writes work correctly in v2 format.
 #[test]
 fn v2_add_n_batch() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     let mut qf = QueueFile::open(&p).unwrap();
 
@@ -909,9 +938,54 @@ fn v2_add_n_batch() {
     assert_eq!(items[2], b"three".to_vec());
 }
 
+#[test]
+fn v2_add_n_batch_suppresses_per_write_syncs() {
+    let _lock = lock_failpoint_env();
+    let p = temp_path();
+    let mut qf = QueueFile::open(&p).unwrap();
+    qf.set_sync_writes(true);
+
+    let batch = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
+    let failpoint = FailpointGuard::set("v2_add_batch_per_write_sync");
+    qf.add_n(batch.iter().map(|v| v.as_slice())).unwrap();
+    drop(failpoint);
+
+    assert!(qf.sync_writes(), "sync_writes should be restored after batched append");
+}
+
+#[test]
+fn v2_add_n_batch_restores_sync_state_after_flush_failure() {
+    let _lock = lock_failpoint_env();
+    let p = temp_path();
+    let mut qf = QueueFile::open(&p).unwrap();
+    qf.set_sync_writes(true);
+
+    let (before_bytes, _) = active_slot(&p);
+    let before = parse_slot_fields(&before_bytes);
+
+    let batch = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
+    let failpoint = FailpointGuard::set("v2_after_add_batch_flush");
+    let err = qf.add_n(batch.iter().map(|v| v.as_slice())).unwrap_err().to_string();
+    drop(failpoint);
+
+    assert!(err.contains("v2_after_add_batch_flush"), "unexpected error: {err}");
+    assert!(qf.sync_writes(), "sync_writes should be restored after batched append failure");
+
+    let (after_bytes, _) = active_slot(&p);
+    let after = parse_slot_fields(&after_bytes);
+    assert_eq!(after.generation, before.generation, "header commit must not happen yet");
+    assert_eq!(after.element_count, before.element_count, "header must remain authoritative");
+
+    drop(qf);
+
+    let reopened = QueueFile::open(&p).unwrap();
+    assert_eq!(reopened.size(), before.element_count as usize);
+}
+
 /// Test remove_n in v2 format.
 #[test]
 fn v2_remove_n() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     let mut qf = QueueFile::open(&p).unwrap();
 
@@ -933,6 +1007,7 @@ fn v2_remove_n() {
 /// Test that skip_write_header_on_add works with v2.
 #[test]
 fn v2_skip_write_header_on_add() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     let mut qf = QueueFile::open(&p).unwrap();
     qf.set_skip_write_header_on_add(true);
@@ -959,6 +1034,7 @@ fn v2_skip_write_header_on_add() {
 /// Test persistence: data survives close and reopen.
 #[test]
 fn v2_persistence() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
 
     {
@@ -977,6 +1053,7 @@ fn v2_persistence() {
 /// Test that empty elements (zero-length payloads) work in v2.
 #[test]
 fn v2_empty_elements() {
+    let _lock = lock_failpoint_env();
     let p = temp_path();
     let mut qf = QueueFile::open(&p).unwrap();
 

@@ -495,6 +495,7 @@ struct QueueFileInner {
 enum SyncContext {
     Normal,
     BacklinkRewrite,
+    AppendBatch,
 }
 
 impl Drop for QueueFile {
@@ -1193,37 +1194,42 @@ impl QueueFile {
 
         let base_seq = self.next_seq;
 
-        for (i, elem) in elems.into_iter().enumerate() {
-            let elem = elem.as_ref();
-            let len = elem.len();
+        self.with_batched_v2_append_sync(|queue_file| {
+            for (i, elem) in elems.into_iter().enumerate() {
+                let elem = elem.as_ref();
+                let len = elem.len();
 
-            ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu {});
+                ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu {});
 
-            let seq = base_seq + i as u64;
+                let seq = base_seq + i as u64;
 
-            // prev_pos: 0 if this is the absolute first element; else pos of the previous elem.
-            let prev_pos = if was_empty && i == 0 {
-                0u64
-            } else if i == 0 {
-                // Continuing from existing last.
-                self.last.pos
-            } else {
-                last_added.map_or(0, |e| e.pos)
-            };
+                // prev_pos: 0 if this is the absolute first element; else pos of the previous
+                // elem.
+                let prev_pos = if was_empty && i == 0 {
+                    0u64
+                } else if i == 0 {
+                    // Continuing from existing last.
+                    queue_file.last.pos
+                } else {
+                    last_added.map_or(0, |e| e.pos)
+                };
 
-            let ds = self.data_start;
-            let fl = self.file_len();
-            Self::write_v2_element(&mut self.inner, pos, seq, prev_pos, elem, ds, fl)?;
+                let ds = queue_file.data_start;
+                let fl = queue_file.file_len();
+                Self::write_v2_element(&mut queue_file.inner, pos, seq, prev_pos, elem, ds, fl)?;
 
-            let elem_entry = Element { pos, len, seq };
+                let elem_entry = Element { pos, len, seq };
 
-            if first_added.is_none() {
-                first_added = Some(elem_entry);
+                if first_added.is_none() {
+                    first_added = Some(elem_entry);
+                }
+                last_added = Some(elem_entry);
+
+                pos = queue_file.wrap_pos(pos + V2_ELEM_OVERHEAD + len as u64);
             }
-            last_added = Some(elem_entry);
 
-            pos = self.wrap_pos(pos + V2_ELEM_OVERHEAD + len as u64);
-        }
+            Ok(())
+        })?;
 
         let first_added = first_added.unwrap();
         let last_added = last_added.unwrap();
@@ -1960,6 +1966,29 @@ impl QueueFile {
         Ok(value)
     }
 
+    fn with_batched_v2_append_sync<T>(
+        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let sync_writes = self.inner.sync_writes;
+        let sync_context = self.inner.sync_context;
+        self.inner.sync_writes = false;
+        self.inner.sync_context = SyncContext::AppendBatch;
+
+        let result = f(self);
+
+        self.inner.sync_context = sync_context;
+        self.inner.sync_writes = sync_writes;
+
+        let value = result?;
+
+        if sync_writes {
+            self.inner.file.sync_data()?;
+            maybe_inject_failpoint("v2_after_add_batch_flush")?;
+        }
+
+        Ok(value)
+    }
+
     /// Ring write using self's `data_start` and `file_len` (for use when we can't borrow inner separately).
     fn ring_write_raw_from_self(&mut self, pos: u64, data: &[u8]) -> Result<()> {
         let data_start = self.data_start;
@@ -2159,6 +2188,8 @@ impl QueueFileInner {
         if self.sync_writes {
             if self.sync_context == SyncContext::BacklinkRewrite {
                 maybe_inject_failpoint("v2_backlink_rewrite_per_write_sync")?;
+            } else if self.sync_context == SyncContext::AppendBatch {
+                maybe_inject_failpoint("v2_add_batch_per_write_sync")?;
             }
             self.file.sync_data()?;
         }
