@@ -363,13 +363,13 @@ fn iter_nth() {
     let c = vec![4, 5, 6];
     qf.add_n(vec![a.clone(), b.clone(), c.clone()]).unwrap();
 
-    assert_eq!(qf.iter().next(), Some(a.into_boxed_slice()));
-    assert_eq!(qf.iter().nth(1), Some(b.clone().into_boxed_slice()));
-    assert_eq!(qf.iter().nth(2), Some(c.clone().into_boxed_slice()));
-    assert_eq!(qf.iter().skip(0).nth(1), Some(b.clone().into_boxed_slice()));
-    assert_eq!(qf.iter().skip(0).nth(2), Some(c.clone().into_boxed_slice()));
-    assert_eq!(qf.iter().nth(1), Some(b.into_boxed_slice()));
-    assert_eq!(qf.iter().skip(1).nth(1), Some(c.into_boxed_slice()));
+    assert_eq!(qf.iter().next(), Some(a));
+    assert_eq!(qf.iter().nth(1), Some(b.clone()));
+    assert_eq!(qf.iter().nth(2), Some(c.clone()));
+    assert_eq!(qf.iter().skip(0).nth(1), Some(b.clone()));
+    assert_eq!(qf.iter().skip(0).nth(2), Some(c.clone()));
+    assert_eq!(qf.iter().nth(1), Some(b));
+    assert_eq!(qf.iter().skip(1).nth(1), Some(c));
     assert_eq!(qf.iter().nth(3), None);
     assert_eq!(qf.iter().nth(123), None);
 }
@@ -393,7 +393,7 @@ fn peek_supports_shared_borrow() {
     qf.add(b"abc").unwrap();
 
     let head = qf.peek().unwrap().unwrap();
-    assert_eq!(head.as_ref(), b"abc");
+    assert_eq!(head.as_slice(), b"abc");
 }
 
 #[test]
@@ -420,6 +420,6 @@ fn read_lock_can_peek_and_iter() {
     let head = guard.peek().unwrap().unwrap();
     let items: Vec<Vec<u8>> = guard.iter().map(Vec::from).collect();
 
-    assert_eq!(head.as_ref(), b"alpha");
+    assert_eq!(head.as_slice(), b"alpha");
     assert_eq!(items, vec![b"alpha".to_vec(), b"beta".to_vec()]);
 }

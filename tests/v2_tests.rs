@@ -645,7 +645,7 @@ fn v2_clear_preserves_next_seq() {
     let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 1);
     let item = qf.peek().unwrap().unwrap();
-    assert_eq!(item.as_ref(), b"after_clear_1");
+    assert_eq!(item.as_slice(), b"after_clear_1");
 }
 
 /// Fill queue to force wrapping, trigger expansion, and verify data is intact.
@@ -935,7 +935,7 @@ fn v2_cross_format_fixture() {
     // Verify we can reopen and read the data.
     let qf = QueueFile::open(&p).unwrap();
     let data = qf.peek().unwrap().unwrap();
-    assert_eq!(data.as_ref(), b"fixture_data");
+    assert_eq!(data.as_slice(), b"fixture_data");
 }
 
 /// Test that `add_n` batch writes work correctly in v2 format.
@@ -1054,7 +1054,7 @@ fn v2_remove_n() {
     assert_eq!(qf.size(), 7);
 
     let first = qf.peek().unwrap().unwrap();
-    assert_eq!(first.as_ref(), &3u32.to_be_bytes());
+    assert_eq!(first.as_slice(), &3u32.to_be_bytes());
 
     qf.remove_n(7).unwrap();
     assert_eq!(qf.size(), 0);

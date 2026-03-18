@@ -438,7 +438,7 @@ fn maybe_inject_failpoint(name: &str) -> Result<()> {
 /// qf.add(&data).expect("add failed");
 ///
 /// if let Ok(Some(bytes)) = qf.peek() {
-///     assert_eq!(data, bytes.as_ref());
+///     assert_eq!(data, bytes.as_slice());
 /// }
 ///
 /// qf.remove().expect("remove failed");
@@ -1442,13 +1442,13 @@ impl QueueFile {
     // ── peek ──────────────────────────────────────────────────────────────────
 
     /// Returns the head element without removing it.
-    pub fn peek(&self) -> Result<Option<Box<[u8]>>> {
+    pub fn peek(&self) -> Result<Option<Vec<u8>>> {
         if self.is_empty() {
             return Ok(None);
         }
 
         let len = self.first.len;
-        let mut data = vec![0; len].into_boxed_slice();
+        let mut data = vec![0; len];
 
         if self.is_v2() {
             let payload_start = self.wrap_pos(self.first.pos + V2_ELEM_HDR_LEN as u64);
@@ -2326,11 +2326,11 @@ pub struct Iter<'a> {
 }
 
 impl Iterator for Iter<'_> {
-    type Item = Box<[u8]>;
+    type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let buffer = self.borrowed_next()?;
-        Some(buffer.to_vec().into_boxed_slice())
+        Some(buffer.to_vec())
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
