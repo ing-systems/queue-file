@@ -484,7 +484,7 @@ struct QueueFileInner {
     file_len: u64,
     expected_seek: u64,
     last_seek: Option<u64>,
-    transfer_buf: Option<Box<[u8]>>,
+    transfer_buf: Box<[u8]>,
     sync_writes: bool,
     sync_context: SyncContext,
 }
@@ -760,9 +760,7 @@ impl QueueFile {
                 file_len: state.file_len,
                 expected_seek: 0,
                 last_seek: Some(32),
-                transfer_buf: Some(
-                    vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
-                ),
+                transfer_buf: vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
                 sync_writes: cfg!(not(test)),
                 sync_context: SyncContext::Normal,
             },
@@ -823,7 +821,7 @@ impl QueueFile {
             file_len: real_file_len,
             expected_seek: 0,
             last_seek: None,
-            transfer_buf: Some(vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice()),
+            transfer_buf: vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
             sync_writes: cfg!(not(test)),
             sync_context: SyncContext::Normal,
         };
@@ -2272,9 +2270,9 @@ impl QueueFileInner {
     }
 
     fn transfer(&mut self, read_pos: u64, write_pos: u64, count: u64) -> Result<()> {
-        let mut buf = self.transfer_buf.take().unwrap();
+        let mut buf = std::mem::take(&mut self.transfer_buf);
         let res = self.transfer_inner(&mut buf, read_pos, write_pos, count);
-        self.transfer_buf = Some(buf);
+        self.transfer_buf = buf;
 
         res
     }
