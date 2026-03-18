@@ -124,7 +124,7 @@ fn fill_wrapped_queue_until_next_add_expands(qf: &mut QueueFile) {
 }
 
 fn lock_failpoint_env() -> MutexGuard<'static, ()> {
-    FAILPOINT_LOCK.lock().unwrap()
+    FAILPOINT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1081,6 +1081,51 @@ fn v2_add_n_batch_restores_sync_state_after_flush_failure() {
 
     let reopened = QueueFile::open(&p).unwrap();
     assert_eq!(reopened.size(), before.element_count as usize);
+}
+
+#[test]
+fn v2_clear_erase_batch_suppresses_per_chunk_syncs() {
+    let _lock = lock_failpoint_env();
+    let p = temp_path();
+    let mut qf = QueueFile::with_capacity(&p, 16_384).unwrap();
+    qf.set_sync_writes(true);
+    qf.set_overwrite_on_remove(true);
+
+    for i in 0..64u32 {
+        qf.add(&i.to_be_bytes()).unwrap();
+    }
+
+    let failpoint = FailpointGuard::set("clear_erase_per_write_sync");
+    qf.clear().unwrap();
+    drop(failpoint);
+
+    assert!(qf.sync_writes(), "sync_writes should be restored after clear erase batching");
+    assert!(qf.is_empty(), "queue should be empty after clear");
+}
+
+#[test]
+fn v2_clear_erase_flush_restores_sync_state_on_failure() {
+    let _lock = lock_failpoint_env();
+    let p = temp_path();
+    let mut qf = QueueFile::with_capacity(&p, 16_384).unwrap();
+    qf.set_sync_writes(true);
+    qf.set_overwrite_on_remove(true);
+
+    for i in 0..64u32 {
+        qf.add(&i.to_be_bytes()).unwrap();
+    }
+
+    let failpoint = FailpointGuard::set("clear_after_erase_flush");
+    let err = qf.clear().unwrap_err().to_string();
+    drop(failpoint);
+
+    assert!(err.contains("clear_after_erase_flush"), "unexpected error: {err}");
+    assert!(qf.sync_writes(), "sync_writes should be restored after clear erase failure");
+
+    drop(qf);
+
+    let reopened = QueueFile::open(&p).unwrap();
+    assert!(reopened.is_empty(), "reopen should observe the committed empty state");
 }
 
 /// Test remove_n in v2 format.

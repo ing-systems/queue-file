@@ -493,6 +493,7 @@ struct QueueFileInner {
 enum SyncContext {
     Normal,
     ExpansionCopy,
+    ClearErase,
     BacklinkRewrite,
     AppendBatch,
 }
@@ -500,6 +501,7 @@ enum SyncContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeferredSyncPhase {
     ExpansionCopy,
+    ClearErase,
     BacklinkRewrite,
     AppendBatch,
 }
@@ -513,7 +515,6 @@ impl Drop for QueueFile {
 }
 
 impl QueueFile {
-    const BLOCK_LENGTH: u64 = 4096;
     const INITIAL_LENGTH: u64 = 4096;
     const VERSIONED_HEADER: u32 = 0x8000_0001;
     const ZEROES: [u8; 4096] = [0; 4096];
@@ -1586,15 +1587,10 @@ impl QueueFile {
                 // Zero the data region.
                 let data_end = self.file_len().min(new_cap);
                 if data_end > V2_DATA_START {
-                    let mut pos = V2_DATA_START;
-                    let mut remaining = (data_end - V2_DATA_START) as usize;
-                    while remaining > 0 {
-                        let chunk = remaining.min(Self::ZEROES.len());
-                        self.inner.seek(pos);
-                        self.inner.write(&Self::ZEROES[..chunk])?;
-                        pos += chunk as u64;
-                        remaining -= chunk;
-                    }
+                    self.with_batched_clear_erase_sync(|queue_file| {
+                        queue_file
+                            .write_zero_chunks(V2_DATA_START, (data_end - V2_DATA_START) as usize)
+                    })?;
                 }
             }
 
@@ -1614,21 +1610,12 @@ impl QueueFile {
         self.write_header(self.capacity, 0, 0, 0)?;
 
         if self.overwrite_on_remove {
-            self.inner.seek(self.data_start());
-            let first_block = self.capacity.min(Self::BLOCK_LENGTH) - self.data_start();
-            self.inner.write(&Self::ZEROES[..first_block as usize])?;
-
-            if let Some(left) = self.capacity.checked_sub(Self::BLOCK_LENGTH) {
-                for _ in 0..left / Self::BLOCK_LENGTH {
-                    self.inner.write(&Self::ZEROES)?;
-                }
-
-                let tail = left % Self::BLOCK_LENGTH;
-
-                if tail != 0 {
-                    self.inner.write(&Self::ZEROES[..tail as usize])?;
-                }
-            }
+            self.with_batched_clear_erase_sync(|queue_file| {
+                queue_file.write_zero_chunks(
+                    queue_file.data_start(),
+                    (queue_file.capacity - queue_file.data_start()) as usize,
+                )
+            })?;
         }
 
         self.cached_offsets.clear();
@@ -2045,6 +2032,12 @@ impl QueueFile {
         self.with_deferred_sync(DeferredSyncPhase::BacklinkRewrite, f)
     }
 
+    fn with_batched_clear_erase_sync<T>(
+        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.with_deferred_sync(DeferredSyncPhase::ClearErase, f)
+    }
+
     fn with_batched_expansion_copy_sync<T>(
         &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
@@ -2065,6 +2058,7 @@ impl QueueFile {
         self.inner.sync_writes = false;
         self.inner.sync_context = match phase {
             DeferredSyncPhase::ExpansionCopy => SyncContext::ExpansionCopy,
+            DeferredSyncPhase::ClearErase => SyncContext::ClearErase,
             DeferredSyncPhase::BacklinkRewrite => SyncContext::BacklinkRewrite,
             DeferredSyncPhase::AppendBatch => SyncContext::AppendBatch,
         };
@@ -2080,6 +2074,7 @@ impl QueueFile {
             self.inner.file_mut()?.sync_data()?;
             maybe_inject_failpoint(match phase {
                 DeferredSyncPhase::ExpansionCopy => "v2_after_expansion_copy_flush",
+                DeferredSyncPhase::ClearErase => "clear_after_erase_flush",
                 DeferredSyncPhase::BacklinkRewrite => "v2_after_backlink_rewrite_flush",
                 DeferredSyncPhase::AppendBatch => "v2_after_add_batch_flush",
             })?;
@@ -2093,6 +2088,18 @@ impl QueueFile {
         let data_start = self.data_start();
         let file_len = self.file_len();
         Self::ring_write_raw(&mut self.inner, pos, data, data_start, file_len)
+    }
+
+    fn write_zero_chunks(&mut self, mut pos: u64, mut len: usize) -> Result<()> {
+        while len > 0 {
+            let chunk_len = min(len, Self::ZEROES.len());
+            self.inner.seek(pos);
+            self.inner.write(&Self::ZEROES[..chunk_len])?;
+            pos += chunk_len as u64;
+            len -= chunk_len;
+        }
+
+        Ok(())
     }
 
     // ── Migration ─────────────────────────────────────────────────────────────
@@ -2217,6 +2224,9 @@ impl QueueFileInner {
                 SyncContext::Normal => {}
                 SyncContext::ExpansionCopy => {
                     maybe_inject_failpoint("v2_expansion_copy_per_write_sync")?;
+                }
+                SyncContext::ClearErase => {
+                    maybe_inject_failpoint("clear_erase_per_write_sync")?;
                 }
                 SyncContext::BacklinkRewrite => {
                     maybe_inject_failpoint("v2_backlink_rewrite_per_write_sync")?;

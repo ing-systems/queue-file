@@ -1,9 +1,32 @@
 use std::collections::VecDeque;
-use std::sync::RwLock;
+use std::sync::{Mutex, MutexGuard, RwLock};
 
 use queue_file::{OffsetCacheKind, QueueFile};
 use quickcheck_macros::quickcheck;
 use test_case::test_case;
+
+const FAILPOINT_ENV: &str = "QUEUE_FILE_FAILPOINT";
+
+static FAILPOINT_LOCK: Mutex<()> = Mutex::new(());
+
+struct FailpointGuard;
+
+impl FailpointGuard {
+    fn set(name: &str) -> Self {
+        std::env::set_var(FAILPOINT_ENV, name);
+        Self
+    }
+}
+
+impl Drop for FailpointGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(FAILPOINT_ENV);
+    }
+}
+
+fn lock_failpoint_env() -> MutexGuard<'static, ()> {
+    FAILPOINT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Tests that the legacy format preserves capacity behavior (file size = requested size, doubles
 /// on overflow, shrinks back to capacity on clear).
@@ -95,6 +118,51 @@ fn existing_queue_extended_on_new_capacity(is_overwrite: bool) {
     // Just verify legacy file still works (the original behavior is tested in legacy path).
     let qf = QueueFile::open_legacy(&p).unwrap();
     assert!(qf.file_len() > 0);
+}
+
+#[test]
+fn legacy_clear_erase_batch_suppresses_per_chunk_syncs() {
+    let _lock = lock_failpoint_env();
+    let p = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::open_legacy(&p).unwrap();
+    qf.set_sync_writes(true);
+    qf.set_overwrite_on_remove(true);
+
+    for i in 0..64u32 {
+        qf.add(&i.to_be_bytes()).unwrap();
+    }
+
+    let failpoint = FailpointGuard::set("clear_erase_per_write_sync");
+    qf.clear().unwrap();
+    drop(failpoint);
+
+    assert!(qf.sync_writes(), "sync_writes should be restored after clear erase batching");
+    assert!(qf.is_empty(), "queue should be empty after clear");
+}
+
+#[test]
+fn legacy_clear_erase_flush_restores_sync_state_on_failure() {
+    let _lock = lock_failpoint_env();
+    let p = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::open_legacy(&p).unwrap();
+    qf.set_sync_writes(true);
+    qf.set_overwrite_on_remove(true);
+
+    for i in 0..64u32 {
+        qf.add(&i.to_be_bytes()).unwrap();
+    }
+
+    let failpoint = FailpointGuard::set("clear_after_erase_flush");
+    let err = qf.clear().unwrap_err().to_string();
+    drop(failpoint);
+
+    assert!(err.contains("clear_after_erase_flush"), "unexpected error: {err}");
+    assert!(qf.sync_writes(), "sync_writes should be restored after clear erase failure");
+
+    drop(qf);
+
+    let reopened = QueueFile::open_legacy(&p).unwrap();
+    assert!(reopened.is_empty(), "reopen should observe the committed empty state");
 }
 
 #[derive(Debug, Clone)]
