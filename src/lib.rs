@@ -1216,7 +1216,9 @@ impl QueueFile {
 
     fn add_n_v2(&mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Result<()> {
         let snapshot = self.snapshot_queue_state();
-        let (_, _, base_seq) = self.v2_state().expect("v2 append requires v2 format state");
+        let (_, _, base_seq) = self.v2_state().ok_or_else(|| Error::CorruptedFile {
+            msg: "operation requires V2 format state".to_owned(),
+        })?;
 
         let result = self.with_batched_v2_append_sync(|queue_file| {
             let mut count = 0usize;
@@ -1264,7 +1266,9 @@ impl QueueFile {
             Ok(count) => {
                 if count != 0 {
                     let (_, _, next_seq) =
-                        self.v2_state_mut().expect("v2 append requires v2 format state");
+                        self.v2_state_mut().ok_or_else(|| Error::CorruptedFile {
+                            msg: "operation requires V2 format state".to_owned(),
+                        })?;
                     *next_seq = base_seq + count as u64;
 
                     if !self.skip_write_header_on_add {
@@ -1365,7 +1369,12 @@ impl QueueFile {
             } else {
                 self.wrap_pos(self.last.pos + V2_ELEM_OVERHEAD + self.last.len as u64)
             };
-            let seq = self.v2_state().expect("v2 append requires v2 format state").2;
+            let seq = self
+                .v2_state()
+                .ok_or_else(|| Error::CorruptedFile {
+                    msg: "operation requires V2 format state".to_owned(),
+                })?
+                .2;
             let prev_pos = if self.is_empty() { 0 } else { self.last.pos };
 
             self.with_batched_v2_append_sync(|queue_file| {
@@ -1381,7 +1390,9 @@ impl QueueFile {
             self.last = elem;
             self.elem_cnt += 1;
 
-            let (_, _, next_seq) = self.v2_state_mut().expect("v2 append requires v2 format state");
+            let (_, _, next_seq) = self.v2_state_mut().ok_or_else(|| Error::CorruptedFile {
+                msg: "operation requires V2 format state".to_owned(),
+            })?;
             *next_seq += 1;
         } else {
             let len = buf.len();
@@ -1674,12 +1685,14 @@ impl QueueFile {
         }
     }
 
-    pub fn into_inner_file(mut self) -> File {
+    pub fn into_inner_file(mut self) -> Result<File> {
         if self.skip_write_header_on_add {
-            let _ = self.sync_header();
+            self.sync_header()?;
         }
 
-        self.inner.file.take().unwrap()
+        self.inner.file.take().ok_or_else(|| Error::Io {
+            source: io::Error::new(io::ErrorKind::BrokenPipe, "file handle already consumed"),
+        })
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -1768,8 +1781,9 @@ impl QueueFile {
         &mut self, file_len: u64, elem_cnt: usize, first_pos: u64, last_pos: u64,
     ) -> Result<()> {
         let (next_slot, generation, next_seq) = {
-            let (active_slot, generation, next_seq) =
-                self.v2_state().expect("v2 header writes require v2 format state");
+            let (active_slot, generation, next_seq) = self.v2_state().ok_or_else(|| {
+                Error::CorruptedFile { msg: "operation requires V2 format state".to_owned() }
+            })?;
             (1 - active_slot, generation, next_seq)
         };
 
@@ -1790,8 +1804,9 @@ impl QueueFile {
         self.inner.seek(offset);
         self.inner.write(&slot_bytes)?;
 
-        let (active_slot, generation, _) =
-            self.v2_state_mut().expect("v2 header writes require v2 format state");
+        let (active_slot, generation, _) = self.v2_state_mut().ok_or_else(|| {
+            Error::CorruptedFile { msg: "operation requires V2 format state".to_owned() }
+        })?;
         *generation += 1;
         *active_slot = next_slot;
 

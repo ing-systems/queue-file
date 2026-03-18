@@ -34,7 +34,7 @@ fn into_inner_file_flushes_deferred_header_safely() {
     qf.set_skip_write_header_on_add(true);
     qf.add(b"abc").unwrap();
 
-    let file = qf.into_inner_file();
+    let file = qf.into_inner_file().unwrap();
     drop(file);
 
     let reopened = QueueFile::open(&path).unwrap();
