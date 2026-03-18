@@ -54,11 +54,7 @@ fn active_slot(path: impl AsRef<std::path::Path>) -> (Vec<u8>, u64) {
     let gen_a = i64::from_be_bytes(slot_a_bytes[36..44].try_into().unwrap());
     let gen_b = i64::from_be_bytes(slot_b_bytes[36..44].try_into().unwrap());
 
-    if gen_b >= gen_a {
-        (slot_b_bytes, V2_SLOT_B_OFFSET)
-    } else {
-        (slot_a_bytes, V2_SLOT_A_OFFSET)
-    }
+    if gen_b >= gen_a { (slot_b_bytes, V2_SLOT_B_OFFSET) } else { (slot_a_bytes, V2_SLOT_A_OFFSET) }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -534,10 +530,7 @@ fn v2_recovery_fails_when_prev_zero_appears_before_live_count() {
     write_bytes_at(&p, active_offset, &active_bytes);
 
     let err = QueueFile::open(&p).unwrap_err().to_string();
-    assert!(
-        err.contains("walked 3 elements but expected 4"),
-        "unexpected error: {err}"
-    );
+    assert!(err.contains("walked 3 elements but expected 4"), "unexpected error: {err}");
 }
 
 /// A sequence discontinuity in backlinks should cause recovery to fail.
@@ -654,7 +647,10 @@ fn v2_relocation_commit_happens_before_erasing_old_wrapped_bytes() {
 
     let (before_bytes, _) = active_slot(&p);
     let before = parse_slot_fields(&before_bytes);
-    assert!(before.last_position < before.first_position, "queue should be wrapped before expansion");
+    assert!(
+        before.last_position < before.first_position,
+        "queue should be wrapped before expansion"
+    );
 
     let old_last_header = read_bytes_at(&p, before.last_position, 4);
 

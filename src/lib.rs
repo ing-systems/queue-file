@@ -824,7 +824,8 @@ impl QueueFile {
     }
 
     fn build_v2_queue_file(
-        mut inner: QueueFileInner, open_state: V2OpenState, capacity: u64, overwrite_on_remove: bool,
+        mut inner: QueueFileInner, open_state: V2OpenState, capacity: u64,
+        overwrite_on_remove: bool,
     ) -> Self {
         inner.file_len = open_state.slot.file_length;
 
@@ -862,11 +863,8 @@ impl QueueFile {
             )
         });
 
-        self.last = Element {
-            pos: slot.last_position,
-            len: last_header.payload_len,
-            seq: last_header.seq,
-        };
+        self.last =
+            Element { pos: slot.last_position, len: last_header.payload_len, seq: last_header.seq };
 
         self.first = match self.validate_v2_element_header(slot.first_position) {
             Ok(first_header) => Element {
@@ -929,13 +927,12 @@ impl QueueFile {
         for step in 0..elem_cnt {
             let current_header = self.validate_v2_element_header(cur_pos)?;
 
-            let expected_seq = last_seq.checked_sub(step as u64).ok_or_else(|| {
-                Error::CorruptedFile {
+            let expected_seq =
+                last_seq.checked_sub(step as u64).ok_or_else(|| Error::CorruptedFile {
                     msg: format!(
                         "v2 recovery: tail seq {last_seq} too small for element_count {elem_cnt}"
                     ),
-                }
-            })?;
+                })?;
             ensure!(current_header.seq == expected_seq, CorruptedFileSnafu {
                 msg: format!("v2 recovery: seq {} != expected {expected_seq}", current_header.seq)
             });
@@ -948,11 +945,7 @@ impl QueueFile {
             }
 
             ensure!(current_header.prev_pos != 0, CorruptedFileSnafu {
-                msg: format!(
-                    "v2 recovery: walked {} elements but expected {}",
-                    step + 1,
-                    elem_cnt
-                )
+                msg: format!("v2 recovery: walked {} elements but expected {}", step + 1, elem_cnt)
             });
 
             cur_pos = current_header.prev_pos;
