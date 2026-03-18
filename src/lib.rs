@@ -1493,20 +1493,34 @@ impl QueueFile {
             return Ok(None);
         }
 
-        let len = self.first.len;
-        let mut data = vec![0; len];
+        let mut buf = Vec::with_capacity(self.first.len);
 
-        if self.is_v2() {
-            let payload_start = self.wrap_pos(self.first.pos + V2_ELEM_HDR_LEN as u64);
-            self.ring_read(payload_start, &mut data)?;
+        if self.peek_into(&mut buf)? { Ok(Some(buf)) } else { Ok(None) }
+    }
 
-            let footer_pos = self.wrap_pos(payload_start + len as u64);
-            self.validate_v2_footer(footer_pos, self.first.seq, &data)?;
-        } else {
-            self.ring_read(self.first.pos + Element::HEADER_LENGTH as u64, &mut data)?;
+    /// Returns the head element without removing it.
+    pub fn peek_into(&self, buf: &mut Vec<u8>) -> Result<bool> {
+        if self.is_empty() {
+            return Ok(false);
         }
 
-        Ok(Some(data))
+        let len = self.first.len;
+        buf.resize(len, 0); // Reuses existing capacity without reallocating
+
+        let payload_start = if self.is_v2() {
+            self.wrap_pos(self.first.pos + V2_ELEM_HDR_LEN as u64)
+        } else {
+            self.first.pos + Element::HEADER_LENGTH as u64
+        };
+
+        self.ring_read(payload_start, buf)?;
+
+        if self.is_v2() {
+            let footer_pos = self.wrap_pos(payload_start + len as u64);
+            self.validate_v2_footer(footer_pos, self.first.seq, buf)?;
+        }
+
+        Ok(true)
     }
 
     // ── remove_n ─────────────────────────────────────────────────────────────
