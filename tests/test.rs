@@ -491,3 +491,20 @@ fn read_lock_can_peek_and_iter() {
     assert_eq!(head.as_slice(), b"alpha");
     assert_eq!(items, vec![b"alpha".to_vec(), b"beta".to_vec()]);
 }
+
+#[test]
+fn iter_nth_large_payloads() {
+    let path = auto_delete_path::AutoDeletePath::temp();
+    let mut q = QueueFile::open(&path).unwrap();
+
+    let payloads: Vec<Vec<u8>> = (0u8..20).map(|i| vec![i; 4096]).collect();
+
+    for p in &payloads {
+        q.add(p).unwrap();
+    }
+
+    assert_eq!(q.iter().nth(0).unwrap(), payloads[0]);
+    assert_eq!(q.iter().nth(10).unwrap(), payloads[10]);
+    assert_eq!(q.iter().nth(19).unwrap(), payloads[19]);
+    assert!(q.iter().nth(20).is_none());
+}
