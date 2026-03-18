@@ -306,6 +306,7 @@ fn build_slot_bytes(data: &SlotData) -> [u8; V2_SLOT_LEN] {
         w.put_u8(0); // flags
         w.put_u8(0); // reserved
         w.put_u8(0); // reserved
+        // SAFETY: caller (write_header_v2) validates all fields fit in their signed widths.
         w.put_i64(data.file_length as i64);
         w.put_i32(data.element_count as i32);
         w.put_i64(data.first_position as i64);
@@ -332,12 +333,12 @@ fn parse_slot(bytes: &[u8; V2_SLOT_LEN]) -> Option<SlotData> {
     if version != 2 || flags != 0 || res0 != 0 || res1 != 0 {
         return None;
     }
-    let file_length = r.get_i64() as u64;
-    let element_count = r.get_i32() as u32;
-    let first_position = r.get_i64() as u64;
-    let last_position = r.get_i64() as u64;
-    let generation = r.get_i64() as u64;
-    let next_sequence_number = r.get_i64() as u64;
+    let file_length = u64::try_from(r.get_i64()).ok()?;
+    let element_count = u32::try_from(r.get_i32()).ok()?;
+    let first_position = u64::try_from(r.get_i64()).ok()?;
+    let last_position = u64::try_from(r.get_i64()).ok()?;
+    let generation = u64::try_from(r.get_i64()).ok()?;
+    let next_sequence_number = u64::try_from(r.get_i64()).ok()?;
 
     let stored_crc = u32::from_be_bytes([bytes[52], bytes[53], bytes[54], bytes[55]]);
     let expected_crc = compute_slot_crc(bytes);
@@ -963,11 +964,11 @@ impl QueueFile {
         let prev_pos = i64::from_be_bytes([
             hdr[12], hdr[13], hdr[14], hdr[15], hdr[16], hdr[17], hdr[18], hdr[19],
         ]) as u64;
-        let payload_len = i32::from_be_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]) as usize;
-
-        ensure!(i32::try_from(payload_len).is_ok(), CorruptedFileSnafu {
-            msg: format!("v2 element payload_len {payload_len} invalid at pos {pos}")
+        let payload_len_raw = i32::from_be_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]);
+        ensure!(payload_len_raw >= 0, CorruptedFileSnafu {
+            msg: format!("v2 element payload_len {payload_len_raw} is negative at pos {pos}")
         });
+        let payload_len = payload_len_raw as usize; // safe: non-negative i32 fits in usize
         ensure!(seq >= 1, CorruptedFileSnafu {
             msg: format!("v2 element seq {seq} < 1 at pos {pos}")
         });
@@ -1820,9 +1821,22 @@ impl QueueFile {
             (active_slot.toggle(), generation, next_seq)
         };
 
+        ensure!(i64::try_from(file_len).is_ok(), CorruptedFileSnafu {
+            msg: "file length in V2 header will exceed i64::MAX"
+        });
+        ensure!(u32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
+            msg: "element count in V2 header will exceed u32::MAX"
+        });
+        ensure!(i64::try_from(first_pos).is_ok(), CorruptedFileSnafu {
+            msg: "first element position in V2 header will exceed i64::MAX"
+        });
+        ensure!(i64::try_from(last_pos).is_ok(), CorruptedFileSnafu {
+            msg: "last element position in V2 header will exceed i64::MAX"
+        });
+
         let slot_data = SlotData {
             file_length: file_len,
-            element_count: elem_cnt as u32,
+            element_count: elem_cnt as u32, // validated above
             first_position: first_pos,
             last_position: last_pos,
             generation: generation + 1,
