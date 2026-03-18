@@ -95,7 +95,6 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions, rename};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::mem::ManuallyDrop;
 use std::path::Path;
 
 use bytes::{Buf, BufMut, BytesMut};
@@ -480,7 +479,7 @@ pub enum OffsetCacheKind {
 /// Owns the backing file handle and manages all low-level I/O.
 #[derive(Debug)]
 struct QueueFileInner {
-    file: ManuallyDrop<File>,
+    file: Option<File>,
     file_len: u64,
     expected_seek: u64,
     last_seek: Option<u64>,
@@ -506,12 +505,8 @@ enum DeferredSyncPhase {
 
 impl Drop for QueueFile {
     fn drop(&mut self) {
-        if self.skip_write_header_on_add {
+        if self.skip_write_header_on_add && self.inner.file.is_some() {
             let _ = self.sync_header();
-        }
-
-        unsafe {
-            ManuallyDrop::drop(&mut self.inner.file);
         }
     }
 }
@@ -718,7 +713,7 @@ impl QueueFile {
     ) -> Result<Self> {
         let mut queue_file = Self {
             inner: QueueFileInner {
-                file: ManuallyDrop::new(file),
+                file: Some(file),
                 file_len: state.file_len,
                 expected_seek: 0,
                 last_seek: Some(32),
@@ -788,7 +783,7 @@ impl QueueFile {
         file: File, real_file_len: u64, capacity: u64, overwrite_on_remove: bool, _path: &Path,
     ) -> Result<Self> {
         let mut inner = QueueFileInner {
-            file: ManuallyDrop::new(file),
+            file: Some(file),
             file_len: real_file_len,
             expected_seek: 0,
             last_seek: None,
@@ -1048,11 +1043,11 @@ impl QueueFile {
 
     pub fn sync_all(&mut self) -> Result<()> {
         if self.skip_write_header_on_add {
-            self.inner.file.sync_data()?; // Barrier: ensure payloads are durable
+            self.inner.file_mut()?.sync_data()?; // Barrier: ensure payloads are durable
             self.sync_header()?; // Write the header
         }
 
-        Ok(self.inner.file.sync_all()?) // Barrier: ensure header is durable
+        Ok(self.inner.file_mut()?.sync_all()?) // Barrier: ensure header is durable
     }
 
     // ── Cache helpers ─────────────────────────────────────────────────────────
@@ -1604,10 +1599,7 @@ impl QueueFile {
             let _ = self.sync_header();
         }
 
-        let file = unsafe { ManuallyDrop::take(&mut self.inner.file) };
-        std::mem::forget(self);
-
-        file
+        self.inner.file.take().unwrap()
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -1980,7 +1972,7 @@ impl QueueFile {
         let value = result?;
 
         if sync_writes {
-            self.inner.file.sync_data()?;
+            self.inner.file_mut()?.sync_data()?;
             maybe_inject_failpoint(match phase {
                 DeferredSyncPhase::BacklinkRewrite => "v2_after_backlink_rewrite_flush",
                 DeferredSyncPhase::AppendBatch => "v2_after_add_batch_flush",
@@ -2061,6 +2053,13 @@ impl QueueFileInner {
     const TRANSFER_BUFFER_SIZE: usize = 128 * 1024;
 
     #[inline]
+    fn file_mut(&mut self) -> io::Result<&mut File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "queue file handle unavailable"))
+    }
+
+    #[inline]
     fn seek(&mut self, pos: u64) -> u64 {
         self.expected_seek = pos;
         pos
@@ -2071,7 +2070,8 @@ impl QueueFileInner {
             return Ok(self.expected_seek);
         }
 
-        let res = self.file.seek(SeekFrom::Start(self.expected_seek));
+        let expected_seek = self.expected_seek;
+        let res = self.file_mut()?.seek(SeekFrom::Start(expected_seek));
         self.last_seek = res.as_ref().ok().copied();
 
         res
@@ -2104,7 +2104,12 @@ impl QueueFileInner {
             let mut res = Ok(());
 
             while read < self.read_buffer.len() {
-                match self.file.read(&mut self.read_buffer[read..]) {
+                let read_result = match self.file {
+                    Some(ref mut file) => file.read(&mut self.read_buffer[read..]),
+                    None => Err(Error::new(ErrorKind::Other, "queue file handle unavailable")),
+                };
+
+                match read_result {
                     Ok(0) => break,
                     Ok(n) => read += n,
                     Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
@@ -2143,7 +2148,7 @@ impl QueueFileInner {
     fn write(&mut self, buf: &[u8]) -> Result<()> {
         self.real_seek()?;
 
-        self.file.write_all(buf)?;
+        self.file_mut()?.write_all(buf)?;
 
         if let Some(seek) = &mut self.last_seek {
             *seek += buf.len() as u64;
@@ -2192,7 +2197,7 @@ impl QueueFileInner {
             } else if self.sync_context == SyncContext::AppendBatch {
                 maybe_inject_failpoint("v2_add_batch_per_write_sync")?;
             }
-            self.file.sync_data()?;
+            self.file_mut()?.sync_data()?;
         }
 
         Ok(())
@@ -2222,7 +2227,7 @@ impl QueueFileInner {
         }
 
         if self.sync_writes {
-            self.file.sync_data()?;
+            self.file_mut()?.sync_data()?;
         }
 
         Ok(())
@@ -2237,9 +2242,9 @@ impl QueueFileInner {
     }
 
     fn sync_set_len(&mut self, new_len: u64) -> io::Result<()> {
-        self.file.set_len(new_len)?;
+        self.file_mut()?.set_len(new_len)?;
         self.file_len = new_len;
-        self.file.sync_all()
+        self.file_mut()?.sync_all()
     }
 }
 

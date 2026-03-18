@@ -45,3 +45,17 @@ fn transfer_expand_invalid_file_len() {
 
     assert_eq!(qf.iter().map(|v| v[0]).collect::<Vec<_>>(), vec![3, 1, 2, 4]);
 }
+
+#[test]
+fn into_inner_file_flushes_deferred_header_safely() {
+    let path = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::open(&path).unwrap();
+    qf.set_skip_write_header_on_add(true);
+    qf.add(b"abc").unwrap();
+
+    let file = qf.into_inner_file();
+    drop(file);
+
+    let mut reopened = QueueFile::open(&path).unwrap();
+    assert_eq!(reopened.iter().map(Vec::from).collect::<Vec<_>>(), vec![b"abc".to_vec()]);
+}
