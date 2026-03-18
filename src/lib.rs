@@ -1839,14 +1839,9 @@ impl QueueFile {
         let mut pos = pos;
         let mut len = n;
 
-        self.write_buf.clear();
-        self.write_buf.extend(Self::ZEROES);
-
         while len > 0 {
             let chunk_len = min(len, Self::ZEROES.len());
-            self.write_buf.truncate(chunk_len);
-
-            self.ring_write_buf(pos)?;
+            self.ring_write_raw_from_self(pos, &Self::ZEROES[..chunk_len])?;
 
             len -= chunk_len;
             pos += chunk_len as u64;
