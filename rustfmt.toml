@@ -1,5 +1,4 @@
-version = "Two"
-edition = "2021"
+style_edition = "2024"
 
 max_width = 100
 error_on_line_overflow = false
