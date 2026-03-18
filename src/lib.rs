@@ -2455,7 +2455,7 @@ impl Iterator for Iter<'_> {
         };
 
         for _ in 0..left {
-            self.borrowed_next();
+            self.skip_next()?;
         }
 
         self.next()
@@ -2463,6 +2463,19 @@ impl Iterator for Iter<'_> {
 }
 
 impl Iter<'_> {
+    /// Advance the iterator cursor by one element without reading the payload.
+    /// Used by [`Iterator::nth`] to skip elements cheaply.
+    fn skip_next(&mut self) -> Option<()> {
+        if self.next_elem_index >= self.queue_file.elem_cnt {
+            return None;
+        }
+        let current = self.queue_file.read_element(self.next_elem_pos).ok()?;
+        self.next_elem_pos =
+            self.queue_file.wrap_pos(current.pos + self.queue_file.elem_span(current.len));
+        self.next_elem_index += 1;
+        Some(())
+    }
+
     /// Returns the next element as a slice into the iterator's internal buffer.
     pub fn borrowed_next(&mut self) -> Option<&[u8]> {
         if self.next_elem_index >= self.queue_file.elem_cnt {
