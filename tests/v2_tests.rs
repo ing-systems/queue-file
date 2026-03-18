@@ -167,7 +167,7 @@ fn v2_slot_a_corrupt_slot_b_valid() {
     write_bytes_at(&p, V2_SLOT_A_OFFSET, &[0xFF; 4]);
 
     // Should open successfully using slot B (gen=2, has "hello" only).
-    let mut qf = QueueFile::open(&p).unwrap();
+    let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 1, "slot B had 1 element when slot A was written");
     let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
     assert_eq!(items, vec![b"hello".to_vec()]);
@@ -187,7 +187,7 @@ fn v2_slot_b_corrupt_slot_a_valid() {
     // Corrupt slot B.
     write_bytes_at(&p, V2_SLOT_B_OFFSET, &[0xDE, 0xAD, 0xBE, 0xEF]);
 
-    let mut qf = QueueFile::open(&p).unwrap();
+    let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 2);
     let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
     assert_eq!(items, vec![b"data1".to_vec(), b"data2".to_vec()]);
@@ -283,7 +283,7 @@ fn v2_element_header_crc_mismatch() {
     // Reopening should fail during element header validation (called from open_v2).
     // Alternatively, if open succeeds somehow, peek should fail.
     let result = QueueFile::open(&p);
-    if let Ok(mut qf) = result {
+    if let Ok(qf) = result {
         // If open succeeded (e.g. via recovery), peek must fail.
         let peek_result = qf.peek();
         assert!(peek_result.is_err(), "should fail with corrupt element header CRC on peek");
@@ -313,7 +313,7 @@ fn v2_element_footer_magic_mismatch() {
     // Corrupt footer magic.
     write_bytes_at(&p, footer_offset, &[0xDE, 0xAD, 0xBE, 0xEF]);
 
-    let mut qf = QueueFile::open(&p).unwrap();
+    let qf = QueueFile::open(&p).unwrap();
     let result = qf.peek();
     assert!(result.is_err(), "should fail with corrupt footer magic");
 }
@@ -339,7 +339,7 @@ fn v2_element_footer_crc_mismatch() {
     crc_bytes[0] ^= 0xFF;
     write_bytes_at(&p, footer_crc_offset, &crc_bytes);
 
-    let mut qf = QueueFile::open(&p).unwrap();
+    let qf = QueueFile::open(&p).unwrap();
     let result = qf.peek();
     assert!(result.is_err(), "should fail with corrupt footer CRC");
 }
@@ -364,7 +364,7 @@ fn v2_footer_sequence_mismatch() {
     let bad_seq: i64 = 9999;
     write_bytes_at(&p, footer_seq_offset, &bad_seq.to_be_bytes());
 
-    let mut qf = QueueFile::open(&p).unwrap();
+    let qf = QueueFile::open(&p).unwrap();
     let result = qf.peek();
     // Either the seq check fails or the CRC check fails; either is an error.
     assert!(result.is_err(), "should fail with footer seq mismatch");
@@ -443,7 +443,7 @@ fn v2_head_recovery() {
     // Recovery should walk from last_pos → prev_pos → find first element.
     let result = QueueFile::open(&p);
     match result {
-        Ok(mut qf) => {
+        Ok(qf) => {
             assert_eq!(qf.size(), 2, "recovered queue should have 2 elements");
             let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
             assert_eq!(items.len(), 2);
@@ -537,7 +537,7 @@ fn v2_recover_head_after_dequeues_with_historical_backlink() {
     active_bytes[52..56].copy_from_slice(&new_crc.to_be_bytes());
     write_bytes_at(&p, active_offset, &active_bytes);
 
-    let mut qf = QueueFile::open(&p).unwrap();
+    let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 2);
     let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
     assert_eq!(items, vec![b"third".to_vec(), b"fourth".to_vec()]);
@@ -642,7 +642,7 @@ fn v2_clear_preserves_next_seq() {
     // Verify by re-opening and checking that the queue is consistent.
     drop(qf);
 
-    let mut qf = QueueFile::open(&p).unwrap();
+    let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 1);
     let item = qf.peek().unwrap().unwrap();
     assert_eq!(item.as_ref(), b"after_clear_1");
@@ -726,7 +726,7 @@ fn v2_reopens_relocated_pre_add_queue_after_cleanup_before_final_add_commit() {
     assert!(err.contains("v2_after_relocation_cleanup_before_add"), "unexpected error: {err}");
     drop(qf);
 
-    let mut reopened = QueueFile::open(&p).unwrap();
+    let reopened = QueueFile::open(&p).unwrap();
     let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
     assert_eq!(items, expected, "reopen should see the relocated pre-add queue only");
 }
@@ -770,7 +770,7 @@ fn v2_backlink_rewrite_flush_happens_before_relocation_commit() {
 
     drop(qf);
 
-    let mut reopened = QueueFile::open(&p).unwrap();
+    let reopened = QueueFile::open(&p).unwrap();
     let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
     assert_eq!(items.len(), before.element_count as usize);
 }
@@ -789,7 +789,7 @@ fn v2_migrate_v0() {
     }
 
     // Opening with `open()` should migrate to v2.
-    let mut qf = QueueFile::open(&p).unwrap();
+    let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 2);
 
     let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
@@ -933,7 +933,7 @@ fn v2_cross_format_fixture() {
     assert_eq!(stored_crc, expected_crc);
 
     // Verify we can reopen and read the data.
-    let mut qf = QueueFile::open(&p).unwrap();
+    let qf = QueueFile::open(&p).unwrap();
     let data = qf.peek().unwrap().unwrap();
     assert_eq!(data.as_ref(), b"fixture_data");
 }
@@ -989,7 +989,7 @@ fn v2_add_n_reopens_after_mid_batch_expansion() {
 
     drop(qf);
 
-    let mut reopened = QueueFile::open(&p).unwrap();
+    let reopened = QueueFile::open(&p).unwrap();
     let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
     assert_eq!(items.len(), next as usize + batch.len());
     assert_eq!(items[items.len() - 2..], batch);
@@ -1079,7 +1079,7 @@ fn v2_skip_write_header_on_add() {
     drop(qf);
 
     // Reopen and verify all 5 elements are present.
-    let mut qf = QueueFile::open(&p).unwrap();
+    let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 5);
 
     let items: Vec<u32> =
@@ -1100,7 +1100,7 @@ fn v2_persistence() {
         qf.add(b"more_data").unwrap();
     }
 
-    let mut qf = QueueFile::open(&p).unwrap();
+    let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 2);
     let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
     assert_eq!(items[0], b"persistent_data".to_vec());

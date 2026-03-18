@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::RwLock;
 
 use queue_file::{OffsetCacheKind, QueueFile};
 use quickcheck_macros::quickcheck;
@@ -273,7 +274,6 @@ fn small_queue_is_vecdeque(actions: Vec<Action>) {
     let path = auto_delete_path::AutoDeletePath::temp();
     let mut qf = QueueFile::with_capacity(&path, 32 + 32).unwrap();
     qf.set_overwrite_on_remove(false);
-    qf.set_read_buffer_size(7);
     let mut vd = VecDeque::new();
 
     for action in actions {
@@ -298,7 +298,6 @@ fn small_queue_is_vecdeque_cached_offsets(actions: Vec<Action>) {
     let path = auto_delete_path::AutoDeletePath::temp();
     let mut qf = QueueFile::with_capacity(&path, 32 + 32).unwrap();
     qf.set_overwrite_on_remove(false);
-    qf.set_read_buffer_size(7);
     qf.set_cache_offset_policy(Some(OffsetCacheKind::Quadratic));
     let mut vd = VecDeque::new();
 
@@ -385,4 +384,42 @@ fn add_n_accepts_non_clone_iterator_on_legacy_queue() {
 
     let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
     assert_eq!(items, batch);
+}
+
+#[test]
+fn peek_supports_shared_borrow() {
+    let path = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::open(&path).unwrap();
+    qf.add(b"abc").unwrap();
+
+    let head = qf.peek().unwrap().unwrap();
+    assert_eq!(head.as_ref(), b"abc");
+}
+
+#[test]
+fn iter_supports_shared_borrow() {
+    let path = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::open(&path).unwrap();
+    qf.add(b"one").unwrap();
+    qf.add(b"two").unwrap();
+
+    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    assert_eq!(items, vec![b"one".to_vec(), b"two".to_vec()]);
+}
+
+#[test]
+fn read_lock_can_peek_and_iter() {
+    let path = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::open(&path).unwrap();
+    qf.add(b"alpha").unwrap();
+    qf.add(b"beta").unwrap();
+
+    let qf = RwLock::new(qf);
+    let guard = qf.read().unwrap();
+
+    let head = guard.peek().unwrap().unwrap();
+    let items: Vec<Vec<u8>> = guard.iter().map(Vec::from).collect();
+
+    assert_eq!(head.as_ref(), b"alpha");
+    assert_eq!(items, vec![b"alpha".to_vec(), b"beta".to_vec()]);
 }

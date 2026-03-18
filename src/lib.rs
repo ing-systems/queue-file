@@ -95,6 +95,10 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions, rename};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::path::Path;
 
 use bytes::{Buf, BufMut, BytesMut};
@@ -319,10 +323,9 @@ fn parse_slot(bytes: &[u8; V2_SLOT_LEN]) -> Option<SlotData> {
 }
 
 /// Read 56 bytes from absolute file offset `offset` (no ring-buffer wrapping).
-fn read_slot(inner: &mut QueueFileInner, offset: u64) -> Result<[u8; V2_SLOT_LEN]> {
+fn read_slot(inner: &QueueFileInner, offset: u64) -> Result<[u8; V2_SLOT_LEN]> {
     let mut buf = [0u8; V2_SLOT_LEN];
-    inner.seek(offset);
-    inner.read(&mut buf)?;
+    inner.read_exact_at(offset, &mut buf)?;
     Ok(buf)
 }
 
@@ -481,8 +484,6 @@ struct QueueFileInner {
     file_len: u64,
     expected_seek: u64,
     last_seek: Option<u64>,
-    read_buffer_offset: Option<u64>,
-    read_buffer: Vec<u8>,
     transfer_buf: Option<Box<[u8]>>,
     sync_writes: bool,
     sync_context: SyncContext,
@@ -512,7 +513,6 @@ impl Drop for QueueFile {
 impl QueueFile {
     const BLOCK_LENGTH: u64 = 4096;
     const INITIAL_LENGTH: u64 = 4096;
-    const READ_BUFFER_SIZE: usize = 4096;
     const VERSIONED_HEADER: u32 = 0x8000_0001;
     const ZEROES: [u8; 4096] = [0; 4096];
 
@@ -760,8 +760,6 @@ impl QueueFile {
                 file_len: state.file_len,
                 expected_seek: 0,
                 last_seek: Some(32),
-                read_buffer_offset: None,
-                read_buffer: vec![0; Self::READ_BUFFER_SIZE],
                 transfer_buf: Some(
                     vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
                 ),
@@ -825,8 +823,6 @@ impl QueueFile {
             file_len: real_file_len,
             expected_seek: 0,
             last_seek: None,
-            read_buffer_offset: None,
-            read_buffer: vec![0; Self::READ_BUFFER_SIZE],
             transfer_buf: Some(vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice()),
             sync_writes: cfg!(not(test)),
             sync_context: SyncContext::Normal,
@@ -918,7 +914,7 @@ impl QueueFile {
     }
 
     /// Validate a v2 element header at `pos`, returning parsed header state.
-    fn validate_v2_element_header(&mut self, pos: u64) -> Result<V2ElementHeader> {
+    fn validate_v2_element_header(&self, pos: u64) -> Result<V2ElementHeader> {
         let mut hdr = [0u8; V2_ELEM_HDR_LEN];
         self.ring_read(pos, &mut hdr)?;
 
@@ -1040,13 +1036,6 @@ impl QueueFile {
     #[inline]
     pub fn set_skip_write_header_on_add(&mut self, value: bool) {
         self.skip_write_header_on_add = value;
-    }
-
-    pub fn set_read_buffer_size(&mut self, size: usize) {
-        if self.inner.read_buffer.len() < size {
-            self.inner.read_buffer_offset = None;
-        }
-        self.inner.read_buffer.resize(size, 0);
     }
 
     #[inline]
@@ -1425,7 +1414,7 @@ impl QueueFile {
         Ok(())
     }
 
-    fn validate_v2_footer(&mut self, footer_pos: u64, seq: u64, payload: &[u8]) -> Result<()> {
+    fn validate_v2_footer(&self, footer_pos: u64, seq: u64, payload: &[u8]) -> Result<()> {
         let mut ftr = [0u8; V2_ELEM_FTR_LEN];
         self.ring_read(footer_pos, &mut ftr)?;
 
@@ -1453,7 +1442,7 @@ impl QueueFile {
     // ── peek ──────────────────────────────────────────────────────────────────
 
     /// Returns the head element without removing it.
-    pub fn peek(&mut self) -> Result<Option<Box<[u8]>>> {
+    pub fn peek(&self) -> Result<Option<Box<[u8]>>> {
         if self.is_empty() {
             return Ok(None);
         }
@@ -1657,14 +1646,12 @@ impl QueueFile {
 
     // ── iter ──────────────────────────────────────────────────────────────────
 
-    pub fn iter(&mut self) -> Iter<'_> {
-        let pos = self.first.pos;
-
+    pub fn iter(&self) -> Iter<'_> {
         Iter {
-            buffer: std::mem::take(&mut self.write_buf),
+            buffer: Vec::new(),
             queue_file: self,
             next_elem_index: 0,
-            next_elem_pos: pos,
+            next_elem_pos: self.first.pos,
         }
     }
 
@@ -1824,7 +1811,7 @@ impl QueueFile {
         Ok(())
     }
 
-    fn read_element(&mut self, pos: u64) -> Result<Element> {
+    fn read_element(&self, pos: u64) -> Result<Element> {
         if pos == 0 {
             return Ok(Element::EMPTY);
         }
@@ -1881,19 +1868,16 @@ impl QueueFile {
         Ok(())
     }
 
-    fn ring_read(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
+    fn ring_read(&self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
         let pos = self.wrap_pos(pos);
 
         if pos + buf.len() as u64 <= self.file_len() {
-            self.inner.seek(pos);
-            self.inner.read(buf)
+            self.inner.read_exact_at(pos, buf)
         } else {
             let before_eof = (self.file_len() - pos) as usize;
 
-            self.inner.seek(pos);
-            self.inner.read(&mut buf[..before_eof])?;
-            self.inner.seek(self.data_start());
-            self.inner.read(&mut buf[before_eof..])
+            self.inner.read_exact_at(pos, &mut buf[..before_eof])?;
+            self.inner.read_exact_at(self.data_start(), &mut buf[before_eof..])
         }
     }
 
@@ -2110,7 +2094,7 @@ impl QueueFile {
 
         let result = (|| -> Result<()> {
             // Open source (no migration, legacy or versioned).
-            let mut src = Self::open_internal_full(path, true, false, Self::INITIAL_LENGTH, false)?;
+            let src = Self::open_internal_full(path, true, false, Self::INITIAL_LENGTH, false)?;
 
             // Create fresh v2 at tmp.
             Self::init(&tmp, false, V2_INITIAL_LEN)?;
@@ -2165,6 +2149,13 @@ impl QueueFileInner {
     const TRANSFER_BUFFER_SIZE: usize = 128 * 1024;
 
     #[inline]
+    fn file(&self) -> io::Result<&File> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "queue file handle unavailable"))
+    }
+
+    #[inline]
     fn file_mut(&mut self) -> io::Result<&mut File> {
         self.file
             .as_mut()
@@ -2194,66 +2185,11 @@ impl QueueFileInner {
             return Ok(());
         }
 
-        let size = buf.len();
-
-        let not_enough_data = if let Some(left) = self.read_buffer.len().checked_sub(size) {
-            self.read_buffer_offset
-                .and_then(|o| self.expected_seek.checked_sub(o))
-                .and_then(|skip| left.checked_sub(skip as usize))
-                .is_none()
-        } else {
-            self.read_buffer.resize(size, 0);
-
-            true
-        };
-
-        if not_enough_data {
-            use std::io::{Error, ErrorKind};
-
-            self.real_seek()?;
-
-            let mut read = 0;
-            let mut res = Ok(());
-
-            while read < self.read_buffer.len() {
-                let read_result = match self.file {
-                    Some(ref mut file) => file.read(&mut self.read_buffer[read..]),
-                    None => Err(Error::new(ErrorKind::Other, "queue file handle unavailable")),
-                };
-
-                match read_result {
-                    Ok(0) => break,
-                    Ok(n) => read += n,
-                    Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
-                    Err(e) => {
-                        res = Err(e);
-                        break;
-                    }
-                }
-            }
-
-            if res.is_ok() && read < size {
-                res = Err(Error::new(ErrorKind::UnexpectedEof, "failed to fill whole buffer"));
-            }
-
-            if let Err(err) = res {
-                self.read_buffer_offset = None;
-                self.last_seek = None;
-
-                return Err(err);
-            }
-
-            self.read_buffer_offset = Some(self.expected_seek);
-
-            if let Some(seek) = &mut self.last_seek {
-                *seek += read as u64;
-            }
+        self.real_seek()?;
+        self.file_mut()?.read_exact(buf)?;
+        if let Some(seek) = &mut self.last_seek {
+            *seek += buf.len() as u64;
         }
-
-        let start = (self.expected_seek - self.read_buffer_offset.unwrap()) as usize;
-
-        buf.copy_from_slice(&self.read_buffer[start..start + size]);
-
         Ok(())
     }
 
@@ -2266,43 +2202,6 @@ impl QueueFileInner {
             *seek += buf.len() as u64;
         }
 
-        if let Some(read_buffer_offset) = self.read_buffer_offset {
-            let write_size_u64 = buf.len() as u64;
-            let read_buffer_end_offset = read_buffer_offset + self.read_buffer.len() as u64;
-            let read_buffered = read_buffer_offset..read_buffer_end_offset;
-
-            let has_start = read_buffered.contains(&self.expected_seek);
-            let buf_end = self.expected_seek + write_size_u64;
-            let has_end = read_buffered.contains(&buf_end);
-
-            match (has_start, has_end) {
-                (true, true) => {
-                    let start = (self.expected_seek - read_buffer_offset) as usize;
-                    self.read_buffer[start..start + buf.len()].copy_from_slice(buf);
-                }
-                (false, true) => {
-                    let need_to_skip = (read_buffer_offset - self.expected_seek) as usize;
-                    let need_to_copy = buf.len() - need_to_skip;
-                    self.read_buffer[..need_to_copy].copy_from_slice(&buf[need_to_skip..]);
-                }
-                (true, false) => {
-                    let need_to_skip = (self.expected_seek - read_buffer_offset) as usize;
-                    let need_to_copy = self.read_buffer.len() - need_to_skip;
-                    self.read_buffer[need_to_skip..need_to_skip + need_to_copy]
-                        .copy_from_slice(&buf[..need_to_copy]);
-                }
-                (false, false)
-                    if (self.expected_seek + 1..buf_end).contains(&read_buffer_offset) =>
-                {
-                    let need_to_skip = (read_buffer_offset - self.expected_seek) as usize;
-                    let need_to_copy = self.read_buffer.len();
-                    self.read_buffer[..]
-                        .copy_from_slice(&buf[need_to_skip..need_to_skip + need_to_copy]);
-                }
-                (false, false) => {}
-            }
-        }
-
         if self.sync_writes {
             if self.sync_context == SyncContext::BacklinkRewrite {
                 maybe_inject_failpoint("v2_backlink_rewrite_per_write_sync")?;
@@ -2313,6 +2212,33 @@ impl QueueFileInner {
         }
 
         Ok(())
+    }
+
+    fn read_exact_at(&self, mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
+        while !buf.is_empty() {
+            let read = self.read_at(offset, buf)?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+
+            offset += read as u64;
+            buf = &mut buf[read..];
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.file()?.read_at(buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.file()?.seek_read(buf, offset)
     }
 
     fn transfer_inner(
@@ -2393,7 +2319,7 @@ impl Element {
 /// An iterator that yields the elements of a [`QueueFile`] from head to tail.
 #[derive(Debug)]
 pub struct Iter<'a> {
-    queue_file: &'a mut QueueFile,
+    queue_file: &'a QueueFile,
     buffer: Vec<u8>,
     next_elem_index: usize,
     next_elem_pos: u64,
@@ -2464,16 +2390,8 @@ impl Iter<'_> {
 
         self.next_elem_pos =
             self.queue_file.wrap_pos(current.pos + self.queue_file.elem_span(current.len));
-
-        self.queue_file.cache_elem_if_needed(self.next_elem_index, current, 1);
         self.next_elem_index += 1;
 
         Some(&self.buffer[..current.len])
-    }
-}
-
-impl Drop for Iter<'_> {
-    fn drop(&mut self) {
-        self.queue_file.write_buf = std::mem::take(&mut self.buffer);
     }
 }
