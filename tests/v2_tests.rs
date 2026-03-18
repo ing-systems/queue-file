@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::{Mutex, MutexGuard};
 
 use queue_file::QueueFile;
 
@@ -10,6 +11,9 @@ const V2_SLOT_A_OFFSET: u64 = 0;
 const V2_SLOT_B_OFFSET: u64 = 4096;
 const V2_SLOT_LEN: usize = 56;
 const V2_DATA_START: u64 = 8192;
+const FAILPOINT_ENV: &str = "QUEUE_FILE_FAILPOINT";
+
+static FAILPOINT_LOCK: Mutex<()> = Mutex::new(());
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -54,6 +58,57 @@ fn active_slot(path: impl AsRef<std::path::Path>) -> (Vec<u8>, u64) {
         (slot_b_bytes, V2_SLOT_B_OFFSET)
     } else {
         (slot_a_bytes, V2_SLOT_A_OFFSET)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParsedSlot {
+    file_length: u64,
+    element_count: u32,
+    first_position: u64,
+    last_position: u64,
+    generation: u64,
+    next_sequence_number: u64,
+}
+
+fn parse_slot_fields(bytes: &[u8]) -> ParsedSlot {
+    ParsedSlot {
+        file_length: i64::from_be_bytes(bytes[8..16].try_into().unwrap()) as u64,
+        element_count: i32::from_be_bytes(bytes[16..20].try_into().unwrap()) as u32,
+        first_position: i64::from_be_bytes(bytes[20..28].try_into().unwrap()) as u64,
+        last_position: i64::from_be_bytes(bytes[28..36].try_into().unwrap()) as u64,
+        generation: i64::from_be_bytes(bytes[36..44].try_into().unwrap()) as u64,
+        next_sequence_number: i64::from_be_bytes(bytes[44..52].try_into().unwrap()) as u64,
+    }
+}
+
+struct FailpointGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl FailpointGuard {
+    fn set(name: &str) -> Self {
+        let lock = FAILPOINT_LOCK.lock().unwrap();
+        std::env::set_var(FAILPOINT_ENV, name);
+        Self { _lock: lock }
+    }
+}
+
+impl Drop for FailpointGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(FAILPOINT_ENV);
+    }
+}
+
+fn fill_wrapped_queue_until_next_add_expands(qf: &mut QueueFile) {
+    for i in 0..140u32 {
+        qf.add(&i.to_be_bytes()).unwrap();
+    }
+
+    qf.remove_n(100).unwrap();
+
+    for i in 140..270u32 {
+        qf.add(&i.to_be_bytes()).unwrap();
     }
 }
 
@@ -601,6 +656,56 @@ fn v2_wrapped_expansion() {
         qf.iter().map(|b| u32::from_be_bytes(b[..].try_into().unwrap())).collect();
     let expected: Vec<u32> = (20..80).collect();
     assert_eq!(items, expected);
+}
+
+#[test]
+fn v2_relocation_commit_happens_before_erasing_old_wrapped_bytes() {
+    let p = temp_path();
+    let mut qf = QueueFile::open(&p).unwrap();
+    fill_wrapped_queue_until_next_add_expands(&mut qf);
+
+    let (before_bytes, _) = active_slot(&p);
+    let before = parse_slot_fields(&before_bytes);
+    assert!(before.last_position < before.first_position, "queue should be wrapped before expansion");
+
+    let old_last_header = read_bytes_at(&p, before.last_position, 4);
+
+    let failpoint = FailpointGuard::set("v2_after_relocation_commit_before_erase");
+    let err = qf.add(&999u32.to_be_bytes()).unwrap_err().to_string();
+    drop(failpoint);
+    assert!(err.contains("v2_after_relocation_commit_before_erase"), "unexpected error: {err}");
+
+    let (after_bytes, _) = active_slot(&p);
+    let after = parse_slot_fields(&after_bytes);
+
+    assert!(after.generation > before.generation);
+    assert_eq!(after.element_count, before.element_count);
+    assert_eq!(after.first_position, before.first_position);
+    assert_eq!(after.next_sequence_number, before.next_sequence_number);
+    assert!(after.file_length > before.file_length);
+    assert!(after.last_position >= before.file_length);
+
+    let old_last_header_after = read_bytes_at(&p, before.last_position, 4);
+    assert_eq!(old_last_header_after, old_last_header, "old wrapped bytes should still be intact");
+}
+
+#[test]
+fn v2_reopens_relocated_pre_add_queue_after_cleanup_before_final_add_commit() {
+    let p = temp_path();
+    let mut qf = QueueFile::open(&p).unwrap();
+    fill_wrapped_queue_until_next_add_expands(&mut qf);
+
+    let expected: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+
+    let failpoint = FailpointGuard::set("v2_after_relocation_cleanup_before_add");
+    let err = qf.add(&999u32.to_be_bytes()).unwrap_err().to_string();
+    drop(failpoint);
+    assert!(err.contains("v2_after_relocation_cleanup_before_add"), "unexpected error: {err}");
+    drop(qf);
+
+    let mut reopened = QueueFile::open(&p).unwrap();
+    let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
+    assert_eq!(items, expected, "reopen should see the relocated pre-add queue only");
 }
 
 /// Opening a v0 (legacy) file with `open()` should migrate it to v2.

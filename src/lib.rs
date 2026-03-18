@@ -350,6 +350,14 @@ fn validate_v2_slot_data(slot: &SlotData, real_file_len: u64) -> Result<()> {
     Ok(())
 }
 
+fn maybe_inject_failpoint(name: &str) -> Result<()> {
+    if std::env::var("QUEUE_FILE_FAILPOINT").ok().as_deref() == Some(name) {
+        return Err(Error::CorruptedFile { msg: format!("injected failpoint: {name}") });
+    }
+
+    Ok(())
+}
+
 // ── QueueFile ────────────────────────────────────────────────────────────────
 
 /// A lightning-fast, transactional, file-based FIFO queue.
@@ -1760,6 +1768,13 @@ impl QueueFile {
 
                 let new_last_pos = orig_file_len + self.last.pos - self.data_start;
                 self.last = Element { pos: new_last_pos, len: self.last.len, seq: self.last.seq };
+
+                maybe_inject_failpoint("v2_before_relocation_commit")?;
+
+                if self.overwrite_on_remove {
+                    self.write_header(self.file_len(), self.elem_cnt, self.first.pos, self.last.pos)?;
+                    maybe_inject_failpoint("v2_after_relocation_commit_before_erase")?;
+                }
             }
         }
 
@@ -1773,6 +1788,9 @@ impl QueueFile {
 
         if self.overwrite_on_remove {
             self.ring_erase(self.data_start, count as usize)?;
+            if matches!(self.format, Format::V2) && wraps {
+                maybe_inject_failpoint("v2_after_relocation_cleanup_before_add")?;
+            }
         }
 
         let bytes_used_after = self.used_bytes();
