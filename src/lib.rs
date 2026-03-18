@@ -1048,10 +1048,11 @@ impl QueueFile {
 
     pub fn sync_all(&mut self) -> Result<()> {
         if self.skip_write_header_on_add {
-            self.sync_header()?;
+            self.inner.file.sync_data()?; // Barrier: ensure payloads are durable
+            self.sync_header()?; // Write the header
         }
 
-        Ok(self.inner.file.sync_all()?)
+        Ok(self.inner.file.sync_all()?) // Barrier: ensure header is durable
     }
 
     // ── Cache helpers ─────────────────────────────────────────────────────────
@@ -1159,9 +1160,11 @@ impl QueueFile {
             self.first = first_added;
         }
         self.last = last_added.unwrap();
-
-        self.write_header(self.file_len(), self.elem_cnt + count, self.first.pos, self.last.pos)?;
         self.elem_cnt += count;
+
+        if !self.skip_write_header_on_add {
+            self.write_header(self.file_len(), self.elem_cnt, self.first.pos, self.last.pos)?;
+        }
 
         self.cache_last_offset_if_needed(count);
 
@@ -1240,7 +1243,9 @@ impl QueueFile {
         self.next_seq += count as u64;
         self.elem_cnt += count;
 
-        self.write_header(self.file_len(), self.elem_cnt, self.first.pos, self.last.pos)?;
+        if !self.skip_write_header_on_add {
+            self.write_header(self.file_len(), self.elem_cnt, self.first.pos, self.last.pos)?;
+        }
 
         self.cache_last_offset_if_needed(count);
 
@@ -1789,8 +1794,8 @@ impl QueueFile {
         let mut prev_len = current_len;
         let mut new_len = current_len;
         while remaining_bytes < data_len {
-            remaining_bytes += prev_len;
-            new_len = prev_len << 1;
+            remaining_bytes = remaining_bytes.saturating_add(prev_len);
+            new_len = prev_len.checked_shl(1).unwrap_or(u64::MAX);
             prev_len = new_len;
         }
         new_len
@@ -2003,6 +2008,8 @@ impl QueueFile {
                 }
             }
 
+            dst.sync_all()?;
+
             drop(src);
             drop(dst);
 
@@ -2073,7 +2080,7 @@ impl QueueFileInner {
             let mut read = 0;
             let mut res = Ok(());
 
-            while !buf.is_empty() {
+            while read < self.read_buffer.len() {
                 match self.file.read(&mut self.read_buffer[read..]) {
                     Ok(0) => break,
                     Ok(n) => read += n,
