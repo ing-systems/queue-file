@@ -226,6 +226,16 @@ struct ExpansionPlan {
     moved_count: u64,
 }
 
+#[derive(Debug, Clone)]
+struct QueueStateSnapshot {
+    format: FormatState,
+    elem_cnt: usize,
+    first: Element,
+    last: Element,
+    overwrite_on_remove: bool,
+    cached_offsets: VecDeque<(usize, Element)>,
+}
+
 // ── CRC helpers ───────────────────────────────────────────────────────────────
 
 fn crc32(data: &[u8]) -> u32 {
@@ -1087,6 +1097,26 @@ impl QueueFile {
         self.cache_elem_if_needed(self.elem_cnt - 1, self.last, affected_items);
     }
 
+    fn snapshot_queue_state(&self) -> QueueStateSnapshot {
+        QueueStateSnapshot {
+            format: self.format,
+            elem_cnt: self.elem_cnt,
+            first: self.first,
+            last: self.last,
+            overwrite_on_remove: self.overwrite_on_remove,
+            cached_offsets: self.cached_offsets.clone(),
+        }
+    }
+
+    fn restore_queue_state(&mut self, snapshot: QueueStateSnapshot) {
+        self.format = snapshot.format;
+        self.elem_cnt = snapshot.elem_cnt;
+        self.first = snapshot.first;
+        self.last = snapshot.last;
+        self.overwrite_on_remove = snapshot.overwrite_on_remove;
+        self.cached_offsets = snapshot.cached_offsets;
+    }
+
     fn cache_elem_if_needed(&mut self, index: usize, elem: Element, affected_items: usize) {
         debug_assert!(index <= self.elem_cnt);
         debug_assert!(index + 1 >= affected_items);
@@ -1128,156 +1158,144 @@ impl QueueFile {
     // ── add_n ─────────────────────────────────────────────────────────────────
 
     /// Adds multiple elements to the end of the queue in a single write.
-    pub fn add_n(
-        &mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>> + Clone,
-    ) -> Result<()> {
+    pub fn add_n(&mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Result<()> {
         if self.is_v2() {
             return self.add_n_v2(elems);
         }
 
-        let (count, total_len) =
-            elems.clone().into_iter().fold((0usize, 0usize), |(c, l), elem| {
-                (c + 1, l + Element::HEADER_LENGTH + elem.as_ref().len())
-            });
+        let snapshot = self.snapshot_queue_state();
 
-        if count == 0 {
-            return Ok(());
-        }
+        let result = (|| {
+            let mut count = 0usize;
 
-        ensure!(self.elem_cnt + count < i32::MAX as usize, TooManyElementsSnafu {});
+            for elem in elems {
+                self.overwrite_on_remove =
+                    if count == 0 { snapshot.overwrite_on_remove } else { false };
+                ensure!(self.elem_cnt + 1 < i32::MAX as usize, TooManyElementsSnafu {});
 
-        self.expand_if_necessary(total_len as u64)?;
-
-        let was_empty = self.is_empty();
-        let mut pos = if was_empty {
-            self.data_start()
-        } else {
-            self.wrap_pos(self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64)
-        };
-
-        let mut first_added = None;
-        let mut last_added = None;
-
-        self.write_buf.clear();
-
-        for elem in elems {
-            let elem = elem.as_ref();
-            let len = elem.len();
-
-            if first_added.is_none() {
-                first_added = Some(Element::new(pos, len, 0)?);
-            }
-            last_added = Some(Element::new(pos, len, 0)?);
-
-            self.write_buf.extend(&(len as u32).to_be_bytes());
-            self.write_buf.extend(elem);
-
-            pos = self.wrap_pos(pos + Element::HEADER_LENGTH as u64 + len as u64);
-        }
-
-        let first_added = first_added.unwrap();
-        self.ring_write_buf(first_added.pos)?;
-
-        if was_empty {
-            self.first = first_added;
-        }
-        self.last = last_added.unwrap();
-        self.elem_cnt += count;
-
-        if !self.skip_write_header_on_add {
-            self.write_header(self.file_len(), self.elem_cnt, self.first.pos, self.last.pos)?;
-        }
-
-        self.cache_last_offset_if_needed(count);
-
-        Ok(())
-    }
-
-    fn add_n_v2(
-        &mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>> + Clone,
-    ) -> Result<()> {
-        // First pass: compute count and total needed space.
-        let (count, total_bytes) =
-            elems.clone().into_iter().fold((0usize, 0u64), |(c, l), elem| {
-                (c + 1, l + V2_ELEM_OVERHEAD + elem.as_ref().len() as u64)
-            });
-
-        if count == 0 {
-            return Ok(());
-        }
-
-        ensure!(self.elem_cnt + count < i32::MAX as usize, TooManyElementsSnafu {});
-
-        self.expand_if_necessary(total_bytes)?;
-
-        let was_empty = self.is_empty();
-        let mut pos = if was_empty {
-            V2_DATA_START
-        } else {
-            self.wrap_pos(self.last.pos + V2_ELEM_OVERHEAD + self.last.len as u64)
-        };
-
-        let mut first_added: Option<Element> = None;
-        let mut last_added: Option<Element> = None;
-
-        let (_, _, base_seq) = self.v2_state().expect("v2 append requires v2 format state");
-
-        self.with_batched_v2_append_sync(|queue_file| {
-            for (i, elem) in elems.into_iter().enumerate() {
                 let elem = elem.as_ref();
                 let len = elem.len();
+                let span = Element::HEADER_LENGTH as u64 + len as u64;
+                self.expand_if_necessary(span)?;
 
+                let pos = if self.is_empty() {
+                    self.data_start()
+                } else {
+                    self.wrap_pos(
+                        self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64,
+                    )
+                };
+                let elem_entry = Element::new(pos, len, 0)?;
+
+                self.write_buf.clear();
+                self.write_buf.extend(&(len as u32).to_be_bytes());
+                self.write_buf.extend(elem);
+                self.ring_write_buf(pos)?;
+
+                if self.is_empty() {
+                    self.first = elem_entry;
+                }
+                self.last = elem_entry;
+                self.elem_cnt += 1;
+                count += 1;
+            }
+
+            if count == 0 {
+                return Ok(0);
+            }
+
+            if !self.skip_write_header_on_add {
+                self.write_header(self.file_len(), self.elem_cnt, self.first.pos, self.last.pos)?;
+            }
+
+            self.cache_last_offset_if_needed(count);
+
+            Ok(count)
+        })();
+
+        self.overwrite_on_remove = snapshot.overwrite_on_remove;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                self.restore_queue_state(snapshot);
+                Err(err)
+            }
+        }
+    }
+
+    fn add_n_v2(&mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Result<()> {
+        let snapshot = self.snapshot_queue_state();
+        let (_, _, base_seq) = self.v2_state().expect("v2 append requires v2 format state");
+
+        let result = self.with_batched_v2_append_sync(|queue_file| {
+            let mut count = 0usize;
+
+            for elem in elems {
+                queue_file.overwrite_on_remove =
+                    if count == 0 { snapshot.overwrite_on_remove } else { false };
+                ensure!(queue_file.elem_cnt + 1 < i32::MAX as usize, TooManyElementsSnafu {});
+
+                let elem = elem.as_ref();
+                let len = elem.len();
                 ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu {});
 
-                let seq = base_seq + i as u64;
+                queue_file.expand_if_necessary(V2_ELEM_OVERHEAD + len as u64)?;
 
-                // prev_pos: 0 if this is the absolute first element; else pos of the previous
-                // elem.
-                let prev_pos = if was_empty && i == 0 {
-                    0u64
-                } else if i == 0 {
-                    // Continuing from existing last.
-                    queue_file.last.pos
+                let pos = if queue_file.is_empty() {
+                    V2_DATA_START
                 } else {
-                    last_added.map_or(0, |e| e.pos)
+                    queue_file.wrap_pos(
+                        queue_file.last.pos + V2_ELEM_OVERHEAD + queue_file.last.len as u64,
+                    )
                 };
+                let seq = base_seq + count as u64;
+                let prev_pos = if queue_file.is_empty() { 0 } else { queue_file.last.pos };
 
                 let ds = queue_file.data_start();
                 let fl = queue_file.file_len();
                 Self::write_v2_element(&mut queue_file.inner, pos, seq, prev_pos, elem, ds, fl)?;
 
                 let elem_entry = Element { pos, len, seq };
-
-                if first_added.is_none() {
-                    first_added = Some(elem_entry);
+                if queue_file.is_empty() {
+                    queue_file.first = elem_entry;
                 }
-                last_added = Some(elem_entry);
-
-                pos = queue_file.wrap_pos(pos + V2_ELEM_OVERHEAD + len as u64);
+                queue_file.last = elem_entry;
+                queue_file.elem_cnt += 1;
+                count += 1;
             }
 
-            Ok(())
-        })?;
+            Ok(count)
+        });
 
-        let first_added = first_added.unwrap();
-        let last_added = last_added.unwrap();
+        self.overwrite_on_remove = snapshot.overwrite_on_remove;
 
-        if was_empty {
-            self.first = first_added;
+        match result {
+            Ok(count) => {
+                if count != 0 {
+                    let (_, _, next_seq) =
+                        self.v2_state_mut().expect("v2 append requires v2 format state");
+                    *next_seq = base_seq + count as u64;
+
+                    if !self.skip_write_header_on_add {
+                        self.write_header(
+                            self.file_len(),
+                            self.elem_cnt,
+                            self.first.pos,
+                            self.last.pos,
+                        )?;
+                    }
+
+                    self.cache_last_offset_if_needed(count);
+                }
+
+                Ok(())
+            }
+            Err(err) => {
+                self.restore_queue_state(snapshot);
+                Err(err)
+            }
         }
-        self.last = last_added;
-
-        let (_, _, next_seq) = self.v2_state_mut().expect("v2 append requires v2 format state");
-        *next_seq += count as u64;
-        self.elem_cnt += count;
-
-        if !self.skip_write_header_on_add {
-            self.write_header(self.file_len(), self.elem_cnt, self.first.pos, self.last.pos)?;
-        }
-
-        self.cache_last_offset_if_needed(count);
-
-        Ok(())
     }
 
     /// Write a single v2 element (header + payload + footer) at `pos` in the ring buffer.
@@ -1344,7 +1362,67 @@ impl QueueFile {
     /// Appends a single element to the tail of the queue.
     #[inline]
     pub fn add(&mut self, buf: &[u8]) -> Result<()> {
-        self.add_n(std::iter::once(buf))
+        ensure!(self.elem_cnt + 1 < i32::MAX as usize, TooManyElementsSnafu {});
+
+        if self.is_v2() {
+            let len = buf.len();
+            ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu {});
+
+            self.expand_if_necessary(V2_ELEM_OVERHEAD + len as u64)?;
+
+            let pos = if self.is_empty() {
+                V2_DATA_START
+            } else {
+                self.wrap_pos(self.last.pos + V2_ELEM_OVERHEAD + self.last.len as u64)
+            };
+            let seq = self.v2_state().expect("v2 append requires v2 format state").2;
+            let prev_pos = if self.is_empty() { 0 } else { self.last.pos };
+
+            self.with_batched_v2_append_sync(|queue_file| {
+                let ds = queue_file.data_start();
+                let fl = queue_file.file_len();
+                Self::write_v2_element(&mut queue_file.inner, pos, seq, prev_pos, buf, ds, fl)
+            })?;
+
+            let elem = Element { pos, len, seq };
+            if self.is_empty() {
+                self.first = elem;
+            }
+            self.last = elem;
+            self.elem_cnt += 1;
+
+            let (_, _, next_seq) = self.v2_state_mut().expect("v2 append requires v2 format state");
+            *next_seq += 1;
+        } else {
+            let len = buf.len();
+            self.expand_if_necessary(Element::HEADER_LENGTH as u64 + len as u64)?;
+
+            let pos = if self.is_empty() {
+                self.data_start()
+            } else {
+                self.wrap_pos(self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64)
+            };
+            let elem = Element::new(pos, len, 0)?;
+
+            self.write_buf.clear();
+            self.write_buf.extend(&(len as u32).to_be_bytes());
+            self.write_buf.extend(buf);
+            self.ring_write_buf(pos)?;
+
+            if self.is_empty() {
+                self.first = elem;
+            }
+            self.last = elem;
+            self.elem_cnt += 1;
+        }
+
+        if !self.skip_write_header_on_add {
+            self.write_header(self.file_len(), self.elem_cnt, self.first.pos, self.last.pos)?;
+        }
+
+        self.cache_last_offset_if_needed(1);
+
+        Ok(())
     }
 
     fn validate_v2_footer(&mut self, footer_pos: u64, seq: u64, payload: &[u8]) -> Result<()> {

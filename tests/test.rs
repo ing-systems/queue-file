@@ -11,7 +11,7 @@ use test_case::test_case;
 fn legacy_queue_capacity_preserved(is_overwrite: bool) {
     let initial_size = 517;
     let p = auto_delete_path::AutoDeletePath::temp();
-    let mut qf = QueueFile::open_legacy(&p).unwrap();
+    let qf = QueueFile::open_legacy(&p).unwrap();
     // open_legacy does not use capacity param for size check, re-open with capacity
     drop(qf);
     // Manually set up: use open_legacy which creates a 4096-byte file.
@@ -101,6 +101,24 @@ enum Action {
     Add(Vec<u8>),
     Read { skip: usize, take: usize },
     Remove(usize),
+}
+
+struct NonCloneIter<T> {
+    inner: std::vec::IntoIter<T>,
+}
+
+impl<T> NonCloneIter<T> {
+    fn new(items: Vec<T>) -> Self {
+        Self { inner: items.into_iter() }
+    }
+}
+
+impl<T> Iterator for NonCloneIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
 }
 
 impl quickcheck::Arbitrary for Action {
@@ -355,4 +373,16 @@ fn iter_nth() {
     assert_eq!(qf.iter().skip(1).nth(1), Some(c.into_boxed_slice()));
     assert_eq!(qf.iter().nth(3), None);
     assert_eq!(qf.iter().nth(123), None);
+}
+
+#[test]
+fn add_n_accepts_non_clone_iterator_on_legacy_queue() {
+    let path = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::open_legacy(&path).unwrap();
+
+    let batch = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
+    qf.add_n(NonCloneIter::new(batch.clone())).unwrap();
+
+    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    assert_eq!(items, batch);
 }

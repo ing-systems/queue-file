@@ -93,6 +93,24 @@ impl Drop for FailpointGuard {
     }
 }
 
+struct NonCloneIter<T> {
+    inner: std::vec::IntoIter<T>,
+}
+
+impl<T> NonCloneIter<T> {
+    fn new(items: Vec<T>) -> Self {
+        Self { inner: items.into_iter() }
+    }
+}
+
+impl<T> Iterator for NonCloneIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
 fn fill_wrapped_queue_until_next_add_expands(qf: &mut QueueFile) {
     for i in 0..140u32 {
         qf.add(&i.to_be_bytes()).unwrap();
@@ -936,6 +954,45 @@ fn v2_add_n_batch() {
     assert_eq!(items[0], b"one".to_vec());
     assert_eq!(items[1], b"two".to_vec());
     assert_eq!(items[2], b"three".to_vec());
+}
+
+#[test]
+fn v2_add_n_accepts_non_clone_iterator() {
+    let _lock = lock_failpoint_env();
+    let p = temp_path();
+    let mut qf = QueueFile::open(&p).unwrap();
+
+    let batch = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
+    qf.add_n(NonCloneIter::new(batch.clone())).unwrap();
+
+    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    assert_eq!(items, batch);
+}
+
+#[test]
+fn v2_add_n_reopens_after_mid_batch_expansion() {
+    let _lock = lock_failpoint_env();
+    let p = temp_path();
+    let mut qf = QueueFile::with_capacity(&p, 16_384).unwrap();
+
+    let mut next = 0u32;
+    while qf.file_len() - qf.used_bytes() >= 96 {
+        qf.add(&next.to_be_bytes()).unwrap();
+        next += 1;
+    }
+
+    let before = qf.file_len();
+    let batch = vec![1000u32.to_be_bytes().to_vec(), 1001u32.to_be_bytes().to_vec()];
+    qf.add_n(NonCloneIter::new(batch.clone())).unwrap();
+    let after = qf.file_len();
+    assert!(after > before, "expected the second batch element to trigger expansion");
+
+    drop(qf);
+
+    let mut reopened = QueueFile::open(&p).unwrap();
+    let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
+    assert_eq!(items.len(), next as usize + batch.len());
+    assert_eq!(items[items.len() - 2..], batch);
 }
 
 #[test]
