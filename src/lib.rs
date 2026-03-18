@@ -853,42 +853,38 @@ impl QueueFile {
     fn recover_v2_head(
         &mut self, last_pos: u64, last_seq: u64, elem_cnt: usize,
     ) -> Result<Element> {
-        // Walk from tail backward to find head (element with prev_pos == 0 if it's first).
-        // Use Floyd cycle detection (tortoise and hare) is complex; instead just limit steps.
         let mut positions = Vec::with_capacity(elem_cnt);
         let mut cur_pos = last_pos;
 
         for step in 0..elem_cnt {
             let (payload_len, cur_seq, prev_pos) = self.validate_v2_element_header(cur_pos)?;
 
-            // Sequence must be consistent.
-            let expected_seq = last_seq - step as u64;
+            let expected_seq = last_seq.checked_sub(step as u64).ok_or_else(|| {
+                Error::CorruptedFile {
+                    msg: format!(
+                        "v2 recovery: tail seq {last_seq} too small for element_count {elem_cnt}"
+                    ),
+                }
+            })?;
             ensure!(cur_seq == expected_seq, CorruptedFileSnafu {
                 msg: format!("v2 recovery: seq {cur_seq} != expected {expected_seq}")
             });
 
-            positions.push(Element { pos: cur_pos, len: payload_len, seq: cur_seq });
+            let current = Element { pos: cur_pos, len: payload_len, seq: cur_seq };
+            positions.push(current);
 
-            if prev_pos == 0 {
-                // This is the head.
-                ensure!(step + 1 == elem_cnt, CorruptedFileSnafu {
-                    msg: format!(
-                        "v2 recovery: walked {} elements but expected {}",
-                        step + 1,
-                        elem_cnt
-                    )
-                });
-
-                // Cycle detection: check we haven't seen this pos before.
-                ensure!(
-                    positions.iter().filter(|e| e.pos == cur_pos).count() == 1,
-                    CorruptedFileSnafu { msg: "v2 recovery: cycle detected".to_owned() }
-                );
-
-                return Ok(Element { pos: cur_pos, len: payload_len, seq: cur_seq });
+            if step + 1 == elem_cnt {
+                return Ok(current);
             }
 
-            // Cycle detection: check prev_pos not already visited.
+            ensure!(prev_pos != 0, CorruptedFileSnafu {
+                msg: format!(
+                    "v2 recovery: walked {} elements but expected {}",
+                    step + 1,
+                    elem_cnt
+                )
+            });
+
             ensure!(!positions.iter().any(|e| e.pos == prev_pos), CorruptedFileSnafu {
                 msg: "v2 recovery: cycle in backlinks".to_owned()
             });
@@ -897,7 +893,7 @@ impl QueueFile {
         }
 
         Err(Error::CorruptedFile {
-            msg: "v2 recovery: could not find head via backlinks".to_owned(),
+            msg: "v2 recovery: could not walk expected live element count".to_owned(),
         })
     }
 

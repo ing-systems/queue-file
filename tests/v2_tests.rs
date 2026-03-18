@@ -44,6 +44,19 @@ fn crc32(data: &[u8]) -> u32 {
     crc32fast::hash(data)
 }
 
+fn active_slot(path: impl AsRef<std::path::Path>) -> (Vec<u8>, u64) {
+    let slot_a_bytes = read_bytes_at(&path, V2_SLOT_A_OFFSET, V2_SLOT_LEN);
+    let slot_b_bytes = read_bytes_at(&path, V2_SLOT_B_OFFSET, V2_SLOT_LEN);
+    let gen_a = i64::from_be_bytes(slot_a_bytes[36..44].try_into().unwrap());
+    let gen_b = i64::from_be_bytes(slot_b_bytes[36..44].try_into().unwrap());
+
+    if gen_b >= gen_a {
+        (slot_b_bytes, V2_SLOT_B_OFFSET)
+    } else {
+        (slot_a_bytes, V2_SLOT_A_OFFSET)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// A fresh v2 file should have valid magic at slot A.
@@ -418,6 +431,62 @@ fn v2_backlink_cycle() {
     let _ = result; // Cycle detection may or may not trigger depending on exact layout.
     // Just verify we don't hang.
     let _ = first_pos; // use the variable
+}
+
+#[test]
+fn v2_recover_head_after_dequeues_with_historical_backlink() {
+    let p = temp_path();
+    {
+        let mut qf = QueueFile::open(&p).unwrap();
+        qf.add(b"first").unwrap();
+        qf.add(b"second").unwrap();
+        qf.add(b"third").unwrap();
+        qf.add(b"fourth").unwrap();
+        qf.remove_n(2).unwrap();
+    }
+
+    let (mut active_bytes, active_offset) = active_slot(&p);
+    let live_head_pos = i64::from_be_bytes(active_bytes[20..28].try_into().unwrap()) as u64;
+    let last_pos = i64::from_be_bytes(active_bytes[28..36].try_into().unwrap()) as u64;
+    let live_head_hdr = read_bytes_at(&p, live_head_pos, 28);
+    let live_head_prev = i64::from_be_bytes(live_head_hdr[12..20].try_into().unwrap()) as u64;
+    assert_ne!(live_head_prev, 0, "post-dequeue live head should retain historical backlink");
+
+    active_bytes[20..28].copy_from_slice(&((last_pos + 1) as i64).to_be_bytes());
+    let new_crc = crc32(&active_bytes[..52]);
+    active_bytes[52..56].copy_from_slice(&new_crc.to_be_bytes());
+    write_bytes_at(&p, active_offset, &active_bytes);
+
+    let mut qf = QueueFile::open(&p).unwrap();
+    assert_eq!(qf.size(), 2);
+    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    assert_eq!(items, vec![b"third".to_vec(), b"fourth".to_vec()]);
+}
+
+#[test]
+fn v2_recovery_fails_when_prev_zero_appears_before_live_count() {
+    let p = temp_path();
+    {
+        let mut qf = QueueFile::open(&p).unwrap();
+        qf.add(b"first").unwrap();
+        qf.add(b"second").unwrap();
+        qf.add(b"third").unwrap();
+    }
+
+    let (mut active_bytes, active_offset) = active_slot(&p);
+    let last_pos = i64::from_be_bytes(active_bytes[28..36].try_into().unwrap()) as u64;
+
+    active_bytes[16..20].copy_from_slice(&4i32.to_be_bytes());
+    active_bytes[20..28].copy_from_slice(&((last_pos + 1) as i64).to_be_bytes());
+    let new_crc = crc32(&active_bytes[..52]);
+    active_bytes[52..56].copy_from_slice(&new_crc.to_be_bytes());
+    write_bytes_at(&p, active_offset, &active_bytes);
+
+    let err = QueueFile::open(&p).unwrap_err().to_string();
+    assert!(
+        err.contains("walked 3 elements but expected 4"),
+        "unexpected error: {err}"
+    );
 }
 
 /// A sequence discontinuity in backlinks should cause recovery to fail (or be detected).
