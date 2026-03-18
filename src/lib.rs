@@ -492,12 +492,14 @@ struct QueueFileInner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyncContext {
     Normal,
+    ExpansionCopy,
     BacklinkRewrite,
     AppendBatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeferredSyncPhase {
+    ExpansionCopy,
     BacklinkRewrite,
     AppendBatch,
 }
@@ -1917,7 +1919,9 @@ impl QueueFile {
             return Ok(());
         }
 
-        self.inner.transfer(self.data_start(), plan.orig_file_len, plan.moved_count)?;
+        self.with_batched_expansion_copy_sync(|queue_file| {
+            queue_file.inner.transfer(queue_file.data_start(), plan.orig_file_len, plan.moved_count)
+        })?;
 
         if self.is_v2() {
             let moved_offset = plan.orig_file_len - self.data_start();
@@ -2041,6 +2045,12 @@ impl QueueFile {
         self.with_deferred_sync(DeferredSyncPhase::BacklinkRewrite, f)
     }
 
+    fn with_batched_expansion_copy_sync<T>(
+        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.with_deferred_sync(DeferredSyncPhase::ExpansionCopy, f)
+    }
+
     fn with_batched_v2_append_sync<T>(
         &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
@@ -2054,6 +2064,7 @@ impl QueueFile {
         let sync_context = self.inner.sync_context;
         self.inner.sync_writes = false;
         self.inner.sync_context = match phase {
+            DeferredSyncPhase::ExpansionCopy => SyncContext::ExpansionCopy,
             DeferredSyncPhase::BacklinkRewrite => SyncContext::BacklinkRewrite,
             DeferredSyncPhase::AppendBatch => SyncContext::AppendBatch,
         };
@@ -2068,6 +2079,7 @@ impl QueueFile {
         if sync_writes {
             self.inner.file_mut()?.sync_data()?;
             maybe_inject_failpoint(match phase {
+                DeferredSyncPhase::ExpansionCopy => "v2_after_expansion_copy_flush",
                 DeferredSyncPhase::BacklinkRewrite => "v2_after_backlink_rewrite_flush",
                 DeferredSyncPhase::AppendBatch => "v2_after_add_batch_flush",
             })?;
@@ -2201,10 +2213,17 @@ impl QueueFileInner {
         }
 
         if self.sync_writes {
-            if self.sync_context == SyncContext::BacklinkRewrite {
-                maybe_inject_failpoint("v2_backlink_rewrite_per_write_sync")?;
-            } else if self.sync_context == SyncContext::AppendBatch {
-                maybe_inject_failpoint("v2_add_batch_per_write_sync")?;
+            match self.sync_context {
+                SyncContext::Normal => {}
+                SyncContext::ExpansionCopy => {
+                    maybe_inject_failpoint("v2_expansion_copy_per_write_sync")?;
+                }
+                SyncContext::BacklinkRewrite => {
+                    maybe_inject_failpoint("v2_backlink_rewrite_per_write_sync")?;
+                }
+                SyncContext::AppendBatch => {
+                    maybe_inject_failpoint("v2_add_batch_per_write_sync")?;
+                }
             }
             self.file_mut()?.sync_data()?;
         }
