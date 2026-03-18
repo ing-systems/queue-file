@@ -708,6 +708,48 @@ fn v2_reopens_relocated_pre_add_queue_after_cleanup_before_final_add_commit() {
     assert_eq!(items, expected, "reopen should see the relocated pre-add queue only");
 }
 
+#[test]
+fn v2_backlink_rewrite_batch_suppresses_per_header_syncs() {
+    let p = temp_path();
+    let mut qf = QueueFile::open(&p).unwrap();
+    qf.set_sync_writes(true);
+    fill_wrapped_queue_until_next_add_expands(&mut qf);
+
+    let failpoint = FailpointGuard::set("v2_backlink_rewrite_per_write_sync");
+    qf.add(&999u32.to_be_bytes()).unwrap();
+    drop(failpoint);
+
+    assert!(qf.sync_writes(), "sync_writes should be restored after batched rewrite");
+}
+
+#[test]
+fn v2_backlink_rewrite_flush_happens_before_relocation_commit() {
+    let p = temp_path();
+    let mut qf = QueueFile::open(&p).unwrap();
+    qf.set_sync_writes(true);
+    fill_wrapped_queue_until_next_add_expands(&mut qf);
+
+    let (before_bytes, _) = active_slot(&p);
+    let before = parse_slot_fields(&before_bytes);
+
+    let failpoint = FailpointGuard::set("v2_after_backlink_rewrite_flush");
+    let err = qf.add(&999u32.to_be_bytes()).unwrap_err().to_string();
+    drop(failpoint);
+    assert!(err.contains("v2_after_backlink_rewrite_flush"), "unexpected error: {err}");
+    assert!(qf.sync_writes(), "sync_writes should be restored after batched rewrite failure");
+
+    let (after_bytes, _) = active_slot(&p);
+    let after = parse_slot_fields(&after_bytes);
+    assert_eq!(after.generation, before.generation, "relocation commit must not happen yet");
+    assert_eq!(after.file_length, before.file_length, "active slot should remain the old layout");
+
+    drop(qf);
+
+    let mut reopened = QueueFile::open(&p).unwrap();
+    let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
+    assert_eq!(items.len(), before.element_count as usize);
+}
+
 /// Opening a v0 (legacy) file with `open()` should migrate it to v2.
 #[test]
 fn v2_migrate_v0() {

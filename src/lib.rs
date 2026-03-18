@@ -455,6 +455,13 @@ struct QueueFileInner {
     read_buffer: Vec<u8>,
     transfer_buf: Option<Box<[u8]>>,
     sync_writes: bool,
+    sync_context: SyncContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncContext {
+    Normal,
+    BacklinkRewrite,
 }
 
 impl Drop for QueueFile {
@@ -695,6 +702,7 @@ impl QueueFile {
                     vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
                 ),
                 sync_writes: cfg!(not(test)),
+                sync_context: SyncContext::Normal,
             },
             format,
             header_len,
@@ -736,6 +744,7 @@ impl QueueFile {
             read_buffer: vec![0; Self::READ_BUFFER_SIZE],
             transfer_buf: Some(vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice()),
             sync_writes: cfg!(not(test)),
+            sync_context: SyncContext::Normal,
         };
 
         // Read both slots.
@@ -1831,35 +1840,60 @@ impl QueueFile {
             }
         }
 
-        // Now walk all elements and fix backlinks.
-        for elem in &positions {
-            // Read element header.
-            let elem_pos = elem.pos;
-            let mut hdr = [0u8; V2_ELEM_HDR_LEN];
-            self.ring_read(elem_pos, &mut hdr)?;
+        self.with_batched_backlink_rewrite_sync(|queue_file| {
+            // Now walk all elements and fix backlinks.
+            for elem in &positions {
+                // Read element header.
+                let elem_pos = elem.pos;
+                let mut hdr = [0u8; V2_ELEM_HDR_LEN];
+                queue_file.ring_read(elem_pos, &mut hdr)?;
 
-            let prev_pos = i64::from_be_bytes([
-                hdr[12], hdr[13], hdr[14], hdr[15], hdr[16], hdr[17], hdr[18], hdr[19],
-            ]) as u64;
+                let prev_pos = i64::from_be_bytes([
+                    hdr[12], hdr[13], hdr[14], hdr[15], hdr[16], hdr[17], hdr[18], hdr[19],
+                ]) as u64;
 
-            // If prev_pos is in [data_start, wrap_point), it was moved.
-            if prev_pos >= data_start && prev_pos < wrap_point {
-                let new_prev_pos = prev_pos + moved_offset;
+                // If prev_pos is in [data_start, wrap_point), it was moved.
+                if prev_pos >= data_start && prev_pos < wrap_point {
+                    let new_prev_pos = prev_pos + moved_offset;
 
-                // Write new prev_pos into header bytes 12-19.
-                let new_prev_bytes = (new_prev_pos as i64).to_be_bytes();
-                hdr[12..20].copy_from_slice(&new_prev_bytes);
+                    // Write new prev_pos into header bytes 12-19.
+                    let new_prev_bytes = (new_prev_pos as i64).to_be_bytes();
+                    hdr[12..20].copy_from_slice(&new_prev_bytes);
 
-                // Recompute header CRC.
-                let new_crc = compute_elem_header_crc(&hdr);
-                hdr[24..28].copy_from_slice(&new_crc.to_be_bytes());
+                    // Recompute header CRC.
+                    let new_crc = compute_elem_header_crc(&hdr);
+                    hdr[24..28].copy_from_slice(&new_crc.to_be_bytes());
 
-                // Write updated header.
-                self.ring_write_raw_from_self(elem_pos, &hdr)?;
+                    // Write updated header.
+                    queue_file.ring_write_raw_from_self(elem_pos, &hdr)?;
+                }
             }
+
+            Ok(())
+        })
+    }
+
+    fn with_batched_backlink_rewrite_sync<T>(
+        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let sync_writes = self.inner.sync_writes;
+        let sync_context = self.inner.sync_context;
+        self.inner.sync_writes = false;
+        self.inner.sync_context = SyncContext::BacklinkRewrite;
+
+        let result = f(self);
+
+        self.inner.sync_context = sync_context;
+        self.inner.sync_writes = sync_writes;
+
+        let value = result?;
+
+        if sync_writes {
+            self.inner.file.sync_data()?;
+            maybe_inject_failpoint("v2_after_backlink_rewrite_flush")?;
         }
 
-        Ok(())
+        Ok(value)
     }
 
     /// Ring write using self's `data_start` and `file_len` (for use when we can't borrow inner separately).
@@ -2057,6 +2091,9 @@ impl QueueFileInner {
         }
 
         if self.sync_writes {
+            if self.sync_context == SyncContext::BacklinkRewrite {
+                maybe_inject_failpoint("v2_backlink_rewrite_per_write_sync")?;
+            }
             self.file.sync_data()?;
         }
 
