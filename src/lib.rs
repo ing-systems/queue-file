@@ -870,7 +870,6 @@ impl QueueFile {
     fn recover_v2_head(
         &mut self, last_pos: u64, last_seq: u64, elem_cnt: usize,
     ) -> Result<Element> {
-        let mut positions = Vec::with_capacity(elem_cnt);
         let mut cur_pos = last_pos;
 
         for step in 0..elem_cnt {
@@ -888,7 +887,6 @@ impl QueueFile {
             });
 
             let current = Element { pos: cur_pos, len: payload_len, seq: cur_seq };
-            positions.push(current);
 
             if step + 1 == elem_cnt {
                 return Ok(current);
@@ -900,10 +898,6 @@ impl QueueFile {
                     step + 1,
                     elem_cnt
                 )
-            });
-
-            ensure!(!positions.iter().any(|e| e.pos == prev_pos), CorruptedFileSnafu {
-                msg: "v2 recovery: cycle in backlinks".to_owned()
             });
 
             cur_pos = prev_pos;

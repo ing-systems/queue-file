@@ -431,7 +431,7 @@ fn v2_head_recovery() {
     let _ = last_pos;
 }
 
-/// Setting up a backlink cycle should cause open to return an error.
+/// A backlink cycle should be rejected during bounded recovery.
 #[test]
 fn v2_backlink_cycle() {
     let p = temp_path();
@@ -454,10 +454,9 @@ fn v2_backlink_cycle() {
     let last_pos = i64::from_be_bytes(active_bytes[28..36].try_into().unwrap()) as u64;
     let first_pos = i64::from_be_bytes(active_bytes[20..28].try_into().unwrap()) as u64;
 
-    // Corrupt first_pos to an invalid value.
+    // Corrupt first_pos to an invalid value so open must recover via backlinks.
     let mut corrupted_slot = active_bytes.clone();
-    // Set first_position to last_position to cause validation issues.
-    let fake_first: i64 = last_pos as i64;
+    let fake_first: i64 = (last_pos + 1) as i64;
     corrupted_slot[20..28].copy_from_slice(&fake_first.to_be_bytes());
     let new_crc = crc32(&corrupted_slot[..52]);
     corrupted_slot[52..56].copy_from_slice(&new_crc.to_be_bytes());
@@ -481,11 +480,8 @@ fn v2_backlink_cycle() {
     write_bytes_at(&p, last_pos, &new_last_hdr);
 
     let result = QueueFile::open(&p);
-    // Should fail due to cycle or invalid element count.
-    // (May succeed if last_pos happens to be valid as first - that's OK too)
-    let _ = result; // Cycle detection may or may not trigger depending on exact layout.
-    // Just verify we don't hang.
-    let _ = first_pos; // use the variable
+    assert!(result.is_err(), "expected malformed backlink cycle to be rejected");
+    let _ = first_pos;
 }
 
 #[test]
@@ -544,7 +540,7 @@ fn v2_recovery_fails_when_prev_zero_appears_before_live_count() {
     );
 }
 
-/// A sequence discontinuity in backlinks should cause recovery to fail (or be detected).
+/// A sequence discontinuity in backlinks should cause recovery to fail.
 #[test]
 fn v2_backlink_sequence_discontinuity() {
     let p = temp_path();
@@ -583,7 +579,7 @@ fn v2_backlink_sequence_discontinuity() {
 
         // Also corrupt first_pos in the active slot to force recovery walk.
         let mut corrupted_slot = active_bytes.clone();
-        corrupted_slot[20..28].copy_from_slice(&(last_pos as i64).to_be_bytes());
+        corrupted_slot[20..28].copy_from_slice(&((last_pos + 1) as i64).to_be_bytes());
         let new_crc = crc32(&corrupted_slot[..52]);
         corrupted_slot[52..56].copy_from_slice(&new_crc.to_be_bytes());
         write_bytes_at(&p, active_offset, &corrupted_slot);
@@ -594,17 +590,9 @@ fn v2_backlink_sequence_discontinuity() {
         write_bytes_at(&p, other_offset, &[0xFF; 4]);
 
         // With first_pos == last_pos and a sequence discontinuity in the chain,
-        // recovery should fail or detect the corruption.
+        // recovery must reject the malformed backlink walk.
         let result = QueueFile::open(&p);
-        // The result may be an error (recovery fails) or may open with inconsistent data.
-        // Either way, we should not panic/hang.
-        match result {
-            Err(_) => {} // expected: recovery detected discontinuity
-            Ok(mut qf) => {
-                // If it opened, verify data is readable without panicking.
-                let _ = qf.size();
-            }
-        }
+        assert!(result.is_err(), "expected malformed sequence chain to be rejected");
     }
     let _ = last_seq;
 }
