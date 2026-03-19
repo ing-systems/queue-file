@@ -1599,8 +1599,6 @@ impl QueueFile {
 
     /// Adds multiple elements to the end of the queue in a single write.
     pub fn add_n(&mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Result<()> {
-        let snapshot = self.snapshot_queue_state();
-
         let elems: Vec<_> = elems.into_iter().collect();
         if elems.is_empty() {
             return Ok(());
@@ -1614,6 +1612,8 @@ impl QueueFile {
         }
 
         self.expand_if_necessary(total_span)?;
+
+        let snapshot = self.snapshot_queue_state();
 
         let result = self.with_batched_append_sync(|queue_file| {
             let mut count = 0usize;
