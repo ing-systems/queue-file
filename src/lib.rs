@@ -466,12 +466,15 @@ impl FormatState {
         inner.ring_write(pos, &hdr, data_start)?;
 
         // Ring-write payload.
-        let payload_pos = wrap_pos_fn(pos + V2_ELEM_HDR_LEN as u64, file_len, data_start);
+        let payload_pos = circular_file_pos(pos + V2_ELEM_HDR_LEN as u64, file_len, data_start);
         inner.ring_write(payload_pos, payload, data_start)?;
 
         // Build 16-byte footer.
-        let footer_pos =
-            wrap_pos_fn(pos + V2_ELEM_HDR_LEN as u64 + payload_len as u64, file_len, data_start);
+        let footer_pos = circular_file_pos(
+            pos + V2_ELEM_HDR_LEN as u64 + payload_len as u64,
+            file_len,
+            data_start,
+        );
         let mut ftr = [0u8; V2_ELEM_FTR_LEN];
         {
             let mut w: &mut [u8] = &mut ftr;
@@ -511,8 +514,11 @@ impl FormatState {
         let mut cur = first;
         for _ in 0..elem_cnt {
             positions.push(cur);
-            let next_pos =
-                wrap_pos_fn(cur.pos + V2_ELEM_OVERHEAD + cur.len as u64, file_len, data_start);
+            let next_pos = circular_file_pos(
+                cur.pos + V2_ELEM_OVERHEAD + cur.len as u64,
+                file_len,
+                data_start,
+            );
             if positions.len() < elem_cnt {
                 let next_header = self.validate_v2_element_header(inner, next_pos)?;
                 cur = Element { pos: next_pos, len: next_header.payload_len, seq: next_header.seq };
@@ -550,8 +556,11 @@ impl FormatState {
         &self, inner: &QueueFileInner, payload_start: u64, elem: &Element, payload: &[u8],
     ) -> Result<()> {
         if let Self::V2 { .. } = self {
-            let footer_pos =
-                wrap_pos_fn(payload_start + elem.len as u64, inner.file_len, self.data_start());
+            let footer_pos = circular_file_pos(
+                payload_start + elem.len as u64,
+                inner.file_len,
+                self.data_start(),
+            );
             self.validate_v2_footer(inner, footer_pos, elem.seq, payload)?;
         }
         Ok(())
@@ -1827,7 +1836,7 @@ impl QueueFile {
 
     #[inline]
     const fn wrap_pos(&self, pos: u64) -> u64 {
-        wrap_pos_fn(pos, self.inner.file_len, self.data_start())
+        circular_file_pos(pos, self.inner.file_len, self.data_start())
     }
 
     fn ring_erase(&mut self, pos: u64, n: usize) -> Result<()> {
@@ -1989,7 +1998,7 @@ impl QueueFile {
 // ── Free helper: wrap_pos ─────────────────────────────────────────────────────
 
 #[inline]
-const fn wrap_pos_fn(pos: u64, file_len: u64, data_start: u64) -> u64 {
+const fn circular_file_pos(pos: u64, file_len: u64, data_start: u64) -> u64 {
     if pos < file_len { pos } else { data_start + pos - file_len }
 }
 
@@ -2134,7 +2143,7 @@ impl QueueFileInner {
     }
 
     fn ring_read(&self, pos: u64, buf: &mut [u8], data_start: u64) -> io::Result<()> {
-        let pos = wrap_pos_fn(pos, self.file_len, data_start);
+        let pos = circular_file_pos(pos, self.file_len, data_start);
 
         if pos + buf.len() as u64 <= self.file_len {
             self.read_exact_at(pos, buf)
@@ -2147,7 +2156,7 @@ impl QueueFileInner {
     }
 
     fn ring_write(&mut self, pos: u64, data: &[u8], data_start: u64) -> Result<()> {
-        let pos = wrap_pos_fn(pos, self.file_len, data_start);
+        let pos = circular_file_pos(pos, self.file_len, data_start);
 
         if pos + data.len() as u64 <= self.file_len {
             self.seek(pos);
