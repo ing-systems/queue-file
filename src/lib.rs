@@ -529,16 +529,7 @@ struct QueueFileInner {
     last_seek: Option<u64>,
     transfer_buf: Box<[u8]>,
     sync_writes: bool,
-    sync_context: SyncContext,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SyncContext {
-    Normal,
-    ExpansionCopy,
-    ClearErase,
-    BacklinkRewrite,
-    AppendBatch,
+    deferred_sync_phase: Option<DeferredSyncPhase>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -826,7 +817,7 @@ impl QueueFile {
                 last_seek: Some(32),
                 transfer_buf: vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
                 sync_writes: cfg!(not(test)),
-                sync_context: SyncContext::Normal,
+                deferred_sync_phase: None,
             },
             format: state.format,
             elem_cnt: state.elem_cnt,
@@ -887,7 +878,7 @@ impl QueueFile {
             last_seek: None,
             transfer_buf: vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
             sync_writes: cfg!(not(test)),
-            sync_context: SyncContext::Normal,
+            deferred_sync_phase: None,
         };
 
         let open_state = Self::read_v2_open_state(&mut inner, real_file_len)?;
@@ -2204,18 +2195,13 @@ impl QueueFile {
         &mut self, phase: DeferredSyncPhase, f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
         let sync_writes = self.inner.sync_writes;
-        let sync_context = self.inner.sync_context;
+        let deferred_sync_phase = self.inner.deferred_sync_phase;
         self.inner.sync_writes = false;
-        self.inner.sync_context = match phase {
-            DeferredSyncPhase::ExpansionCopy => SyncContext::ExpansionCopy,
-            DeferredSyncPhase::ClearErase => SyncContext::ClearErase,
-            DeferredSyncPhase::BacklinkRewrite => SyncContext::BacklinkRewrite,
-            DeferredSyncPhase::AppendBatch => SyncContext::AppendBatch,
-        };
+        self.inner.deferred_sync_phase = Some(phase);
 
         let result = f(self);
 
-        self.inner.sync_context = sync_context;
+        self.inner.deferred_sync_phase = deferred_sync_phase;
         self.inner.sync_writes = sync_writes;
 
         let value = result?;
@@ -2370,19 +2356,20 @@ impl QueueFileInner {
         }
 
         if self.sync_writes {
-            match self.sync_context {
-                SyncContext::Normal => {}
-                SyncContext::ExpansionCopy => {
-                    maybe_inject_failpoint("v2_expansion_copy_per_write_sync")?;
-                }
-                SyncContext::ClearErase => {
-                    maybe_inject_failpoint("clear_erase_per_write_sync")?;
-                }
-                SyncContext::BacklinkRewrite => {
-                    maybe_inject_failpoint("v2_backlink_rewrite_per_write_sync")?;
-                }
-                SyncContext::AppendBatch => {
-                    maybe_inject_failpoint("v2_add_batch_per_write_sync")?;
+            if let Some(phase) = self.deferred_sync_phase {
+                match phase {
+                    DeferredSyncPhase::ExpansionCopy => {
+                        maybe_inject_failpoint("v2_expansion_copy_per_write_sync")?;
+                    }
+                    DeferredSyncPhase::ClearErase => {
+                        maybe_inject_failpoint("clear_erase_per_write_sync")?;
+                    }
+                    DeferredSyncPhase::BacklinkRewrite => {
+                        maybe_inject_failpoint("v2_backlink_rewrite_per_write_sync")?;
+                    }
+                    DeferredSyncPhase::AppendBatch => {
+                        maybe_inject_failpoint("v2_add_batch_per_write_sync")?;
+                    }
                 }
             }
             self.file_mut()?.sync_data()?;
