@@ -1040,6 +1040,37 @@ fn v2_add_n_reopens_after_mid_batch_expansion() {
 }
 
 #[test]
+fn v2_add_n_batch_two_expansion_boundaries() {
+    // Regression: add_n previously called expand_if_necessary per element, triggering
+    // relocate_wrapped_data once per element that exceeded remaining capacity.
+    // With 3 elements spanning two capacity boundaries, this fired twice.
+    // The fix pre-computes total_span and expands once before the loop.
+    //
+    // Setup: fresh file at V2_INITIAL_LEN=8192 (0 usable bytes).
+    // Batch: 3 elements of 4097 bytes each (span=4141, total=12423).
+    // One expansion jumps 8192→32768 (via compute_expanded_len doubling twice internally).
+    let _lock = lock_failpoint_env();
+    let p = temp_path();
+    let mut qf = QueueFile::with_capacity(&p, 8192).unwrap();
+    assert_eq!(qf.file_len(), 8192, "sanity: initial file len");
+
+    let payload = vec![0xABu8; 4097];
+    let batch = vec![payload.clone(), payload.clone(), payload.clone()];
+    qf.add_n(batch.iter().map(|v| v.as_slice())).unwrap();
+
+    // File must have grown.
+    assert!(qf.file_len() > 8192);
+    assert_eq!(qf.size(), 3);
+    drop(qf);
+
+    // All elements must survive a reopen.
+    let reopened = QueueFile::open(&p).unwrap();
+    let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
+    assert_eq!(items.len(), 3);
+    assert!(items.iter().all(|v| v == &payload));
+}
+
+#[test]
 fn v2_add_n_batch_suppresses_per_write_syncs() {
     let _lock = lock_failpoint_env();
     let p = temp_path();
