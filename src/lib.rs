@@ -289,77 +289,34 @@ impl FormatState {
 
         match self {
             Self::Legacy | Self::V1 => {
-                let mut header = [0u8; 32];
-                let mut header_buf: &mut [u8] = &mut header;
-
-                if matches!(self, Self::V1) {
-                    ensure!(i64::try_from(metadata.file_len).is_ok(), CorruptedFileSnafu {
-                        msg: "file length in header will exceed i64::MAX"
-                    });
-                    ensure!(i32::try_from(metadata.elem_cnt).is_ok(), CorruptedFileSnafu {
-                        msg: "element count in header will exceed i32::MAX"
-                    });
-                    ensure!(i64::try_from(first_phys).is_ok(), CorruptedFileSnafu {
-                        msg: "first element position in header will exceed i64::MAX"
-                    });
-                    ensure!(i64::try_from(last_phys).is_ok(), CorruptedFileSnafu {
-                        msg: "last element position in header will exceed i64::MAX"
-                    });
-
-                    header_buf.put_u32(VERSIONED_HEADER);
-                    header_buf.put_u64(metadata.file_len);
-                    header_buf.put_i32(metadata.elem_cnt as i32);
-                    header_buf.put_u64(first_phys);
-                    header_buf.put_u64(last_phys);
+                let bytes = if matches!(self, Self::V1) {
+                    encode_v1_header(metadata.file_len, metadata.elem_cnt, first_phys, last_phys)?
+                        .to_vec()
                 } else {
-                    ensure!(i32::try_from(metadata.file_len).is_ok(), CorruptedFileSnafu {
-                        msg: "file length in header will exceed i32::MAX"
-                    });
-                    ensure!(i32::try_from(metadata.elem_cnt).is_ok(), CorruptedFileSnafu {
-                        msg: "element count in header will exceed i32::MAX"
-                    });
-                    ensure!(i32::try_from(first_phys).is_ok(), CorruptedFileSnafu {
-                        msg: "first element position in header will exceed i32::MAX"
-                    });
-                    ensure!(i32::try_from(last_phys).is_ok(), CorruptedFileSnafu {
-                        msg: "last element position in header will exceed i32::MAX"
-                    });
-
-                    header_buf.put_i32(metadata.file_len as i32);
-                    header_buf.put_i32(metadata.elem_cnt as i32);
-                    header_buf.put_i32(first_phys as i32);
-                    header_buf.put_i32(last_phys as i32);
-                }
+                    encode_legacy_header(
+                        metadata.file_len,
+                        metadata.elem_cnt,
+                        first_phys,
+                        last_phys,
+                    )?
+                    .to_vec()
+                };
 
                 inner.seek(0);
-                inner.write(&header[..self.header_len() as usize])
+                inner.write(&bytes)
             }
             Self::V2 { active_slot, generation, next_seq } => {
                 let next_slot = active_slot.toggle();
 
-                ensure!(i64::try_from(metadata.file_len).is_ok(), CorruptedFileSnafu {
-                    msg: "file length in V2 header will exceed i64::MAX"
-                });
-                ensure!(u32::try_from(metadata.elem_cnt).is_ok(), CorruptedFileSnafu {
-                    msg: "element count in V2 header will exceed u32::MAX"
-                });
-                ensure!(i64::try_from(first_phys).is_ok(), CorruptedFileSnafu {
-                    msg: "first element position in V2 header will exceed i64::MAX"
-                });
-                ensure!(i64::try_from(last_phys).is_ok(), CorruptedFileSnafu {
-                    msg: "last element position in V2 header will exceed i64::MAX"
-                });
+                let slot_bytes = encode_v2_slot(
+                    metadata.file_len,
+                    metadata.elem_cnt,
+                    first_phys,
+                    last_phys,
+                    *generation + 1,
+                    *next_seq,
+                )?;
 
-                let slot_data = SlotData {
-                    file_length: metadata.file_len,
-                    element_count: metadata.elem_cnt as u32,
-                    first_position: first_phys,
-                    last_position: last_phys,
-                    generation: *generation + 1,
-                    next_sequence_number: *next_seq,
-                };
-
-                let slot_bytes = build_slot_bytes(&slot_data);
                 let offset = next_slot.offset();
 
                 inner.seek(offset);
@@ -693,6 +650,91 @@ fn compute_elem_footer_crc(payload: &[u8], ftr_bytes_0_to_11: &[u8]) -> u32 {
     hasher.update(payload);
     hasher.update(ftr_bytes_0_to_11);
     hasher.finalize()
+}
+
+// ── Header serialisation / deserialisation ────────────────────────────────────
+
+fn encode_legacy_header(
+    file_len: u64, elem_cnt: usize, first_phys: u64, last_phys: u64,
+) -> Result<[u8; 16]> {
+    ensure!(i32::try_from(file_len).is_ok(), CorruptedFileSnafu {
+        msg: "file length in header will exceed i32::MAX"
+    });
+    ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
+        msg: "element count in header will exceed i32::MAX"
+    });
+    ensure!(i32::try_from(first_phys).is_ok(), CorruptedFileSnafu {
+        msg: "first element position in header will exceed i32::MAX"
+    });
+    ensure!(i32::try_from(last_phys).is_ok(), CorruptedFileSnafu {
+        msg: "last element position in header will exceed i32::MAX"
+    });
+
+    let mut header = [0u8; 16];
+    let mut header_buf: &mut [u8] = &mut header;
+
+    header_buf.put_i32(file_len as i32);
+    header_buf.put_i32(elem_cnt as i32);
+    header_buf.put_i32(first_phys as i32);
+    header_buf.put_i32(last_phys as i32);
+
+    Ok(header)
+}
+
+fn encode_v1_header(
+    file_len: u64, elem_cnt: usize, first_phys: u64, last_phys: u64,
+) -> Result<[u8; 32]> {
+    ensure!(i64::try_from(file_len).is_ok(), CorruptedFileSnafu {
+        msg: "file length in header will exceed i64::MAX"
+    });
+    ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
+        msg: "element count in header will exceed i32::MAX"
+    });
+    ensure!(i64::try_from(first_phys).is_ok(), CorruptedFileSnafu {
+        msg: "first element position in header will exceed i64::MAX"
+    });
+    ensure!(i64::try_from(last_phys).is_ok(), CorruptedFileSnafu {
+        msg: "last element position in header will exceed i64::MAX"
+    });
+
+    let mut header = [0u8; 32];
+    let mut header_buf: &mut [u8] = &mut header;
+
+    header_buf.put_u32(VERSIONED_HEADER);
+    header_buf.put_u64(file_len);
+    header_buf.put_i32(elem_cnt as i32);
+    header_buf.put_u64(first_phys);
+    header_buf.put_u64(last_phys);
+
+    Ok(header)
+}
+
+fn encode_v2_slot(
+    file_len: u64, elem_cnt: usize, first_phys: u64, last_phys: u64, generation: u64, next_seq: u64,
+) -> Result<[u8; V2_SLOT_LEN]> {
+    ensure!(i64::try_from(file_len).is_ok(), CorruptedFileSnafu {
+        msg: "file length in V2 header will exceed i64::MAX"
+    });
+    ensure!(u32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
+        msg: "element count in V2 header will exceed u32::MAX"
+    });
+    ensure!(i64::try_from(first_phys).is_ok(), CorruptedFileSnafu {
+        msg: "first element position in V2 header will exceed i64::MAX"
+    });
+    ensure!(i64::try_from(last_phys).is_ok(), CorruptedFileSnafu {
+        msg: "last element position in V2 header will exceed i64::MAX"
+    });
+
+    let slot_data = SlotData {
+        file_length: file_len,
+        element_count: elem_cnt as u32,
+        first_position: first_phys,
+        last_position: last_phys,
+        generation,
+        next_sequence_number: next_seq,
+    };
+
+    Ok(build_slot_bytes(&slot_data))
 }
 
 // ── Slot serialisation / deserialisation ─────────────────────────────────────
@@ -1559,46 +1601,19 @@ impl QueueFile {
             total_span = total_span.saturating_add(self.format.elem_span(len));
         }
 
-        let result = self.with_batched_append_sync(|queue_file| {
-            queue_file.expand_if_necessary(total_span)?;
+        self.expand_if_necessary(total_span)?;
 
+        let result = self.with_batched_append_sync(|queue_file| {
             let mut count = 0usize;
             let base_seq = queue_file.format.next_seq();
 
-            let format = queue_file.format;
-
             for elem in &elems {
-                queue_file.overwrite_on_remove =
-                    if count == 0 { snapshot.overwrite_on_remove } else { false };
-                ensure!(queue_file.elem_cnt + 1 < i32::MAX as usize, TooManyElementsSnafu {});
-
-                let is_empty = queue_file.is_empty();
-                let last_pos = queue_file.last.pos;
-                let last_len = queue_file.last.len;
-
-                let elem = elem.as_ref();
-                let len = elem.len();
-
-                let mut ring = queue_file.ring_mut();
-                let pos = if is_empty { 0 } else { ring.add(last_pos, format.elem_span(last_len)) };
-                let seq = if base_seq == 0 { 0 } else { base_seq + count as u64 };
-                let prev_pos = if is_empty { None } else { Some(last_pos) };
-
-                format.write_element(&mut ring, pos, elem, seq, prev_pos)?;
-
-                let elem_entry = Element::new(pos, len, seq)?;
-                if queue_file.is_empty() {
-                    queue_file.first = elem_entry;
-                }
-                queue_file.last = elem_entry;
-                queue_file.elem_cnt += 1;
+                queue_file.append_single_element(elem.as_ref(), base_seq, count)?;
                 count += 1;
             }
 
             Ok(count)
         });
-
-        self.overwrite_on_remove = snapshot.overwrite_on_remove;
 
         match result {
             Ok(count) => {
@@ -1623,50 +1638,37 @@ impl QueueFile {
         }
     }
 
-    /// Appends a single element to the tail of the queue.
-    #[inline]
-    pub fn add(&mut self, buf: &[u8]) -> Result<()> {
+    fn append_single_element(&mut self, buf: &[u8], base_seq: u64, count: usize) -> Result<()> {
         ensure!(self.elem_cnt + 1 < i32::MAX as usize, TooManyElementsSnafu {});
-
-        let len = buf.len();
-        let span = self.format.elem_span(len);
-        self.expand_if_necessary(span)?;
 
         let is_empty = self.is_empty();
         let last_pos = self.last.pos;
         let last_len = self.last.len;
 
+        let len = buf.len();
+
         let pos =
             if is_empty { 0 } else { self.ring().add(last_pos, self.format.elem_span(last_len)) };
-
-        let seq = self.format.next_seq();
+        let seq = if base_seq == 0 { 0 } else { base_seq + count as u64 };
         let prev_pos = if is_empty { None } else { Some(last_pos) };
 
         let format = self.format;
-        self.with_batched_append_sync(|queue_file| {
-            let mut ring = queue_file.ring_mut();
-            format.write_element(&mut ring, pos, buf, seq, prev_pos)
-        })?;
+        let mut ring = self.ring_mut();
+        format.write_element(&mut ring, pos, buf, seq, prev_pos)?;
 
-        let next_seq = self.format.next_seq();
-        if next_seq != 0 {
-            self.format.set_next_seq(next_seq + 1);
-        }
-
-        let elem = Element::new(pos, len, seq)?;
+        let elem_entry = Element::new(pos, len, seq)?;
         if self.is_empty() {
-            self.first = elem;
+            self.first = elem_entry;
         }
-        self.last = elem;
+        self.last = elem_entry;
         self.elem_cnt += 1;
-
-        if !self.skip_write_header_on_add {
-            self.sync_header()?;
-        }
-
-        self.cache_last_offset_if_needed(1);
-
         Ok(())
+    }
+
+    /// Appends a single element to the tail of the queue.
+    #[inline]
+    pub fn add(&mut self, buf: &[u8]) -> Result<()> {
+        self.add_n(std::iter::once(buf))
     }
 
     // ── peek ──────────────────────────────────────────────────────────────────
@@ -1726,43 +1728,47 @@ impl QueueFile {
             self.cached_offsets
         );
 
-        let erase_start_pos = self.first.pos;
-        let mut erase_total_len = 0usize;
+        let old_first_pos = self.first.pos;
 
-        let mut current = self.first;
-        let mut to_remove = n;
+        // 1. Find the new head element after removing n elements
+        let mut new_first = self.first;
+        let mut remaining_to_skip = n;
 
-        let cached_index = self.cached_index_up_to(n - 1);
-        if let Some(i) = cached_index {
+        let cached_idx = self.cached_index_up_to(n - 1);
+        if let Some(i) = cached_idx {
             let (index, elem) = self.cached_offsets[i];
-
-            if self.overwrite_on_remove {
-                erase_total_len += self.ring().distance(self.first.pos, elem.pos) as usize;
-            }
-
-            current = elem;
-            to_remove = n - index;
+            new_first = elem;
+            remaining_to_skip = n - index;
         }
 
-        for _ in 0..to_remove {
-            let span = self.elem_span(current.len);
-            erase_total_len += span as usize;
-            let next_pos = self.ring().add(current.pos, span);
-            current = self.read_element_at(next_pos)?;
+        for _ in 0..remaining_to_skip {
+            let span = self.elem_span(new_first.len);
+            let next_pos = self.ring().add(new_first.pos, span);
+            new_first = self.read_element_at(next_pos)?;
         }
+
+        // 2. Update metadata
+        let erase_total_len = if self.overwrite_on_remove {
+            self.ring().distance(old_first_pos, new_first.pos) as usize
+        } else {
+            0
+        };
 
         self.elem_cnt -= n;
-        self.first = current;
+        self.first = new_first;
 
+        // 3. Commit change
         self.sync_header()?;
 
-        if let Some(cached_index) = cached_index {
-            self.cached_offsets.drain(..=cached_index);
+        // 4. Update cache
+        if let Some(i) = cached_idx {
+            self.cached_offsets.drain(..=i);
         }
         self.cached_offsets.iter_mut().for_each(|(i, _)| *i -= n);
 
+        // 5. Securely erase removed data if needed
         if self.overwrite_on_remove {
-            self.ring_erase_logical(erase_start_pos, erase_total_len)?;
+            self.ring_erase_logical(old_first_pos, erase_total_len)?;
         }
 
         Ok(())
