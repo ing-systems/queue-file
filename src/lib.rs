@@ -2418,42 +2418,42 @@ impl QueueFileInner {
         self.file()?.seek_read(buf, offset)
     }
 
-    fn transfer_inner(
-        &mut self, buf: &mut [u8], mut read_pos: u64, mut write_pos: u64, count: u64,
-    ) -> Result<()> {
-        debug_assert!(read_pos < self.file_len);
-        debug_assert!(write_pos <= self.file_len);
-        debug_assert!(count < self.file_len);
-        debug_assert!(i64::try_from(count).is_ok());
+    fn transfer(&mut self, read_pos: u64, write_pos: u64, count: u64) -> Result<()> {
+        // Borrow the fields independently so they don't overlap
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| Error::Io { source: io::Error::new(io::ErrorKind::Other, "no file") })?;
 
         let mut bytes_left = count as i64;
+        let mut current_read = read_pos;
+        let mut current_write = write_pos;
 
         while bytes_left > 0 {
-            self.seek(read_pos);
             let bytes_to_read = min(bytes_left as usize, Self::TRANSFER_BUFFER_SIZE);
-            self.read(&mut buf[..bytes_to_read])?;
+            let slice = &mut self.transfer_buf[..bytes_to_read];
 
-            self.seek(write_pos);
-            self.write(&buf[..bytes_to_read])?;
+            // Use the file handle directly instead of `self.read()`
+            file.seek(SeekFrom::Start(current_read))?;
+            file.read_exact(slice)?;
 
-            read_pos += bytes_to_read as u64;
-            write_pos += bytes_to_read as u64;
+            file.seek(SeekFrom::Start(current_write))?;
+            file.write_all(slice)?;
+
+            current_read += bytes_to_read as u64;
+            current_write += bytes_to_read as u64;
             bytes_left -= bytes_to_read as i64;
         }
 
         if self.sync_writes {
-            self.file_mut()?.sync_data()?;
+            file.sync_data()?;
         }
 
+        // Update the seek trackers
+        self.expected_seek = current_write;
+        self.last_seek = Some(current_write);
+
         Ok(())
-    }
-
-    fn transfer(&mut self, read_pos: u64, write_pos: u64, count: u64) -> Result<()> {
-        let mut buf = std::mem::take(&mut self.transfer_buf);
-        let res = self.transfer_inner(&mut buf, read_pos, write_pos, count);
-        self.transfer_buf = buf;
-
-        res
     }
 
     fn sync_set_len(&mut self, new_len: u64) -> io::Result<()> {
