@@ -386,26 +386,35 @@ fn elect_canonical_slot(
 }
 
 fn validate_v2_slot_data(slot: &SlotData, real_file_len: u64) -> Result<()> {
-    ensure!(slot.file_length >= V2_DATA_START, CorruptedFileSnafu {
-        msg: format!("v2 file_length {} < data_start {}", slot.file_length, V2_DATA_START)
-    });
-    ensure!(slot.file_length <= real_file_len, CorruptedFileSnafu {
-        msg: format!(
-            "v2 file is truncated: header claims {}, actual {}",
-            slot.file_length, real_file_len
-        )
-    });
-    ensure!(slot.next_sequence_number >= 1, CorruptedFileSnafu {
-        msg: "v2 next_sequence_number must be >= 1".to_owned()
-    });
+    ensure!(
+        slot.file_length >= V2_DATA_START,
+        CorruptedFileSnafu {
+            msg: format!("v2 file_length {} < data_start {}", slot.file_length, V2_DATA_START)
+        }
+    );
+    ensure!(
+        slot.file_length <= real_file_len,
+        CorruptedFileSnafu {
+            msg: format!(
+                "v2 file is truncated: header claims {}, actual {}",
+                slot.file_length, real_file_len
+            )
+        }
+    );
+    ensure!(
+        slot.next_sequence_number >= 1,
+        CorruptedFileSnafu { msg: "v2 next_sequence_number must be >= 1".to_owned() }
+    );
     if slot.element_count == 0 {
-        ensure!(slot.first_position == 0 && slot.last_position == 0, CorruptedFileSnafu {
-            msg: "v2 empty queue has non-zero pointers".to_owned()
-        });
+        ensure!(
+            slot.first_position == 0 && slot.last_position == 0,
+            CorruptedFileSnafu { msg: "v2 empty queue has non-zero pointers".to_owned() }
+        );
     } else {
-        ensure!(slot.first_position != 0 && slot.last_position != 0, CorruptedFileSnafu {
-            msg: "v2 non-empty queue has zero pointer".to_owned()
-        });
+        ensure!(
+            slot.first_position != 0 && slot.last_position != 0,
+            CorruptedFileSnafu { msg: "v2 non-empty queue has zero pointer".to_owned() }
+        );
         ensure!(
             slot.first_position >= V2_DATA_START && slot.first_position < slot.file_length,
             CorruptedFileSnafu {
@@ -699,18 +708,22 @@ impl QueueFile {
         let first_pos = buf.get_u64();
         let last_pos = buf.get_u64();
 
-        ensure!(i64::try_from(file_len).is_ok(), CorruptedFileSnafu {
-            msg: "file length in header is greater than i64::MAX"
-        });
-        ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
-            msg: "element count in header is greater than i32::MAX"
-        });
-        ensure!(i64::try_from(first_pos).is_ok(), CorruptedFileSnafu {
-            msg: "first element position in header is greater than i64::MAX"
-        });
-        ensure!(i64::try_from(last_pos).is_ok(), CorruptedFileSnafu {
-            msg: "last element position in header is greater than i64::MAX"
-        });
+        ensure!(
+            i64::try_from(file_len).is_ok(),
+            CorruptedFileSnafu { msg: "file length in header is greater than i64::MAX" }
+        );
+        ensure!(
+            i32::try_from(elem_cnt).is_ok(),
+            CorruptedFileSnafu { msg: "element count in header is greater than i32::MAX" }
+        );
+        ensure!(
+            i64::try_from(first_pos).is_ok(),
+            CorruptedFileSnafu { msg: "first element position in header is greater than i64::MAX" }
+        );
+        ensure!(
+            i64::try_from(last_pos).is_ok(),
+            CorruptedFileSnafu { msg: "last element position in header is greater than i64::MAX" }
+        );
         Ok((file_len, elem_cnt, first_pos, last_pos))
     }
 
@@ -722,18 +735,22 @@ impl QueueFile {
         let first_pos = u64::from(buf.get_u32());
         let last_pos = u64::from(buf.get_u32());
 
-        ensure!(i32::try_from(file_len).is_ok(), CorruptedFileSnafu {
-            msg: "file length in header is greater than i32::MAX"
-        });
-        ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
-            msg: "element count in header is greater than i32::MAX"
-        });
-        ensure!(i32::try_from(first_pos).is_ok(), CorruptedFileSnafu {
-            msg: "first element position in header is greater than i32::MAX"
-        });
-        ensure!(i32::try_from(last_pos).is_ok(), CorruptedFileSnafu {
-            msg: "last element position in header is greater than i32::MAX"
-        });
+        ensure!(
+            i32::try_from(file_len).is_ok(),
+            CorruptedFileSnafu { msg: "file length in header is greater than i32::MAX" }
+        );
+        ensure!(
+            i32::try_from(elem_cnt).is_ok(),
+            CorruptedFileSnafu { msg: "element count in header is greater than i32::MAX" }
+        );
+        ensure!(
+            i32::try_from(first_pos).is_ok(),
+            CorruptedFileSnafu { msg: "first element position in header is greater than i32::MAX" }
+        );
+        ensure!(
+            i32::try_from(last_pos).is_ok(),
+            CorruptedFileSnafu { msg: "last element position in header is greater than i32::MAX" }
+        );
         Ok((file_len, elem_cnt, first_pos, last_pos))
     }
 
@@ -768,20 +785,30 @@ impl QueueFile {
             (FormatState::Legacy, 16u64, file_len, elem_cnt, first_pos, last_pos)
         };
 
-        ensure!(file_len <= real_file_len, CorruptedFileSnafu {
-            msg: format!(
-                "file is truncated. expected length was {file_len} but actual length is {real_file_len}"
-            )
-        });
-        ensure!(file_len >= header_len, CorruptedFileSnafu {
-            msg: format!("length stored in header ({file_len}) is invalid")
-        });
-        ensure!(first_pos <= file_len, CorruptedFileSnafu {
-            msg: format!("position of the first element ({first_pos}) is beyond the file")
-        });
-        ensure!(last_pos <= file_len, CorruptedFileSnafu {
-            msg: format!("position of the last element ({last_pos}) is beyond the file")
-        });
+        ensure!(
+            file_len <= real_file_len,
+            CorruptedFileSnafu {
+                msg: format!(
+                    "file is truncated. expected length was {file_len} but actual length is {real_file_len}"
+                )
+            }
+        );
+        ensure!(
+            file_len >= header_len,
+            CorruptedFileSnafu { msg: format!("length stored in header ({file_len}) is invalid") }
+        );
+        ensure!(
+            first_pos <= file_len,
+            CorruptedFileSnafu {
+                msg: format!("position of the first element ({first_pos}) is beyond the file")
+            }
+        );
+        ensure!(
+            last_pos <= file_len,
+            CorruptedFileSnafu {
+                msg: format!("position of the last element ({last_pos}) is beyond the file")
+            }
+        );
 
         let _ = header_len;
 
@@ -925,13 +952,16 @@ impl QueueFile {
         }
 
         let last_header = self.validate_v2_element_header(slot.last_position)?;
-        ensure!(last_header.seq == slot.next_sequence_number - 1, CorruptedFileSnafu {
-            msg: format!(
-                "v2 tail seq {} != next_seq-1 {}",
-                last_header.seq,
-                slot.next_sequence_number - 1
-            )
-        });
+        ensure!(
+            last_header.seq == slot.next_sequence_number - 1,
+            CorruptedFileSnafu {
+                msg: format!(
+                    "v2 tail seq {} != next_seq-1 {}",
+                    last_header.seq,
+                    slot.next_sequence_number - 1
+                )
+            }
+        );
 
         self.last =
             Element { pos: slot.last_position, len: last_header.payload_len, seq: last_header.seq };
@@ -954,9 +984,12 @@ impl QueueFile {
         self.ring_read(pos, &mut hdr)?;
 
         let magic = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-        ensure!(magic == V2_ELEM_HDR_MAGIC, CorruptedFileSnafu {
-            msg: format!("v2 element header magic mismatch at pos {pos}: {magic:#010x}")
-        });
+        ensure!(
+            magic == V2_ELEM_HDR_MAGIC,
+            CorruptedFileSnafu {
+                msg: format!("v2 element header magic mismatch at pos {pos}: {magic:#010x}")
+            }
+        );
 
         let seq =
             i64::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11]])
@@ -965,25 +998,31 @@ impl QueueFile {
             hdr[12], hdr[13], hdr[14], hdr[15], hdr[16], hdr[17], hdr[18], hdr[19],
         ]) as u64;
         let payload_len_raw = i32::from_be_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]);
-        ensure!(payload_len_raw >= 0, CorruptedFileSnafu {
-            msg: format!("v2 element payload_len {payload_len_raw} is negative at pos {pos}")
-        });
+        ensure!(
+            payload_len_raw >= 0,
+            CorruptedFileSnafu {
+                msg: format!("v2 element payload_len {payload_len_raw} is negative at pos {pos}")
+            }
+        );
         let payload_len = payload_len_raw as usize; // safe: non-negative i32 fits in usize
-        ensure!(seq >= 1, CorruptedFileSnafu {
-            msg: format!("v2 element seq {seq} < 1 at pos {pos}")
-        });
+        ensure!(
+            seq >= 1,
+            CorruptedFileSnafu { msg: format!("v2 element seq {seq} < 1 at pos {pos}") }
+        );
 
         let expected_crc = compute_elem_header_crc(&hdr);
         let stored_crc = u32::from_be_bytes([hdr[24], hdr[25], hdr[26], hdr[27]]);
-        ensure!(stored_crc == expected_crc, CorruptedFileSnafu {
-            msg: format!("v2 element header CRC mismatch at pos {pos}")
-        });
+        ensure!(
+            stored_crc == expected_crc,
+            CorruptedFileSnafu { msg: format!("v2 element header CRC mismatch at pos {pos}") }
+        );
 
         // Validate span fits.
         let span = V2_ELEM_OVERHEAD + payload_len as u64;
-        ensure!(span <= self.file_len() - V2_DATA_START, CorruptedFileSnafu {
-            msg: format!("v2 element span {span} exceeds data region")
-        });
+        ensure!(
+            span <= self.file_len() - V2_DATA_START,
+            CorruptedFileSnafu { msg: format!("v2 element span {span} exceeds data region") }
+        );
 
         Ok(V2ElementHeader { payload_len, seq, prev_pos })
     }
@@ -1003,9 +1042,15 @@ impl QueueFile {
                         "v2 recovery: tail seq {last_seq} too small for element_count {elem_cnt}"
                     ),
                 })?;
-            ensure!(current_header.seq == expected_seq, CorruptedFileSnafu {
-                msg: format!("v2 recovery: seq {} != expected {expected_seq}", current_header.seq)
-            });
+            ensure!(
+                current_header.seq == expected_seq,
+                CorruptedFileSnafu {
+                    msg: format!(
+                        "v2 recovery: seq {} != expected {expected_seq}",
+                        current_header.seq
+                    )
+                }
+            );
 
             let current =
                 Element { pos: cur_pos, len: current_header.payload_len, seq: current_header.seq };
@@ -1014,9 +1059,16 @@ impl QueueFile {
                 return Ok(current);
             }
 
-            ensure!(current_header.prev_pos != 0, CorruptedFileSnafu {
-                msg: format!("v2 recovery: walked {} elements but expected {}", step + 1, elem_cnt)
-            });
+            ensure!(
+                current_header.prev_pos != 0,
+                CorruptedFileSnafu {
+                    msg: format!(
+                        "v2 recovery: walked {} elements but expected {}",
+                        step + 1,
+                        elem_cnt
+                    )
+                }
+            );
 
             cur_pos = current_header.prev_pos;
         }
@@ -1254,19 +1306,29 @@ impl QueueFile {
             msg: "operation requires V2 format state".to_owned(),
         })?;
 
+        // Collect upfront: (a) allows measuring total span for a single pre-batch expansion,
+        // avoiding one relocate_wrapped_data cycle per element that triggers growth;
+        // (b) moves ElementTooBig validation before any I/O.
+        let elems: Vec<_> = elems.into_iter().collect();
+        let mut total_span: u64 = 0;
+        for elem in &elems {
+            let len = elem.as_ref().len();
+            ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu {});
+            total_span = total_span.saturating_add(V2_ELEM_OVERHEAD + len as u64);
+        }
+
         let result = self.with_batched_v2_append_sync(|queue_file| {
             let mut count = 0usize;
 
-            for elem in elems {
+            queue_file.expand_if_necessary(total_span)?;
+
+            for elem in &elems {
                 queue_file.overwrite_on_remove =
                     if count == 0 { snapshot.overwrite_on_remove } else { false };
                 ensure!(queue_file.elem_cnt + 1 < i32::MAX as usize, TooManyElementsSnafu {});
 
                 let elem = elem.as_ref();
                 let len = elem.len();
-                ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu {});
-
-                queue_file.expand_if_necessary(V2_ELEM_OVERHEAD + len as u64)?;
 
                 let pos = if queue_file.is_empty() {
                     V2_DATA_START
@@ -1465,22 +1527,27 @@ impl QueueFile {
         self.ring_read(footer_pos, &mut ftr)?;
 
         let ftr_magic = u32::from_be_bytes([ftr[0], ftr[1], ftr[2], ftr[3]]);
-        ensure!(ftr_magic == V2_ELEM_FTR_MAGIC, CorruptedFileSnafu {
-            msg: format!("v2 element footer magic mismatch: {ftr_magic:#010x}")
-        });
+        ensure!(
+            ftr_magic == V2_ELEM_FTR_MAGIC,
+            CorruptedFileSnafu {
+                msg: format!("v2 element footer magic mismatch: {ftr_magic:#010x}")
+            }
+        );
 
         let ftr_seq =
             i64::from_be_bytes([ftr[4], ftr[5], ftr[6], ftr[7], ftr[8], ftr[9], ftr[10], ftr[11]])
                 as u64;
-        ensure!(ftr_seq == seq, CorruptedFileSnafu {
-            msg: format!("v2 footer seq {ftr_seq} != element seq {seq}")
-        });
+        ensure!(
+            ftr_seq == seq,
+            CorruptedFileSnafu { msg: format!("v2 footer seq {ftr_seq} != element seq {seq}") }
+        );
 
         let stored_crc = u32::from_be_bytes([ftr[12], ftr[13], ftr[14], ftr[15]]);
         let expected_crc = compute_elem_footer_crc(payload, &ftr[..12]);
-        ensure!(stored_crc == expected_crc, CorruptedFileSnafu {
-            msg: "v2 element footer CRC mismatch".to_owned()
-        });
+        ensure!(
+            stored_crc == expected_crc,
+            CorruptedFileSnafu { msg: "v2 element footer CRC mismatch".to_owned() }
+        );
 
         Ok(())
     }
@@ -1783,18 +1850,22 @@ impl QueueFile {
         let mut header_buf: &mut [u8] = &mut header;
 
         if matches!(self.format, FormatState::V1) {
-            ensure!(i64::try_from(file_len).is_ok(), CorruptedFileSnafu {
-                msg: "file length in header will exceed i64::MAX"
-            });
-            ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
-                msg: "element count in header will exceed i32::MAX"
-            });
-            ensure!(i64::try_from(first_pos).is_ok(), CorruptedFileSnafu {
-                msg: "first element position in header will exceed i64::MAX"
-            });
-            ensure!(i64::try_from(last_pos).is_ok(), CorruptedFileSnafu {
-                msg: "last element position in header will exceed i64::MAX"
-            });
+            ensure!(
+                i64::try_from(file_len).is_ok(),
+                CorruptedFileSnafu { msg: "file length in header will exceed i64::MAX" }
+            );
+            ensure!(
+                i32::try_from(elem_cnt).is_ok(),
+                CorruptedFileSnafu { msg: "element count in header will exceed i32::MAX" }
+            );
+            ensure!(
+                i64::try_from(first_pos).is_ok(),
+                CorruptedFileSnafu { msg: "first element position in header will exceed i64::MAX" }
+            );
+            ensure!(
+                i64::try_from(last_pos).is_ok(),
+                CorruptedFileSnafu { msg: "last element position in header will exceed i64::MAX" }
+            );
 
             header_buf.put_u32(Self::VERSIONED_HEADER);
             header_buf.put_u64(file_len);
@@ -1802,18 +1873,22 @@ impl QueueFile {
             header_buf.put_u64(first_pos);
             header_buf.put_u64(last_pos);
         } else {
-            ensure!(i32::try_from(file_len).is_ok(), CorruptedFileSnafu {
-                msg: "file length in header will exceed i32::MAX"
-            });
-            ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
-                msg: "element count in header will exceed i32::MAX"
-            });
-            ensure!(i32::try_from(first_pos).is_ok(), CorruptedFileSnafu {
-                msg: "first element position in header will exceed i32::MAX"
-            });
-            ensure!(i32::try_from(last_pos).is_ok(), CorruptedFileSnafu {
-                msg: "last element position in header will exceed i32::MAX"
-            });
+            ensure!(
+                i32::try_from(file_len).is_ok(),
+                CorruptedFileSnafu { msg: "file length in header will exceed i32::MAX" }
+            );
+            ensure!(
+                i32::try_from(elem_cnt).is_ok(),
+                CorruptedFileSnafu { msg: "element count in header will exceed i32::MAX" }
+            );
+            ensure!(
+                i32::try_from(first_pos).is_ok(),
+                CorruptedFileSnafu { msg: "first element position in header will exceed i32::MAX" }
+            );
+            ensure!(
+                i32::try_from(last_pos).is_ok(),
+                CorruptedFileSnafu { msg: "last element position in header will exceed i32::MAX" }
+            );
 
             header_buf.put_i32(file_len as i32);
             header_buf.put_i32(elem_cnt as i32);
@@ -1835,18 +1910,22 @@ impl QueueFile {
             (active_slot.toggle(), generation, next_seq)
         };
 
-        ensure!(i64::try_from(file_len).is_ok(), CorruptedFileSnafu {
-            msg: "file length in V2 header will exceed i64::MAX"
-        });
-        ensure!(u32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
-            msg: "element count in V2 header will exceed u32::MAX"
-        });
-        ensure!(i64::try_from(first_pos).is_ok(), CorruptedFileSnafu {
-            msg: "first element position in V2 header will exceed i64::MAX"
-        });
-        ensure!(i64::try_from(last_pos).is_ok(), CorruptedFileSnafu {
-            msg: "last element position in V2 header will exceed i64::MAX"
-        });
+        ensure!(
+            i64::try_from(file_len).is_ok(),
+            CorruptedFileSnafu { msg: "file length in V2 header will exceed i64::MAX" }
+        );
+        ensure!(
+            u32::try_from(elem_cnt).is_ok(),
+            CorruptedFileSnafu { msg: "element count in V2 header will exceed u32::MAX" }
+        );
+        ensure!(
+            i64::try_from(first_pos).is_ok(),
+            CorruptedFileSnafu { msg: "first element position in V2 header will exceed i64::MAX" }
+        );
+        ensure!(
+            i64::try_from(last_pos).is_ok(),
+            CorruptedFileSnafu { msg: "last element position in V2 header will exceed i64::MAX" }
+        );
 
         let slot_data = SlotData {
             file_length: file_len,
@@ -2403,9 +2482,10 @@ impl Element {
 
     #[inline]
     fn new(pos: u64, len: usize, seq: u64) -> Result<Self> {
-        ensure!(i64::try_from(pos).is_ok(), CorruptedFileSnafu {
-            msg: "element position must be less or equal to i64::MAX"
-        });
+        ensure!(
+            i64::try_from(pos).is_ok(),
+            CorruptedFileSnafu { msg: "element position must be less or equal to i64::MAX" }
+        );
         ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu);
 
         Ok(Self { pos, len, seq })
