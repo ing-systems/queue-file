@@ -279,7 +279,7 @@ impl FormatState {
         }
     }
 
-    fn write_header(&mut self, inner: &mut QueueFileInner, metadata: QueueMetadata) -> Result<()> {
+    fn commit_header(&mut self, inner: &mut QueueFileInner, metadata: QueueMetadata) -> Result<()> {
         let ds = self.data_start();
         let (first_phys, last_phys) = if metadata.elem_cnt == 0 {
             (0, 0)
@@ -374,7 +374,7 @@ impl FormatState {
     }
 
     #[allow(clippy::unused_self)]
-    fn read_element(&self, ring: &VirtualRing<'_>, logical_pos: u64) -> Result<Element> {
+    fn read_element(&self, ring: &DataRing<'_>, logical_pos: u64) -> Result<Element> {
         match self {
             Self::Legacy | Self::V1 => {
                 let mut buf: [u8; 4] = [0; Element::HEADER_LENGTH];
@@ -390,7 +390,7 @@ impl FormatState {
     }
 
     fn validate_v2_element_header(
-        &self, ring: &VirtualRing<'_>, logical_pos: u64,
+        &self, ring: &DataRing<'_>, logical_pos: u64,
     ) -> Result<V2ElementHeader> {
         let mut hdr = [0u8; V2_ELEM_HDR_LEN];
         ring.read_at(logical_pos, &mut hdr)?;
@@ -435,7 +435,7 @@ impl FormatState {
 
     #[allow(clippy::unused_self)]
     fn write_element(
-        &self, ring: &mut VirtualRingMut<'_>, logical_pos: u64, payload: &[u8], seq: u64,
+        &self, ring: &mut DataRingMut<'_>, logical_pos: u64, payload: &[u8], seq: u64,
         prev_logical_pos: Option<u64>,
     ) -> Result<()> {
         match self {
@@ -453,7 +453,7 @@ impl FormatState {
     }
 
     fn write_v2_element(
-        &self, ring: &mut VirtualRingMut<'_>, logical_pos: u64, seq: u64,
+        &self, ring: &mut DataRingMut<'_>, logical_pos: u64, seq: u64,
         prev_logical_pos: Option<u64>, payload: &[u8],
     ) -> Result<()> {
         let payload_len = payload.len();
@@ -495,7 +495,7 @@ impl FormatState {
     }
 
     fn on_expansion(
-        &self, ring: &mut VirtualRingMut<'_>, plan: &ExpansionPlan, first: Element, last: Element,
+        &self, ring: &mut DataRingMut<'_>, plan: &ExpansionPlan, first: Element, last: Element,
         elem_cnt: usize,
     ) -> Result<Option<u64>> {
         if matches!(self, Self::V2 { .. }) {
@@ -518,7 +518,7 @@ impl FormatState {
     }
 
     fn rewrite_v2_backlinks_after_expansion(
-        &self, ring: &mut VirtualRingMut<'_>, plan: &ExpansionPlan, first: Element, elem_cnt: usize,
+        &self, ring: &mut DataRingMut<'_>, plan: &ExpansionPlan, first: Element, elem_cnt: usize,
     ) -> Result<()> {
         let mut positions: Vec<Element> = Vec::with_capacity(elem_cnt);
         let mut cur = first;
@@ -535,7 +535,7 @@ impl FormatState {
         let moved_offset = plan.orig_file_len - ring.data_start;
 
         ring.inner.with_batched_backlink_rewrite_sync(|inner| {
-            let mut ring = VirtualRingMut::new(inner, ring.data_start);
+            let mut ring = DataRingMut::new(inner, ring.data_start);
             for elem in &positions {
                 let elem_pos = elem.pos;
                 let mut hdr = [0u8; V2_ELEM_HDR_LEN];
@@ -565,7 +565,7 @@ impl FormatState {
 
     #[allow(clippy::unused_self)]
     fn validate_footer(
-        &self, ring: &VirtualRing<'_>, payload_start: u64, elem: &Element, payload: &[u8],
+        &self, ring: &DataRing<'_>, payload_start: u64, elem: &Element, payload: &[u8],
     ) -> Result<()> {
         if let Self::V2 { .. } = self {
             let footer_pos = ring.add(payload_start, elem.len as u64);
@@ -575,7 +575,7 @@ impl FormatState {
     }
 
     fn validate_v2_footer(
-        &self, ring: &VirtualRing<'_>, footer_pos: u64, seq: u64, payload: &[u8],
+        &self, ring: &DataRing<'_>, footer_pos: u64, seq: u64, payload: &[u8],
     ) -> Result<()> {
         let mut ftr = [0u8; V2_ELEM_FTR_LEN];
         ring.read_at(footer_pos, &mut ftr)?;
@@ -1823,14 +1823,14 @@ impl QueueFile {
     // ── Metrics ───────────────────────────────────────────────────────────────
 
     #[inline]
-    const fn ring(&self) -> VirtualRing<'_> {
-        VirtualRing::new(&self.inner, self.format.data_start())
+    const fn ring(&self) -> DataRing<'_> {
+        DataRing::new(&self.inner, self.format.data_start())
     }
 
     #[inline]
-    fn ring_mut(&mut self) -> VirtualRingMut<'_> {
+    fn ring_mut(&mut self) -> DataRingMut<'_> {
         let data_start = self.format.data_start();
-        VirtualRingMut::new(&mut self.inner, data_start)
+        DataRingMut::new(&mut self.inner, data_start)
     }
 
     fn read_element_at(&self, logical_pos: u64) -> Result<Element> {
@@ -1871,7 +1871,7 @@ impl QueueFile {
     }
 
     fn sync_header(&mut self) -> Result<()> {
-        self.write_header(self.file_len(), self.size(), self.first.pos, self.last.pos)
+        self.commit_header(self.file_len(), self.size(), self.first.pos, self.last.pos)
     }
 
     #[inline]
@@ -1884,11 +1884,11 @@ impl QueueFile {
         self.format.elem_span(payload_len)
     }
 
-    fn write_header(
+    fn commit_header(
         &mut self, file_len: u64, elem_cnt: usize, first_pos: u64, last_pos: u64,
     ) -> Result<()> {
         let metadata = QueueMetadata { file_len, elem_cnt, first_pos, last_pos };
-        self.format.write_header(&mut self.inner, metadata)
+        self.format.commit_header(&mut self.inner, metadata)
     }
 
     fn ring_erase_logical(&mut self, logical_pos: u64, n: usize) -> Result<()> {
@@ -1950,10 +1950,7 @@ impl QueueFile {
             return Ok(());
         }
 
-        let data_start = self.data_start();
-        self.inner.with_batched_expansion_copy_sync(|inner| {
-            inner.transfer(data_start, plan.orig_file_len, plan.moved_count)
-        })?;
+        self.ring_mut().relocate(plan.orig_file_len, plan.moved_count)?;
 
         let first = self.first;
         let last = self.last;
@@ -2053,16 +2050,16 @@ impl QueueFile {
     }
 }
 
-// ── VirtualRing ──────────────────────────────────────────────────────────────
+// ── DataRing ──────────────────────────────────────────────────────────────
 
 /// A view over the data region of a `QueueFile` that provides linear logical addressing.
 #[derive(Debug, Clone, Copy)]
-struct VirtualRing<'a> {
+struct DataRing<'a> {
     inner: &'a QueueFileInner,
     data_start: u64,
 }
 
-impl<'a> VirtualRing<'a> {
+impl<'a> DataRing<'a> {
     const fn new(inner: &'a QueueFileInner, data_start: u64) -> Self {
         Self { inner, data_start }
     }
@@ -2110,19 +2107,19 @@ impl<'a> VirtualRing<'a> {
 
 /// A mutable view over the data region of a `QueueFile` that provides linear logical addressing.
 #[derive(Debug)]
-struct VirtualRingMut<'a> {
+struct DataRingMut<'a> {
     inner: &'a mut QueueFileInner,
     data_start: u64,
 }
 
-impl<'a> VirtualRingMut<'a> {
+impl<'a> DataRingMut<'a> {
     fn new(inner: &'a mut QueueFileInner, data_start: u64) -> Self {
         Self { inner, data_start }
     }
 
     #[inline]
-    fn as_read_only(&self) -> VirtualRing<'_> {
-        VirtualRing { inner: self.inner, data_start: self.data_start }
+    fn as_read_only(&self) -> DataRing<'_> {
+        DataRing { inner: self.inner, data_start: self.data_start }
     }
 
     #[inline]
@@ -2153,6 +2150,17 @@ impl<'a> VirtualRingMut<'a> {
         }
 
         Ok(())
+    }
+
+    fn relocate(&mut self, orig_file_len: u64, moved_count: u64) -> Result<()> {
+        if moved_count == 0 {
+            return Ok(());
+        }
+
+        let data_start = self.data_start;
+        self.inner.with_batched_expansion_copy_sync(|inner| {
+            inner.transfer(data_start, orig_file_len, moved_count)
+        })
     }
 }
 
@@ -2508,9 +2516,9 @@ mod tests {
     }
 
     #[test]
-    fn test_virtual_ring_addressing() {
+    fn test_data_ring_addressing() {
         let (inner, _p) = create_inner(100);
-        let ring = VirtualRing::new(&inner, 20);
+        let ring = DataRing::new(&inner, 20);
 
         assert_eq!(ring.capacity(), 80);
         assert_eq!(ring.phys_pos(0), 20);
@@ -2526,9 +2534,9 @@ mod tests {
     }
 
     #[test]
-    fn test_virtual_ring_io() {
+    fn test_data_ring_io() {
         let (mut inner, _p) = create_inner(100);
-        let mut ring_mut = VirtualRingMut::new(&mut inner, 20);
+        let mut ring_mut = DataRingMut::new(&mut inner, 20);
 
         // Simple write/read
         let data = b"hello world";
