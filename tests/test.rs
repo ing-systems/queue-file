@@ -239,6 +239,7 @@ fn compare_with_vecdeque_partial(
 
 #[quickcheck]
 fn legacy_queue_is_vecdeque(actions: Vec<Action>) {
+    let _lock = lock_failpoint_env();
     let path = auto_delete_path::AutoDeletePath::temp();
     let mut qf = QueueFile::open_legacy(&path).unwrap();
     let mut vd = VecDeque::new();
@@ -262,6 +263,7 @@ fn legacy_queue_is_vecdeque(actions: Vec<Action>) {
 
 #[quickcheck]
 fn queue_with_skip_header_update_is_vecdeque(actions: Vec<Action>) {
+    let _lock = lock_failpoint_env();
     let path = auto_delete_path::AutoDeletePath::temp();
     let mut qf = QueueFile::open(&path).unwrap();
     qf.set_skip_write_header_on_add(true);
@@ -293,6 +295,7 @@ fn queue_with_skip_header_update_is_vecdeque(actions: Vec<Action>) {
 
 #[quickcheck]
 fn queue_is_vecdeque(actions: Vec<Action>) {
+    let _lock = lock_failpoint_env();
     let path = auto_delete_path::AutoDeletePath::temp();
     let mut qf = QueueFile::open(&path).unwrap();
     let mut vd = VecDeque::new();

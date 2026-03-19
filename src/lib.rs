@@ -130,6 +130,8 @@ const V2_ELEM_FTR_LEN: usize = 16;
 /// Total per-element overhead in v2: header (28) + footer (16).
 const V2_ELEM_OVERHEAD: u64 = 44;
 
+const VERSIONED_HEADER: u32 = 0x8000_0001;
+
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 /// Errors that can be returned by [`QueueFile`] operations.
@@ -218,6 +220,351 @@ enum FormatState {
     V2 { active_slot: HeaderSlot, generation: u64, next_seq: u64 },
 }
 
+impl FormatState {
+    #[inline]
+    const fn header_len(&self) -> u64 {
+        match self {
+            Self::Legacy => 16,
+            Self::V1 => 32,
+            Self::V2 { .. } => V2_SLOT_LEN as u64,
+        }
+    }
+
+    #[inline]
+    const fn data_start(&self) -> u64 {
+        match self {
+            Self::Legacy => 16,
+            Self::V1 => 32,
+            Self::V2 { .. } => V2_DATA_START,
+        }
+    }
+
+    #[inline]
+    const fn elem_hdr_len(&self) -> u64 {
+        match self {
+            Self::V2 { .. } => V2_ELEM_HDR_LEN as u64,
+            _ => Element::HEADER_LENGTH as u64,
+        }
+    }
+
+    #[inline]
+    const fn elem_span(&self, payload_len: usize) -> u64 {
+        match self {
+            Self::V2 { .. } => V2_ELEM_OVERHEAD + payload_len as u64,
+            _ => Element::HEADER_LENGTH as u64 + payload_len as u64,
+        }
+    }
+
+    fn write_header(&mut self, inner: &mut QueueFileInner, metadata: QueueMetadata) -> Result<()> {
+        match self {
+            Self::Legacy | Self::V1 => {
+                let mut header = [0u8; 32];
+                let mut header_buf: &mut [u8] = &mut header;
+
+                if matches!(self, Self::V1) {
+                    ensure!(i64::try_from(metadata.file_len).is_ok(), CorruptedFileSnafu {
+                        msg: "file length in header will exceed i64::MAX"
+                    });
+                    ensure!(i32::try_from(metadata.elem_cnt).is_ok(), CorruptedFileSnafu {
+                        msg: "element count in header will exceed i32::MAX"
+                    });
+                    ensure!(i64::try_from(metadata.first_pos).is_ok(), CorruptedFileSnafu {
+                        msg: "first element position in header will exceed i64::MAX"
+                    });
+                    ensure!(i64::try_from(metadata.last_pos).is_ok(), CorruptedFileSnafu {
+                        msg: "last element position in header will exceed i64::MAX"
+                    });
+
+                    header_buf.put_u32(VERSIONED_HEADER);
+                    header_buf.put_u64(metadata.file_len);
+                    header_buf.put_i32(metadata.elem_cnt as i32);
+                    header_buf.put_u64(metadata.first_pos);
+                    header_buf.put_u64(metadata.last_pos);
+                } else {
+                    ensure!(i32::try_from(metadata.file_len).is_ok(), CorruptedFileSnafu {
+                        msg: "file length in header will exceed i32::MAX"
+                    });
+                    ensure!(i32::try_from(metadata.elem_cnt).is_ok(), CorruptedFileSnafu {
+                        msg: "element count in header will exceed i32::MAX"
+                    });
+                    ensure!(i32::try_from(metadata.first_pos).is_ok(), CorruptedFileSnafu {
+                        msg: "first element position in header will exceed i32::MAX"
+                    });
+                    ensure!(i32::try_from(metadata.last_pos).is_ok(), CorruptedFileSnafu {
+                        msg: "last element position in header will exceed i32::MAX"
+                    });
+
+                    header_buf.put_i32(metadata.file_len as i32);
+                    header_buf.put_i32(metadata.elem_cnt as i32);
+                    header_buf.put_i32(metadata.first_pos as i32);
+                    header_buf.put_i32(metadata.last_pos as i32);
+                }
+
+                inner.seek(0);
+                inner.write(&header[..self.header_len() as usize])
+            }
+            Self::V2 { active_slot, generation, next_seq } => {
+                let next_slot = active_slot.toggle();
+
+                ensure!(i64::try_from(metadata.file_len).is_ok(), CorruptedFileSnafu {
+                    msg: "file length in V2 header will exceed i64::MAX"
+                });
+                ensure!(u32::try_from(metadata.elem_cnt).is_ok(), CorruptedFileSnafu {
+                    msg: "element count in V2 header will exceed u32::MAX"
+                });
+                ensure!(i64::try_from(metadata.first_pos).is_ok(), CorruptedFileSnafu {
+                    msg: "first element position in V2 header will exceed i64::MAX"
+                });
+                ensure!(i64::try_from(metadata.last_pos).is_ok(), CorruptedFileSnafu {
+                    msg: "last element position in V2 header will exceed i64::MAX"
+                });
+
+                let slot_data = SlotData {
+                    file_length: metadata.file_len,
+                    element_count: metadata.elem_cnt as u32,
+                    first_position: metadata.first_pos,
+                    last_position: metadata.last_pos,
+                    generation: *generation + 1,
+                    next_sequence_number: *next_seq,
+                };
+
+                let slot_bytes = build_slot_bytes(&slot_data);
+                let offset = next_slot.offset();
+
+                inner.seek(offset);
+                inner.write(&slot_bytes)?;
+
+                *generation += 1;
+                *active_slot = next_slot;
+
+                Ok(())
+            }
+        }
+    }
+
+    fn read_element(&self, inner: &QueueFileInner, pos: u64) -> Result<Element> {
+        if pos == 0 {
+            return Ok(Element::EMPTY);
+        }
+
+        match self {
+            Self::Legacy | Self::V1 => {
+                let mut buf: [u8; 4] = [0; Element::HEADER_LENGTH];
+                inner.ring_read(pos, &mut buf, self.data_start())?;
+
+                Element::new(pos, u32::from_be_bytes(buf) as usize, 0)
+            }
+            Self::V2 { .. } => {
+                let header = self.validate_v2_element_header(inner, pos)?;
+                Ok(Element { pos, len: header.payload_len, seq: header.seq })
+            }
+        }
+    }
+
+    fn validate_v2_element_header(
+        &self, inner: &QueueFileInner, pos: u64,
+    ) -> Result<V2ElementHeader> {
+        let mut hdr = [0u8; V2_ELEM_HDR_LEN];
+        inner.ring_read(pos, &mut hdr, self.data_start())?;
+
+        let magic = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        ensure!(magic == V2_ELEM_HDR_MAGIC, CorruptedFileSnafu {
+            msg: format!("v2 element header magic mismatch at pos {pos}: {magic:#010x}")
+        });
+
+        let seq =
+            i64::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11]])
+                as u64;
+        let prev_pos = i64::from_be_bytes([
+            hdr[12], hdr[13], hdr[14], hdr[15], hdr[16], hdr[17], hdr[18], hdr[19],
+        ]) as u64;
+        let payload_len_raw = i32::from_be_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]);
+        ensure!(payload_len_raw >= 0, CorruptedFileSnafu {
+            msg: format!("v2 element payload_len {payload_len_raw} is negative at pos {pos}")
+        });
+        let payload_len = payload_len_raw as usize;
+        ensure!(seq >= 1, CorruptedFileSnafu {
+            msg: format!("v2 element seq {seq} < 1 at pos {pos}")
+        });
+
+        let expected_crc = compute_elem_header_crc(&hdr);
+        let stored_crc = u32::from_be_bytes([hdr[24], hdr[25], hdr[26], hdr[27]]);
+        ensure!(stored_crc == expected_crc, CorruptedFileSnafu {
+            msg: format!("v2 element header CRC mismatch at pos {pos}")
+        });
+
+        let span = V2_ELEM_OVERHEAD + payload_len as u64;
+        ensure!(span <= inner.file_len - V2_DATA_START, CorruptedFileSnafu {
+            msg: format!("v2 element span {span} exceeds data region")
+        });
+
+        Ok(V2ElementHeader { payload_len, seq, prev_pos })
+    }
+
+    fn validate_v2_footer(
+        &self, inner: &QueueFileInner, footer_pos: u64, seq: u64, payload: &[u8],
+    ) -> Result<()> {
+        let mut ftr = [0u8; V2_ELEM_FTR_LEN];
+        inner.ring_read(footer_pos, &mut ftr, self.data_start())?;
+
+        let ftr_magic = u32::from_be_bytes([ftr[0], ftr[1], ftr[2], ftr[3]]);
+        ensure!(ftr_magic == V2_ELEM_FTR_MAGIC, CorruptedFileSnafu {
+            msg: format!("v2 element footer magic mismatch: {ftr_magic:#010x}")
+        });
+
+        let ftr_seq =
+            i64::from_be_bytes([ftr[4], ftr[5], ftr[6], ftr[7], ftr[8], ftr[9], ftr[10], ftr[11]])
+                as u64;
+        ensure!(ftr_seq == seq, CorruptedFileSnafu {
+            msg: format!("v2 footer seq {ftr_seq} != element seq {seq}")
+        });
+
+        let stored_crc = u32::from_be_bytes([ftr[12], ftr[13], ftr[14], ftr[15]]);
+        let expected_crc = compute_elem_footer_crc(payload, &ftr[..12]);
+        ensure!(stored_crc == expected_crc, CorruptedFileSnafu {
+            msg: "v2 element footer CRC mismatch".to_owned()
+        });
+
+        Ok(())
+    }
+
+    fn write_element(
+        &self, inner: &mut QueueFileInner, pos: u64, payload: &[u8], seq: u64, prev_pos: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Legacy | Self::V1 => {
+                let len = payload.len();
+                let mut buf = Vec::with_capacity(4 + len);
+                buf.extend(&(len as u32).to_be_bytes());
+                buf.extend(payload);
+                inner.ring_write(pos, &buf, self.data_start())
+            }
+            Self::V2 { .. } => self.write_v2_element(inner, pos, seq, prev_pos, payload),
+        }
+    }
+
+    fn write_v2_element(
+        &self, inner: &mut QueueFileInner, pos: u64, seq: u64, prev_pos: u64, payload: &[u8],
+    ) -> Result<()> {
+        let payload_len = payload.len();
+        let data_start = self.data_start();
+        let file_len = inner.file_len;
+
+        // Build 28-byte header.
+        let mut hdr = [0u8; V2_ELEM_HDR_LEN];
+        {
+            let mut w: &mut [u8] = &mut hdr;
+            w.put_u32(V2_ELEM_HDR_MAGIC);
+            w.put_i64(seq as i64);
+            w.put_i64(prev_pos as i64);
+            w.put_i32(payload_len as i32);
+        }
+        let hdr_crc = compute_elem_header_crc(&hdr);
+        hdr[24..28].copy_from_slice(&hdr_crc.to_be_bytes());
+
+        // Ring-write header.
+        inner.ring_write(pos, &hdr, data_start)?;
+
+        // Ring-write payload.
+        let payload_pos = wrap_pos_fn(pos + V2_ELEM_HDR_LEN as u64, file_len, data_start);
+        inner.ring_write(payload_pos, payload, data_start)?;
+
+        // Build 16-byte footer.
+        let footer_pos =
+            wrap_pos_fn(pos + V2_ELEM_HDR_LEN as u64 + payload_len as u64, file_len, data_start);
+        let mut ftr = [0u8; V2_ELEM_FTR_LEN];
+        {
+            let mut w: &mut [u8] = &mut ftr;
+            w.put_u32(V2_ELEM_FTR_MAGIC);
+            w.put_i64(seq as i64);
+        }
+        let ftr_crc = compute_elem_footer_crc(payload, &ftr[..12]);
+        ftr[12..16].copy_from_slice(&ftr_crc.to_be_bytes());
+
+        inner.ring_write(footer_pos, &ftr, data_start)?;
+
+        Ok(())
+    }
+
+    fn on_expansion(
+        &self, inner: &mut QueueFileInner, plan: &ExpansionPlan, first: Element, last: Element,
+        elem_cnt: usize,
+    ) -> Result<Option<u64>> {
+        if matches!(self, Self::V2 { .. }) {
+            self.rewrite_v2_backlinks_after_expansion(inner, plan, first, elem_cnt)?;
+            let new_last_pos = plan.orig_file_len + last.pos - self.data_start();
+            return Ok(Some(new_last_pos));
+        } else if last.pos < first.pos {
+            let new_last_pos = plan.orig_file_len + last.pos - self.data_start();
+            return Ok(Some(new_last_pos));
+        }
+        Ok(None)
+    }
+
+    fn rewrite_v2_backlinks_after_expansion(
+        &self, inner: &mut QueueFileInner, plan: &ExpansionPlan, first: Element, elem_cnt: usize,
+    ) -> Result<()> {
+        let data_start = self.data_start();
+        let file_len = inner.file_len;
+
+        let mut positions: Vec<Element> = Vec::with_capacity(elem_cnt);
+        let mut cur = first;
+        for _ in 0..elem_cnt {
+            positions.push(cur);
+            let next_pos =
+                wrap_pos_fn(cur.pos + V2_ELEM_OVERHEAD + cur.len as u64, file_len, data_start);
+            if positions.len() < elem_cnt {
+                let next_header = self.validate_v2_element_header(inner, next_pos)?;
+                cur = Element { pos: next_pos, len: next_header.payload_len, seq: next_header.seq };
+            }
+        }
+
+        let moved_offset = plan.orig_file_len - data_start;
+
+        inner.with_batched_backlink_rewrite_sync(|inner| {
+            for elem in &positions {
+                let elem_pos = elem.pos;
+                let mut hdr = [0u8; V2_ELEM_HDR_LEN];
+                inner.ring_read(elem_pos, &mut hdr, data_start)?;
+
+                let prev_pos = self.validate_v2_element_header(inner, elem_pos)?.prev_pos;
+
+                if prev_pos >= data_start && prev_pos < plan.end_of_last_elem {
+                    let new_prev_pos = prev_pos + moved_offset;
+
+                    let new_prev_bytes = (new_prev_pos as i64).to_be_bytes();
+                    hdr[12..20].copy_from_slice(&new_prev_bytes);
+
+                    let new_crc = compute_elem_header_crc(&hdr);
+                    hdr[24..28].copy_from_slice(&new_crc.to_be_bytes());
+
+                    inner.ring_write(elem_pos, &hdr, data_start)?;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    fn validate_footer(
+        &self, inner: &QueueFileInner, payload_start: u64, elem: &Element, payload: &[u8],
+    ) -> Result<()> {
+        if let Self::V2 { .. } = self {
+            let footer_pos =
+                wrap_pos_fn(payload_start + elem.len as u64, inner.file_len, self.data_start());
+            self.validate_v2_footer(inner, footer_pos, elem.seq, payload)?;
+        }
+        Ok(())
+    }
+
+    fn on_expansion_cleanup(&self, plan: &ExpansionPlan) -> Result<()> {
+        if matches!(self, Self::V2 { .. }) && plan.wraps {
+            maybe_inject_failpoint("v2_after_relocation_cleanup_before_add")?;
+        }
+        Ok(())
+    }
+}
+
 // ── V2 slot data ─────────────────────────────────────────────────────────────
 
 /// Parsed contents of one 56-byte v2 header slot.
@@ -229,6 +576,14 @@ struct SlotData {
     last_position: u64,
     generation: u64,
     next_sequence_number: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueueMetadata {
+    file_len: u64,
+    elem_cnt: usize,
+    first_pos: u64,
+    last_pos: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -386,35 +741,26 @@ fn elect_canonical_slot(
 }
 
 fn validate_v2_slot_data(slot: &SlotData, real_file_len: u64) -> Result<()> {
-    ensure!(
-        slot.file_length >= V2_DATA_START,
-        CorruptedFileSnafu {
-            msg: format!("v2 file_length {} < data_start {}", slot.file_length, V2_DATA_START)
-        }
-    );
-    ensure!(
-        slot.file_length <= real_file_len,
-        CorruptedFileSnafu {
-            msg: format!(
-                "v2 file is truncated: header claims {}, actual {}",
-                slot.file_length, real_file_len
-            )
-        }
-    );
-    ensure!(
-        slot.next_sequence_number >= 1,
-        CorruptedFileSnafu { msg: "v2 next_sequence_number must be >= 1".to_owned() }
-    );
+    ensure!(slot.file_length >= V2_DATA_START, CorruptedFileSnafu {
+        msg: format!("v2 file_length {} < data_start {}", slot.file_length, V2_DATA_START)
+    });
+    ensure!(slot.file_length <= real_file_len, CorruptedFileSnafu {
+        msg: format!(
+            "v2 file is truncated: header claims {}, actual {}",
+            slot.file_length, real_file_len
+        )
+    });
+    ensure!(slot.next_sequence_number >= 1, CorruptedFileSnafu {
+        msg: "v2 next_sequence_number must be >= 1".to_owned()
+    });
     if slot.element_count == 0 {
-        ensure!(
-            slot.first_position == 0 && slot.last_position == 0,
-            CorruptedFileSnafu { msg: "v2 empty queue has non-zero pointers".to_owned() }
-        );
+        ensure!(slot.first_position == 0 && slot.last_position == 0, CorruptedFileSnafu {
+            msg: "v2 empty queue has non-zero pointers".to_owned()
+        });
     } else {
-        ensure!(
-            slot.first_position != 0 && slot.last_position != 0,
-            CorruptedFileSnafu { msg: "v2 non-empty queue has zero pointer".to_owned() }
-        );
+        ensure!(slot.first_position != 0 && slot.last_position != 0, CorruptedFileSnafu {
+            msg: "v2 non-empty queue has zero pointer".to_owned()
+        });
         ensure!(
             slot.first_position >= V2_DATA_START && slot.first_position < slot.file_length,
             CorruptedFileSnafu {
@@ -503,8 +849,6 @@ pub struct QueueFile {
     overwrite_on_remove: bool,
     /// When true, skips header update upon adding.
     skip_write_header_on_add: bool,
-    /// Write buffering.
-    write_buf: Vec<u8>,
     /// Offset cache idx->Element. Sorted in ascending order, always unique.
     cached_offsets: VecDeque<(usize, Element)>,
     /// Offset caching policy.
@@ -550,30 +894,11 @@ impl Drop for QueueFile {
 
 impl QueueFile {
     const INITIAL_LENGTH: u64 = 4096;
-    const VERSIONED_HEADER: u32 = 0x8000_0001;
     const ZEROES: [u8; 4096] = [0; 4096];
 
     #[inline]
-    const fn is_v2(&self) -> bool {
-        matches!(self.format, FormatState::V2 { .. })
-    }
-
-    #[inline]
-    const fn header_len(&self) -> u64 {
-        match self.format {
-            FormatState::Legacy => 16,
-            FormatState::V1 => 32,
-            FormatState::V2 { .. } => V2_SLOT_LEN as u64,
-        }
-    }
-
-    #[inline]
     const fn data_start(&self) -> u64 {
-        match self.format {
-            FormatState::Legacy => 16,
-            FormatState::V1 => 32,
-            FormatState::V2 { .. } => V2_DATA_START,
-        }
+        self.format.data_start()
     }
 
     #[inline]
@@ -618,7 +943,7 @@ impl QueueFile {
                 if force_legacy {
                     buf.put_u32(capacity as u32);
                 } else {
-                    buf.put_u32(Self::VERSIONED_HEADER);
+                    buf.put_u32(VERSIONED_HEADER);
                     buf.put_u64(capacity);
                 }
                 file.write_all(buf.as_ref())?;
@@ -665,7 +990,7 @@ impl QueueFile {
         Self::open_internal_full(path, true, true, Self::INITIAL_LENGTH, false)
     }
 
-    /// Returns `true` if the file contains V2_MAGIC at slot A or slot B.
+    /// Returns `true` if the file contains `V2_MAGIC` at slot A or slot B.
     fn detect_v2_magic(file: &mut File, real_file_len: u64, force_legacy: bool) -> Result<bool> {
         if force_legacy {
             return Ok(false);
@@ -699,22 +1024,18 @@ impl QueueFile {
         let first_pos = buf.get_u64();
         let last_pos = buf.get_u64();
 
-        ensure!(
-            i64::try_from(file_len).is_ok(),
-            CorruptedFileSnafu { msg: "file length in header is greater than i64::MAX" }
-        );
-        ensure!(
-            i32::try_from(elem_cnt).is_ok(),
-            CorruptedFileSnafu { msg: "element count in header is greater than i32::MAX" }
-        );
-        ensure!(
-            i64::try_from(first_pos).is_ok(),
-            CorruptedFileSnafu { msg: "first element position in header is greater than i64::MAX" }
-        );
-        ensure!(
-            i64::try_from(last_pos).is_ok(),
-            CorruptedFileSnafu { msg: "last element position in header is greater than i64::MAX" }
-        );
+        ensure!(i64::try_from(file_len).is_ok(), CorruptedFileSnafu {
+            msg: "file length in header is greater than i64::MAX"
+        });
+        ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
+            msg: "element count in header is greater than i32::MAX"
+        });
+        ensure!(i64::try_from(first_pos).is_ok(), CorruptedFileSnafu {
+            msg: "first element position in header is greater than i64::MAX"
+        });
+        ensure!(i64::try_from(last_pos).is_ok(), CorruptedFileSnafu {
+            msg: "last element position in header is greater than i64::MAX"
+        });
         Ok((file_len, elem_cnt, first_pos, last_pos))
     }
 
@@ -726,22 +1047,18 @@ impl QueueFile {
         let first_pos = u64::from(buf.get_u32());
         let last_pos = u64::from(buf.get_u32());
 
-        ensure!(
-            i32::try_from(file_len).is_ok(),
-            CorruptedFileSnafu { msg: "file length in header is greater than i32::MAX" }
-        );
-        ensure!(
-            i32::try_from(elem_cnt).is_ok(),
-            CorruptedFileSnafu { msg: "element count in header is greater than i32::MAX" }
-        );
-        ensure!(
-            i32::try_from(first_pos).is_ok(),
-            CorruptedFileSnafu { msg: "first element position in header is greater than i32::MAX" }
-        );
-        ensure!(
-            i32::try_from(last_pos).is_ok(),
-            CorruptedFileSnafu { msg: "last element position in header is greater than i32::MAX" }
-        );
+        ensure!(i32::try_from(file_len).is_ok(), CorruptedFileSnafu {
+            msg: "file length in header is greater than i32::MAX"
+        });
+        ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
+            msg: "element count in header is greater than i32::MAX"
+        });
+        ensure!(i32::try_from(first_pos).is_ok(), CorruptedFileSnafu {
+            msg: "first element position in header is greater than i32::MAX"
+        });
+        ensure!(i32::try_from(last_pos).is_ok(), CorruptedFileSnafu {
+            msg: "last element position in header is greater than i32::MAX"
+        });
         Ok((file_len, elem_cnt, first_pos, last_pos))
     }
 
@@ -776,30 +1093,20 @@ impl QueueFile {
             (FormatState::Legacy, 16u64, file_len, elem_cnt, first_pos, last_pos)
         };
 
-        ensure!(
-            file_len <= real_file_len,
-            CorruptedFileSnafu {
-                msg: format!(
-                    "file is truncated. expected length was {file_len} but actual length is {real_file_len}"
-                )
-            }
-        );
-        ensure!(
-            file_len >= header_len,
-            CorruptedFileSnafu { msg: format!("length stored in header ({file_len}) is invalid") }
-        );
-        ensure!(
-            first_pos <= file_len,
-            CorruptedFileSnafu {
-                msg: format!("position of the first element ({first_pos}) is beyond the file")
-            }
-        );
-        ensure!(
-            last_pos <= file_len,
-            CorruptedFileSnafu {
-                msg: format!("position of the last element ({last_pos}) is beyond the file")
-            }
-        );
+        ensure!(file_len <= real_file_len, CorruptedFileSnafu {
+            msg: format!(
+                "file is truncated. expected length was {file_len} but actual length is {real_file_len}"
+            )
+        });
+        ensure!(file_len >= header_len, CorruptedFileSnafu {
+            msg: format!("length stored in header ({file_len}) is invalid")
+        });
+        ensure!(first_pos <= file_len, CorruptedFileSnafu {
+            msg: format!("position of the first element ({first_pos}) is beyond the file")
+        });
+        ensure!(last_pos <= file_len, CorruptedFileSnafu {
+            msg: format!("position of the last element ({last_pos}) is beyond the file")
+        });
 
         let _ = header_len;
 
@@ -826,7 +1133,6 @@ impl QueueFile {
             capacity,
             overwrite_on_remove,
             skip_write_header_on_add: false,
-            write_buf: Vec::new(),
             cached_offsets: VecDeque::new(),
             offset_cache_kind: None,
         };
@@ -871,7 +1177,7 @@ impl QueueFile {
     fn open_v2(
         file: File, real_file_len: u64, capacity: u64, overwrite_on_remove: bool, _path: &Path,
     ) -> Result<Self> {
-        let mut inner = QueueFileInner {
+        let inner = QueueFileInner {
             file: Some(file),
             file_len: real_file_len,
             expected_seek: 0,
@@ -881,7 +1187,7 @@ impl QueueFile {
             deferred_sync_phase: None,
         };
 
-        let open_state = Self::read_v2_open_state(&mut inner, real_file_len)?;
+        let open_state = Self::read_v2_open_state(&inner, real_file_len)?;
         let mut qf = Self::build_v2_queue_file(inner, open_state, capacity, overwrite_on_remove);
         qf.initialize_v2_endpoints(open_state.slot)?;
 
@@ -892,7 +1198,7 @@ impl QueueFile {
         Ok(qf)
     }
 
-    fn read_v2_open_state(inner: &mut QueueFileInner, real_file_len: u64) -> Result<V2OpenState> {
+    fn read_v2_open_state(inner: &QueueFileInner, real_file_len: u64) -> Result<V2OpenState> {
         let raw_a = if real_file_len >= V2_SLOT_LEN as u64 {
             read_slot(inner, V2_SLOT_A_OFFSET).ok()
         } else {
@@ -931,7 +1237,6 @@ impl QueueFile {
             capacity: capacity.max(V2_INITIAL_LEN),
             overwrite_on_remove,
             skip_write_header_on_add: false,
-            write_buf: Vec::new(),
             cached_offsets: VecDeque::new(),
             offset_cache_kind: None,
         }
@@ -942,22 +1247,21 @@ impl QueueFile {
             return Ok(());
         }
 
-        let last_header = self.validate_v2_element_header(slot.last_position)?;
-        ensure!(
-            last_header.seq == slot.next_sequence_number - 1,
-            CorruptedFileSnafu {
-                msg: format!(
-                    "v2 tail seq {} != next_seq-1 {}",
-                    last_header.seq,
-                    slot.next_sequence_number - 1
-                )
-            }
-        );
+        let last_header =
+            self.format.validate_v2_element_header(&self.inner, slot.last_position)?;
+        ensure!(last_header.seq == slot.next_sequence_number - 1, CorruptedFileSnafu {
+            msg: format!(
+                "v2 tail seq {} != next_seq-1 {}",
+                last_header.seq,
+                slot.next_sequence_number - 1
+            )
+        });
 
         self.last =
             Element { pos: slot.last_position, len: last_header.payload_len, seq: last_header.seq };
 
-        self.first = match self.validate_v2_element_header(slot.first_position) {
+        self.first = match self.format.validate_v2_element_header(&self.inner, slot.first_position)
+        {
             Ok(first_header) => Element {
                 pos: slot.first_position,
                 len: first_header.payload_len,
@@ -969,63 +1273,12 @@ impl QueueFile {
         Ok(())
     }
 
-    /// Validate a v2 element header at `pos`, returning parsed header state.
-    fn validate_v2_element_header(&self, pos: u64) -> Result<V2ElementHeader> {
-        let mut hdr = [0u8; V2_ELEM_HDR_LEN];
-        self.ring_read(pos, &mut hdr)?;
-
-        let magic = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-        ensure!(
-            magic == V2_ELEM_HDR_MAGIC,
-            CorruptedFileSnafu {
-                msg: format!("v2 element header magic mismatch at pos {pos}: {magic:#010x}")
-            }
-        );
-
-        let seq =
-            i64::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11]])
-                as u64;
-        let prev_pos = i64::from_be_bytes([
-            hdr[12], hdr[13], hdr[14], hdr[15], hdr[16], hdr[17], hdr[18], hdr[19],
-        ]) as u64;
-        let payload_len_raw = i32::from_be_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]);
-        ensure!(
-            payload_len_raw >= 0,
-            CorruptedFileSnafu {
-                msg: format!("v2 element payload_len {payload_len_raw} is negative at pos {pos}")
-            }
-        );
-        let payload_len = payload_len_raw as usize; // safe: non-negative i32 fits in usize
-        ensure!(
-            seq >= 1,
-            CorruptedFileSnafu { msg: format!("v2 element seq {seq} < 1 at pos {pos}") }
-        );
-
-        let expected_crc = compute_elem_header_crc(&hdr);
-        let stored_crc = u32::from_be_bytes([hdr[24], hdr[25], hdr[26], hdr[27]]);
-        ensure!(
-            stored_crc == expected_crc,
-            CorruptedFileSnafu { msg: format!("v2 element header CRC mismatch at pos {pos}") }
-        );
-
-        // Validate span fits.
-        let span = V2_ELEM_OVERHEAD + payload_len as u64;
-        ensure!(
-            span <= self.file_len() - V2_DATA_START,
-            CorruptedFileSnafu { msg: format!("v2 element span {span} exceeds data region") }
-        );
-
-        Ok(V2ElementHeader { payload_len, seq, prev_pos })
-    }
-
     /// Attempt head recovery by walking backward via `prev_pos` backlinks from the tail.
-    fn recover_v2_head(
-        &mut self, last_pos: u64, last_seq: u64, elem_cnt: usize,
-    ) -> Result<Element> {
+    fn recover_v2_head(&self, last_pos: u64, last_seq: u64, elem_cnt: usize) -> Result<Element> {
         let mut cur_pos = last_pos;
 
         for step in 0..elem_cnt {
-            let current_header = self.validate_v2_element_header(cur_pos)?;
+            let current_header = self.format.validate_v2_element_header(&self.inner, cur_pos)?;
 
             let expected_seq =
                 last_seq.checked_sub(step as u64).ok_or_else(|| Error::CorruptedFile {
@@ -1033,15 +1286,9 @@ impl QueueFile {
                         "v2 recovery: tail seq {last_seq} too small for element_count {elem_cnt}"
                     ),
                 })?;
-            ensure!(
-                current_header.seq == expected_seq,
-                CorruptedFileSnafu {
-                    msg: format!(
-                        "v2 recovery: seq {} != expected {expected_seq}",
-                        current_header.seq
-                    )
-                }
-            );
+            ensure!(current_header.seq == expected_seq, CorruptedFileSnafu {
+                msg: format!("v2 recovery: seq {} != expected {expected_seq}", current_header.seq)
+            });
 
             let current =
                 Element { pos: cur_pos, len: current_header.payload_len, seq: current_header.seq };
@@ -1050,16 +1297,9 @@ impl QueueFile {
                 return Ok(current);
             }
 
-            ensure!(
-                current_header.prev_pos != 0,
-                CorruptedFileSnafu {
-                    msg: format!(
-                        "v2 recovery: walked {} elements but expected {}",
-                        step + 1,
-                        elem_cnt
-                    )
-                }
-            );
+            ensure!(current_header.prev_pos != 0, CorruptedFileSnafu {
+                msg: format!("v2 recovery: walked {} elements but expected {}", step + 1, elem_cnt)
+            });
 
             cur_pos = current_header.prev_pos;
         }
@@ -1222,96 +1462,51 @@ impl QueueFile {
             .map_or_else(|i| i.checked_sub(1), Some)
     }
 
+    fn with_batched_append_sync<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let sync_writes = self.inner.sync_writes;
+        let deferred_sync_phase = self.inner.deferred_sync_phase;
+        self.inner.sync_writes = false;
+        self.inner.deferred_sync_phase = Some(DeferredSyncPhase::AppendBatch);
+
+        let result = f(self);
+
+        self.inner.deferred_sync_phase = deferred_sync_phase;
+        self.inner.sync_writes = sync_writes;
+
+        let value = result?;
+
+        if sync_writes {
+            self.inner.file_mut()?.sync_data()?;
+            maybe_inject_failpoint("v2_after_add_batch_flush")?;
+        }
+
+        Ok(value)
+    }
+
     // ── add_n ─────────────────────────────────────────────────────────────────
 
     /// Adds multiple elements to the end of the queue in a single write.
     pub fn add_n(&mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Result<()> {
-        if self.is_v2() {
-            return self.add_n_v2(elems);
-        }
-
         let snapshot = self.snapshot_queue_state();
 
-        let result = (|| {
-            let mut count = 0usize;
-
-            for elem in elems {
-                self.overwrite_on_remove =
-                    if count == 0 { snapshot.overwrite_on_remove } else { false };
-                ensure!(self.elem_cnt + 1 < i32::MAX as usize, TooManyElementsSnafu {});
-
-                let elem = elem.as_ref();
-                let len = elem.len();
-                let span = Element::HEADER_LENGTH as u64 + len as u64;
-                self.expand_if_necessary(span)?;
-
-                let pos = if self.is_empty() {
-                    self.data_start()
-                } else {
-                    self.wrap_pos(
-                        self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64,
-                    )
-                };
-                let elem_entry = Element::new(pos, len, 0)?;
-
-                self.write_buf.clear();
-                self.write_buf.extend(&(len as u32).to_be_bytes());
-                self.write_buf.extend(elem);
-                self.ring_write_buf(pos)?;
-
-                if self.is_empty() {
-                    self.first = elem_entry;
-                }
-                self.last = elem_entry;
-                self.elem_cnt += 1;
-                count += 1;
-            }
-
-            if count == 0 {
-                return Ok(0);
-            }
-
-            if !self.skip_write_header_on_add {
-                self.write_header(self.file_len(), self.elem_cnt, self.first.pos, self.last.pos)?;
-            }
-
-            self.cache_last_offset_if_needed(count);
-
-            Ok(count)
-        })();
-
-        self.overwrite_on_remove = snapshot.overwrite_on_remove;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                self.restore_queue_state(snapshot);
-                Err(err)
-            }
-        }
-    }
-
-    fn add_n_v2(&mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Result<()> {
-        let snapshot = self.snapshot_queue_state();
-        let (_, _, base_seq) = self.v2_state().ok_or_else(|| Error::CorruptedFile {
-            msg: "operation requires V2 format state".to_owned(),
-        })?;
-
-        // Collect upfront: (a) allows measuring total span for a single pre-batch expansion,
-        // avoiding one relocate_wrapped_data cycle per element that triggers growth;
-        // (b) moves ElementTooBig validation before any I/O.
         let elems: Vec<_> = elems.into_iter().collect();
+        if elems.is_empty() {
+            return Ok(());
+        }
+
         let mut total_span: u64 = 0;
         for elem in &elems {
             let len = elem.as_ref().len();
             ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu {});
-            total_span = total_span.saturating_add(V2_ELEM_OVERHEAD + len as u64);
+            total_span = total_span.saturating_add(self.format.elem_span(len));
         }
 
-        let result = self.with_batched_v2_append_sync(|queue_file| {
-            let mut count = 0usize;
-
+        let result = self.with_batched_append_sync(|queue_file| {
             queue_file.expand_if_necessary(total_span)?;
+
+            let mut count = 0usize;
+            let base_seq =
+                if let Some((_, _, next_seq)) = queue_file.v2_state() { next_seq } else { 0 };
 
             for elem in &elems {
                 queue_file.overwrite_on_remove =
@@ -1322,20 +1517,18 @@ impl QueueFile {
                 let len = elem.len();
 
                 let pos = if queue_file.is_empty() {
-                    V2_DATA_START
+                    queue_file.data_start()
                 } else {
                     queue_file.wrap_pos(
-                        queue_file.last.pos + V2_ELEM_OVERHEAD + queue_file.last.len as u64,
+                        queue_file.last.pos + queue_file.format.elem_span(queue_file.last.len),
                     )
                 };
-                let seq = base_seq + count as u64;
+                let seq = if base_seq == 0 { 0 } else { base_seq + count as u64 };
                 let prev_pos = if queue_file.is_empty() { 0 } else { queue_file.last.pos };
 
-                let ds = queue_file.data_start();
-                let fl = queue_file.file_len();
-                Self::write_v2_element(&mut queue_file.inner, pos, seq, prev_pos, elem, ds, fl)?;
+                queue_file.format.write_element(&mut queue_file.inner, pos, elem, seq, prev_pos)?;
 
-                let elem_entry = Element { pos, len, seq };
+                let elem_entry = Element::new(pos, len, seq)?;
                 if queue_file.is_empty() {
                     queue_file.first = elem_entry;
                 }
@@ -1352,11 +1545,9 @@ impl QueueFile {
         match result {
             Ok(count) => {
                 if count != 0 {
-                    let (_, _, next_seq) =
-                        self.v2_state_mut().ok_or_else(|| Error::CorruptedFile {
-                            msg: "operation requires V2 format state".to_owned(),
-                        })?;
-                    *next_seq = base_seq + count as u64;
+                    if let Some((_, _, next_seq)) = self.v2_state_mut() {
+                        *next_seq += count as u64;
+                    }
 
                     if !self.skip_write_header_on_add {
                         self.write_header(
@@ -1369,7 +1560,6 @@ impl QueueFile {
 
                     self.cache_last_offset_if_needed(count);
                 }
-
                 Ok(())
             }
             Err(err) => {
@@ -1379,166 +1569,44 @@ impl QueueFile {
         }
     }
 
-    /// Write a single v2 element (header + payload + footer) at `pos` in the ring buffer.
-    fn write_v2_element(
-        inner: &mut QueueFileInner, pos: u64, seq: u64, prev_pos: u64, payload: &[u8],
-        data_start: u64, file_len: u64,
-    ) -> Result<()> {
-        let payload_len = payload.len();
-
-        // Build 28-byte header.
-        let mut hdr = [0u8; V2_ELEM_HDR_LEN];
-        {
-            let mut w: &mut [u8] = &mut hdr;
-            w.put_u32(V2_ELEM_HDR_MAGIC);
-            w.put_i64(seq as i64);
-            w.put_i64(prev_pos as i64);
-            w.put_i32(payload_len as i32);
-        }
-        let hdr_crc = compute_elem_header_crc(&hdr);
-        hdr[24..28].copy_from_slice(&hdr_crc.to_be_bytes());
-
-        // Ring-write header.
-        Self::ring_write_raw(inner, pos, &hdr, data_start, file_len)?;
-
-        // Ring-write payload.
-        let payload_pos = wrap_pos_fn(pos + V2_ELEM_HDR_LEN as u64, file_len, data_start);
-        Self::ring_write_raw(inner, payload_pos, payload, data_start, file_len)?;
-
-        // Build 16-byte footer.
-        let footer_pos =
-            wrap_pos_fn(pos + V2_ELEM_HDR_LEN as u64 + payload_len as u64, file_len, data_start);
-        let mut ftr = [0u8; V2_ELEM_FTR_LEN];
-        {
-            let mut w: &mut [u8] = &mut ftr;
-            w.put_u32(V2_ELEM_FTR_MAGIC);
-            w.put_i64(seq as i64);
-        }
-        let ftr_crc = compute_elem_footer_crc(payload, &ftr[..12]);
-        ftr[12..16].copy_from_slice(&ftr_crc.to_be_bytes());
-
-        Self::ring_write_raw(inner, footer_pos, &ftr, data_start, file_len)?;
-
-        Ok(())
-    }
-
-    /// Low-level ring write that does not use `self.write_buf`.
-    fn ring_write_raw(
-        inner: &mut QueueFileInner, pos: u64, data: &[u8], data_start: u64, file_len: u64,
-    ) -> Result<()> {
-        let pos = wrap_pos_fn(pos, file_len, data_start);
-
-        if pos + data.len() as u64 <= file_len {
-            inner.seek(pos);
-            inner.write(data)
-        } else {
-            let before_eof = (file_len - pos) as usize;
-            inner.seek(pos);
-            inner.write(&data[..before_eof])?;
-            inner.seek(data_start);
-            inner.write(&data[before_eof..])
-        }
-    }
-
     /// Appends a single element to the tail of the queue.
     #[inline]
     pub fn add(&mut self, buf: &[u8]) -> Result<()> {
         ensure!(self.elem_cnt + 1 < i32::MAX as usize, TooManyElementsSnafu {});
 
-        if self.is_v2() {
-            let len = buf.len();
-            ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu {});
+        let len = buf.len();
+        let span = self.format.elem_span(len);
+        self.expand_if_necessary(span)?;
 
-            self.expand_if_necessary(V2_ELEM_OVERHEAD + len as u64)?;
-
-            let pos = if self.is_empty() {
-                V2_DATA_START
-            } else {
-                self.wrap_pos(self.last.pos + V2_ELEM_OVERHEAD + self.last.len as u64)
-            };
-            let seq = self
-                .v2_state()
-                .ok_or_else(|| Error::CorruptedFile {
-                    msg: "operation requires V2 format state".to_owned(),
-                })?
-                .2;
-            let prev_pos = if self.is_empty() { 0 } else { self.last.pos };
-
-            self.with_batched_v2_append_sync(|queue_file| {
-                let ds = queue_file.data_start();
-                let fl = queue_file.file_len();
-                Self::write_v2_element(&mut queue_file.inner, pos, seq, prev_pos, buf, ds, fl)
-            })?;
-
-            let elem = Element { pos, len, seq };
-            if self.is_empty() {
-                self.first = elem;
-            }
-            self.last = elem;
-            self.elem_cnt += 1;
-
-            let (_, _, next_seq) = self.v2_state_mut().ok_or_else(|| Error::CorruptedFile {
-                msg: "operation requires V2 format state".to_owned(),
-            })?;
-            *next_seq += 1;
+        let pos = if self.is_empty() {
+            self.data_start()
         } else {
-            let len = buf.len();
-            self.expand_if_necessary(Element::HEADER_LENGTH as u64 + len as u64)?;
+            self.wrap_pos(self.last.pos + self.format.elem_span(self.last.len))
+        };
 
-            let pos = if self.is_empty() {
-                self.data_start()
-            } else {
-                self.wrap_pos(self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64)
-            };
-            let elem = Element::new(pos, len, 0)?;
+        let seq = if let Some((_, _, next_seq)) = self.v2_state() { next_seq } else { 0 };
+        let prev_pos = if self.is_empty() { 0 } else { self.last.pos };
 
-            self.write_buf.clear();
-            self.write_buf.extend(&(len as u32).to_be_bytes());
-            self.write_buf.extend(buf);
-            self.ring_write_buf(pos)?;
+        self.with_batched_append_sync(|queue_file| {
+            queue_file.format.write_element(&mut queue_file.inner, pos, buf, seq, prev_pos)
+        })?;
 
-            if self.is_empty() {
-                self.first = elem;
-            }
-            self.last = elem;
-            self.elem_cnt += 1;
+        if let Some((_, _, next_seq)) = self.v2_state_mut() {
+            *next_seq += 1;
         }
+
+        let elem = Element::new(pos, len, seq)?;
+        if self.is_empty() {
+            self.first = elem;
+        }
+        self.last = elem;
+        self.elem_cnt += 1;
 
         if !self.skip_write_header_on_add {
             self.write_header(self.file_len(), self.elem_cnt, self.first.pos, self.last.pos)?;
         }
 
         self.cache_last_offset_if_needed(1);
-
-        Ok(())
-    }
-
-    fn validate_v2_footer(&self, footer_pos: u64, seq: u64, payload: &[u8]) -> Result<()> {
-        let mut ftr = [0u8; V2_ELEM_FTR_LEN];
-        self.ring_read(footer_pos, &mut ftr)?;
-
-        let ftr_magic = u32::from_be_bytes([ftr[0], ftr[1], ftr[2], ftr[3]]);
-        ensure!(
-            ftr_magic == V2_ELEM_FTR_MAGIC,
-            CorruptedFileSnafu {
-                msg: format!("v2 element footer magic mismatch: {ftr_magic:#010x}")
-            }
-        );
-
-        let ftr_seq =
-            i64::from_be_bytes([ftr[4], ftr[5], ftr[6], ftr[7], ftr[8], ftr[9], ftr[10], ftr[11]])
-                as u64;
-        ensure!(
-            ftr_seq == seq,
-            CorruptedFileSnafu { msg: format!("v2 footer seq {ftr_seq} != element seq {seq}") }
-        );
-
-        let stored_crc = u32::from_be_bytes([ftr[12], ftr[13], ftr[14], ftr[15]]);
-        let expected_crc = compute_elem_footer_crc(payload, &ftr[..12]);
-        ensure!(
-            stored_crc == expected_crc,
-            CorruptedFileSnafu { msg: "v2 element footer CRC mismatch".to_owned() }
-        );
 
         Ok(())
     }
@@ -1565,18 +1633,11 @@ impl QueueFile {
         let len = self.first.len;
         buf.resize(len, 0); // Reuses existing capacity without reallocating
 
-        let payload_start = if self.is_v2() {
-            self.wrap_pos(self.first.pos + V2_ELEM_HDR_LEN as u64)
-        } else {
-            self.first.pos + Element::HEADER_LENGTH as u64
-        };
+        let payload_start = self.wrap_pos(self.first.pos + self.elem_hdr_len());
 
-        self.ring_read(payload_start, buf)?;
+        self.inner.ring_read(payload_start, buf, self.data_start())?;
 
-        if self.is_v2() {
-            let footer_pos = self.wrap_pos(payload_start + len as u64);
-            self.validate_v2_footer(footer_pos, self.first.seq, buf)?;
-        }
+        self.format.validate_footer(&self.inner, payload_start, &self.first, buf)?;
 
         Ok(true)
     }
@@ -1606,83 +1667,45 @@ impl QueueFile {
             self.cached_offsets
         );
 
-        if self.is_v2() {
-            return self.remove_n_v2(n);
-        }
-
         let erase_start_pos = self.first.pos;
         let mut erase_total_len = 0usize;
 
-        let mut new_first_pos = self.first.pos;
-        let mut new_first_len = self.first.len;
+        let mut current = self.first;
+        let mut to_remove = n;
 
-        // Legacy / versioned path.
         let cached_index = self.cached_index_up_to(n - 1);
-        let to_remove = if let Some(i) = cached_index {
+        if let Some(i) = cached_index {
             let (index, elem) = self.cached_offsets[i];
 
-            if let Some(index) = index.checked_sub(1) {
-                erase_total_len += Element::HEADER_LENGTH * index;
-                erase_total_len += (elem.pos
-                    + if self.first.pos < elem.pos {
-                        0
-                    } else {
-                        self.file_len() - self.first.pos - self.data_start()
-                    }) as usize;
+            if self.overwrite_on_remove {
+                if self.first.pos <= elem.pos {
+                    erase_total_len += (elem.pos - self.first.pos) as usize;
+                } else {
+                    erase_total_len +=
+                        (self.file_len() - self.first.pos + elem.pos - self.data_start()) as usize;
+                }
             }
 
-            new_first_pos = elem.pos;
-            new_first_len = elem.len;
-            n - index
-        } else {
-            n
-        };
-
-        for _ in 0..to_remove {
-            erase_total_len += Element::HEADER_LENGTH + new_first_len;
-            new_first_pos =
-                self.wrap_pos(new_first_pos + Element::HEADER_LENGTH as u64 + new_first_len as u64);
-
-            let mut buf: [u8; 4] = [0; 4];
-            self.ring_read(new_first_pos, &mut buf)?;
-            new_first_len = u32::from_be_bytes(buf) as usize;
+            current = elem;
+            to_remove = n - index;
         }
 
-        self.write_header(self.file_len(), self.elem_cnt - n, new_first_pos, self.last.pos)?;
-        self.elem_cnt -= n;
-        self.first = Element::new(new_first_pos, new_first_len, 0)?;
+        for _ in 0..to_remove {
+            let span = self.elem_span(current.len);
+            erase_total_len += span as usize;
+            let next_pos = self.wrap_pos(current.pos + span);
+            current = self.read_element(next_pos)?;
+        }
+
+        self.write_header(self.file_len(), self.elem_cnt - n, current.pos, self.last.pos)?;
 
         if let Some(cached_index) = cached_index {
             self.cached_offsets.drain(..=cached_index);
         }
         self.cached_offsets.iter_mut().for_each(|(i, _)| *i -= n);
 
-        if self.overwrite_on_remove {
-            self.ring_erase(erase_start_pos, erase_total_len)?;
-        }
-
-        Ok(())
-    }
-
-    fn remove_n_v2(&mut self, n: usize) -> Result<()> {
-        let erase_start_pos = self.first.pos;
-        let mut erase_total_len = 0usize;
-        let mut new_first_pos = self.first.pos;
-        let mut new_first_len = self.first.len;
-
-        for _ in 0..n {
-            erase_total_len += (V2_ELEM_OVERHEAD as usize) + new_first_len;
-            new_first_pos = self.wrap_pos(new_first_pos + V2_ELEM_OVERHEAD + new_first_len as u64);
-
-            new_first_len = self.validate_v2_element_header(new_first_pos)?.payload_len;
-        }
-
-        let new_first_seq = self.validate_v2_element_header(new_first_pos)?.seq;
-
-        self.write_header(self.file_len(), self.elem_cnt - n, new_first_pos, self.last.pos)?;
         self.elem_cnt -= n;
-        self.first = Element { pos: new_first_pos, len: new_first_len, seq: new_first_seq };
-        self.cached_offsets.clear();
+        self.first = current;
 
         if self.overwrite_on_remove {
             self.ring_erase(erase_start_pos, erase_total_len)?;
@@ -1694,55 +1717,27 @@ impl QueueFile {
     // ── clear ─────────────────────────────────────────────────────────────────
 
     pub fn clear(&mut self) -> Result<()> {
-        if self.is_v2() {
-            // For v2: commit empty state, zero data region, truncate to V2_INITIAL_LEN floor.
-            let new_cap = self.capacity.max(V2_INITIAL_LEN);
+        let new_cap = self.capacity.max(self.data_start());
 
-            self.write_header(new_cap, 0, 0, 0)?;
-
-            if self.overwrite_on_remove {
-                // Zero the data region.
-                let data_end = self.file_len().min(new_cap);
-                if data_end > V2_DATA_START {
-                    self.with_batched_clear_erase_sync(|queue_file| {
-                        queue_file
-                            .write_zero_chunks(V2_DATA_START, (data_end - V2_DATA_START) as usize)
-                    })?;
-                }
-            }
-
-            self.cached_offsets.clear();
-            self.elem_cnt = 0;
-            self.first = Element::EMPTY;
-            self.last = Element::EMPTY;
-
-            if self.file_len() > new_cap {
-                self.inner.sync_set_len(new_cap)?;
-            }
-
-            return Ok(());
-        }
-
-        // Legacy / versioned.
-        self.write_header(self.capacity, 0, 0, 0)?;
+        self.write_header(new_cap, 0, 0, 0)?;
 
         if self.overwrite_on_remove {
-            self.with_batched_clear_erase_sync(|queue_file| {
-                queue_file.write_zero_chunks(
-                    queue_file.data_start(),
-                    (queue_file.capacity - queue_file.data_start()) as usize,
-                )
-            })?;
+            let data_end = self.file_len().min(new_cap);
+            let ds = self.data_start();
+            if data_end > ds {
+                self.inner.with_batched_clear_erase_sync(|inner| {
+                    inner.write_zero_chunks(ds, (data_end - ds) as usize)
+                })?;
+            }
         }
 
         self.cached_offsets.clear();
-
         self.elem_cnt = 0;
         self.first = Element::EMPTY;
         self.last = Element::EMPTY;
 
-        if self.file_len() > self.capacity {
-            self.inner.sync_set_len(self.capacity)?;
+        if self.file_len() > new_cap {
+            self.inner.sync_set_len(new_cap)?;
         }
 
         Ok(())
@@ -1750,7 +1745,7 @@ impl QueueFile {
 
     // ── iter ──────────────────────────────────────────────────────────────────
 
-    pub fn iter(&self) -> Iter<'_> {
+    pub const fn iter(&self) -> Iter<'_> {
         Iter {
             buffer: Vec::new(),
             queue_file: self,
@@ -1758,7 +1753,18 @@ impl QueueFile {
             next_elem_pos: self.first.pos,
         }
     }
+}
 
+impl<'a> IntoIterator for &'a QueueFile {
+    type IntoIter = Iter<'a>;
+    type Item = Vec<u8>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl QueueFile {
     // ── Metrics ───────────────────────────────────────────────────────────────
 
     #[inline]
@@ -1770,24 +1776,10 @@ impl QueueFile {
     pub const fn used_bytes(&self) -> u64 {
         if self.elem_cnt == 0 {
             self.data_start()
-        } else if self.is_v2() {
-            if self.last.pos >= self.first.pos {
-                (self.last.pos - self.first.pos)
-                    + V2_ELEM_OVERHEAD
-                    + self.last.len as u64
-                    + self.data_start()
-            } else {
-                self.last.pos + V2_ELEM_OVERHEAD + self.last.len as u64 + self.file_len()
-                    - self.first.pos
-            }
         } else if self.last.pos >= self.first.pos {
-            (self.last.pos - self.first.pos)
-                + Element::HEADER_LENGTH as u64
-                + self.last.len as u64
-                + self.data_start()
+            (self.last.pos - self.first.pos) + self.elem_span(self.last.len) + self.data_start()
         } else {
-            self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64 + self.file_len()
-                - self.first.pos
+            self.last.pos + self.elem_span(self.last.len) + self.file_len() - self.first.pos
         }
     }
 
@@ -1812,152 +1804,25 @@ impl QueueFile {
         self.write_header(self.file_len(), self.size(), self.first.pos, self.last.pos)
     }
 
-    /// Returns the element header length for the active format.
     #[inline]
     const fn elem_hdr_len(&self) -> u64 {
-        match self.format {
-            FormatState::V2 { .. } => V2_ELEM_HDR_LEN as u64,
-            _ => Element::HEADER_LENGTH as u64,
-        }
+        self.format.elem_hdr_len()
     }
 
-    /// Returns the total on-disk span of an element with the given payload length.
     #[inline]
     const fn elem_span(&self, payload_len: usize) -> u64 {
-        match self.format {
-            FormatState::V2 { .. } => V2_ELEM_OVERHEAD + payload_len as u64,
-            _ => Element::HEADER_LENGTH as u64 + payload_len as u64,
-        }
+        self.format.elem_span(payload_len)
     }
 
     fn write_header(
         &mut self, file_len: u64, elem_cnt: usize, first_pos: u64, last_pos: u64,
     ) -> Result<()> {
-        if self.is_v2() {
-            return self.write_header_v2(file_len, elem_cnt, first_pos, last_pos);
-        }
-
-        let mut header = [0u8; 32];
-        let mut header_buf: &mut [u8] = &mut header;
-
-        if matches!(self.format, FormatState::V1) {
-            ensure!(
-                i64::try_from(file_len).is_ok(),
-                CorruptedFileSnafu { msg: "file length in header will exceed i64::MAX" }
-            );
-            ensure!(
-                i32::try_from(elem_cnt).is_ok(),
-                CorruptedFileSnafu { msg: "element count in header will exceed i32::MAX" }
-            );
-            ensure!(
-                i64::try_from(first_pos).is_ok(),
-                CorruptedFileSnafu { msg: "first element position in header will exceed i64::MAX" }
-            );
-            ensure!(
-                i64::try_from(last_pos).is_ok(),
-                CorruptedFileSnafu { msg: "last element position in header will exceed i64::MAX" }
-            );
-
-            header_buf.put_u32(Self::VERSIONED_HEADER);
-            header_buf.put_u64(file_len);
-            header_buf.put_i32(elem_cnt as i32);
-            header_buf.put_u64(first_pos);
-            header_buf.put_u64(last_pos);
-        } else {
-            ensure!(
-                i32::try_from(file_len).is_ok(),
-                CorruptedFileSnafu { msg: "file length in header will exceed i32::MAX" }
-            );
-            ensure!(
-                i32::try_from(elem_cnt).is_ok(),
-                CorruptedFileSnafu { msg: "element count in header will exceed i32::MAX" }
-            );
-            ensure!(
-                i32::try_from(first_pos).is_ok(),
-                CorruptedFileSnafu { msg: "first element position in header will exceed i32::MAX" }
-            );
-            ensure!(
-                i32::try_from(last_pos).is_ok(),
-                CorruptedFileSnafu { msg: "last element position in header will exceed i32::MAX" }
-            );
-
-            header_buf.put_i32(file_len as i32);
-            header_buf.put_i32(elem_cnt as i32);
-            header_buf.put_i32(first_pos as i32);
-            header_buf.put_i32(last_pos as i32);
-        }
-
-        self.inner.seek(0);
-        self.inner.write(&header[..self.header_len() as usize])
-    }
-
-    fn write_header_v2(
-        &mut self, file_len: u64, elem_cnt: usize, first_pos: u64, last_pos: u64,
-    ) -> Result<()> {
-        let (next_slot, generation, next_seq) = {
-            let (active_slot, generation, next_seq) = self.v2_state().ok_or_else(|| {
-                Error::CorruptedFile { msg: "operation requires V2 format state".to_owned() }
-            })?;
-            (active_slot.toggle(), generation, next_seq)
-        };
-
-        ensure!(
-            i64::try_from(file_len).is_ok(),
-            CorruptedFileSnafu { msg: "file length in V2 header will exceed i64::MAX" }
-        );
-        ensure!(
-            u32::try_from(elem_cnt).is_ok(),
-            CorruptedFileSnafu { msg: "element count in V2 header will exceed u32::MAX" }
-        );
-        ensure!(
-            i64::try_from(first_pos).is_ok(),
-            CorruptedFileSnafu { msg: "first element position in V2 header will exceed i64::MAX" }
-        );
-        ensure!(
-            i64::try_from(last_pos).is_ok(),
-            CorruptedFileSnafu { msg: "last element position in V2 header will exceed i64::MAX" }
-        );
-
-        let slot_data = SlotData {
-            file_length: file_len,
-            element_count: elem_cnt as u32, // validated above
-            first_position: first_pos,
-            last_position: last_pos,
-            generation: generation + 1,
-            next_sequence_number: next_seq,
-        };
-
-        let slot_bytes = build_slot_bytes(&slot_data);
-
-        let offset = next_slot.offset();
-
-        // Write directly to absolute offset (not ring buffer).
-        self.inner.seek(offset);
-        self.inner.write(&slot_bytes)?;
-
-        let (active_slot, generation, _) = self.v2_state_mut().ok_or_else(|| {
-            Error::CorruptedFile { msg: "operation requires V2 format state".to_owned() }
-        })?;
-        *generation += 1;
-        *active_slot = next_slot;
-
-        Ok(())
+        let metadata = QueueMetadata { file_len, elem_cnt, first_pos, last_pos };
+        self.format.write_header(&mut self.inner, metadata)
     }
 
     fn read_element(&self, pos: u64) -> Result<Element> {
-        if pos == 0 {
-            return Ok(Element::EMPTY);
-        }
-
-        if self.is_v2() {
-            let header = self.validate_v2_element_header(pos)?;
-            return Ok(Element { pos, len: header.payload_len, seq: header.seq });
-        }
-
-        let mut buf: [u8; 4] = [0; Element::HEADER_LENGTH];
-        self.ring_read(pos, &mut buf)?;
-
-        Element::new(pos, u32::from_be_bytes(buf) as usize, 0)
+        self.format.read_element(&self.inner, pos)
     }
 
     #[inline]
@@ -1965,48 +1830,20 @@ impl QueueFile {
         wrap_pos_fn(pos, self.inner.file_len, self.data_start())
     }
 
-    fn ring_write_buf(&mut self, pos: u64) -> Result<()> {
-        let pos = self.wrap_pos(pos);
-
-        if pos + self.write_buf.len() as u64 <= self.file_len() {
-            self.inner.seek(pos);
-            self.inner.write(&self.write_buf)
-        } else {
-            let before_eof = (self.file_len() - pos) as usize;
-
-            self.inner.seek(pos);
-            self.inner.write(&self.write_buf[..before_eof])?;
-            self.inner.seek(self.data_start());
-            self.inner.write(&self.write_buf[before_eof..])
-        }
-    }
-
     fn ring_erase(&mut self, pos: u64, n: usize) -> Result<()> {
         let mut pos = pos;
         let mut len = n;
+        let ds = self.data_start();
 
         while len > 0 {
             let chunk_len = min(len, Self::ZEROES.len());
-            self.ring_write_raw_from_self(pos, &Self::ZEROES[..chunk_len])?;
+            self.inner.ring_write(pos, &Self::ZEROES[..chunk_len], ds)?;
 
             len -= chunk_len;
             pos += chunk_len as u64;
         }
 
         Ok(())
-    }
-
-    fn ring_read(&self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
-        let pos = self.wrap_pos(pos);
-
-        if pos + buf.len() as u64 <= self.file_len() {
-            self.inner.read_exact_at(pos, buf)
-        } else {
-            let before_eof = (self.file_len() - pos) as usize;
-
-            self.inner.read_exact_at(pos, &mut buf[..before_eof])?;
-            self.inner.read_exact_at(self.data_start(), &mut buf[before_eof..])
-        }
     }
 
     /// Compute the smallest power-of-two multiple of `current_len` that adds enough
@@ -2029,7 +1866,7 @@ impl QueueFile {
         }
 
         let orig_file_len = self.file_len();
-        let end_of_last_elem = self.wrap_pos(self.last.pos + self.elem_span(self.last.len));
+        let end_of_last_elem = self.wrap_pos(self.last.pos + self.format.elem_span(self.last.len));
         let wraps = end_of_last_elem <= self.first.pos;
         let moved_count = if wraps { end_of_last_elem - self.data_start() } else { 0 };
 
@@ -2047,15 +1884,18 @@ impl QueueFile {
             return Ok(());
         }
 
-        self.with_batched_expansion_copy_sync(|queue_file| {
-            queue_file.inner.transfer(queue_file.data_start(), plan.orig_file_len, plan.moved_count)
+        let data_start = self.data_start();
+        self.inner.with_batched_expansion_copy_sync(|inner| {
+            inner.transfer(data_start, plan.orig_file_len, plan.moved_count)
         })?;
 
-        if self.is_v2() {
-            let moved_offset = plan.orig_file_len - self.data_start();
-            self.rewrite_v2_backlinks_after_expansion(plan.end_of_last_elem, moved_offset)?;
-
-            let new_last_pos = plan.orig_file_len + self.last.pos - self.data_start();
+        if let Some(new_last_pos) = self.format.on_expansion(
+            &mut self.inner,
+            &plan,
+            self.first,
+            self.last,
+            self.elem_cnt,
+        )? {
             self.last = Element { pos: new_last_pos, len: self.last.len, seq: self.last.seq };
 
             maybe_inject_failpoint("v2_before_relocation_commit")?;
@@ -2069,24 +1909,10 @@ impl QueueFile {
         Ok(())
     }
 
-    fn adjust_positions_after_expansion(&mut self, plan: ExpansionPlan) -> Result<()> {
-        let legacy_wrapped = !self.is_v2() && self.last.pos < self.first.pos;
-        if legacy_wrapped {
-            let new_last_pos = plan.orig_file_len + self.last.pos - self.data_start();
-            self.last = Element::new(new_last_pos, self.last.len, 0)?;
-        }
-
-        self.cached_offsets.clear();
-
-        Ok(())
-    }
-
     fn cleanup_after_expansion(&mut self, plan: ExpansionPlan) -> Result<()> {
         if self.overwrite_on_remove {
             self.ring_erase(self.data_start(), plan.moved_count as usize)?;
-            if self.is_v2() && plan.wraps {
-                maybe_inject_failpoint("v2_after_relocation_cleanup_before_add")?;
-            }
+            self.format.on_expansion_cleanup(&plan)?;
         }
 
         Ok(())
@@ -2100,140 +1926,11 @@ impl QueueFile {
         let bytes_used_before = self.used_bytes();
         self.inner.sync_set_len(plan.new_len)?;
         self.relocate_wrapped_data(plan)?;
-        self.adjust_positions_after_expansion(plan)?;
+        self.cached_offsets.clear();
         self.cleanup_after_expansion(plan)?;
 
         let bytes_used_after = self.used_bytes();
         debug_assert_eq!(bytes_used_before, bytes_used_after);
-
-        Ok(())
-    }
-
-    /// After expanding and copying `[data_start, wrap_point)` to `[orig_file_len, ...)`,
-    /// update `prev_pos` in any element header that pointed into the moved region.
-    fn rewrite_v2_backlinks_after_expansion(
-        &mut self, wrap_point: u64, moved_offset: u64,
-    ) -> Result<()> {
-        // Walk all elements from first to last (before last.pos update) and fix backlinks.
-        // Elements that were in [data_start, wrap_point) have been moved to [old_len, old_len+count).
-        // Their prev_pos fields may also point into [data_start, wrap_point).
-
-        let data_start = self.data_start();
-
-        // Collect element positions (we need to walk from first to last).
-        // First, determine the list. Since positions may have changed, use the old positions
-        // (before last update) which are still in-place for the elements in the moved range
-        // (they now exist in two places: old and new).
-        // We iterate all elements by walking the ring from current first.pos.
-        let mut positions: Vec<Element> = Vec::with_capacity(self.elem_cnt);
-        let mut cur = self.first;
-        for _ in 0..self.elem_cnt {
-            positions.push(cur);
-            let next_pos = wrap_pos_fn(
-                cur.pos + V2_ELEM_OVERHEAD + cur.len as u64,
-                self.file_len(), // Note: file already expanded.
-                data_start,
-            );
-            if positions.len() < self.elem_cnt {
-                let next_header = self.validate_v2_element_header(next_pos)?;
-                cur = Element { pos: next_pos, len: next_header.payload_len, seq: next_header.seq };
-            }
-        }
-
-        self.with_batched_backlink_rewrite_sync(|queue_file| {
-            // Now walk all elements and fix backlinks.
-            for elem in &positions {
-                // Read element header.
-                let elem_pos = elem.pos;
-                let mut hdr = [0u8; V2_ELEM_HDR_LEN];
-                queue_file.ring_read(elem_pos, &mut hdr)?;
-
-                let prev_pos = queue_file.validate_v2_element_header(elem_pos)?.prev_pos;
-
-                if prev_pos >= data_start && prev_pos < wrap_point {
-                    let new_prev_pos = prev_pos + moved_offset;
-
-                    let new_prev_bytes = (new_prev_pos as i64).to_be_bytes();
-                    hdr[12..20].copy_from_slice(&new_prev_bytes);
-
-                    let new_crc = compute_elem_header_crc(&hdr);
-                    hdr[24..28].copy_from_slice(&new_crc.to_be_bytes());
-
-                    queue_file.ring_write_raw_from_self(elem_pos, &hdr)?;
-                }
-            }
-
-            Ok(())
-        })
-    }
-
-    fn with_batched_backlink_rewrite_sync<T>(
-        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.with_deferred_sync(DeferredSyncPhase::BacklinkRewrite, f)
-    }
-
-    fn with_batched_clear_erase_sync<T>(
-        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.with_deferred_sync(DeferredSyncPhase::ClearErase, f)
-    }
-
-    fn with_batched_expansion_copy_sync<T>(
-        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.with_deferred_sync(DeferredSyncPhase::ExpansionCopy, f)
-    }
-
-    fn with_batched_v2_append_sync<T>(
-        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.with_deferred_sync(DeferredSyncPhase::AppendBatch, f)
-    }
-
-    fn with_deferred_sync<T>(
-        &mut self, phase: DeferredSyncPhase, f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        let sync_writes = self.inner.sync_writes;
-        let deferred_sync_phase = self.inner.deferred_sync_phase;
-        self.inner.sync_writes = false;
-        self.inner.deferred_sync_phase = Some(phase);
-
-        let result = f(self);
-
-        self.inner.deferred_sync_phase = deferred_sync_phase;
-        self.inner.sync_writes = sync_writes;
-
-        let value = result?;
-
-        if sync_writes {
-            self.inner.file_mut()?.sync_data()?;
-            maybe_inject_failpoint(match phase {
-                DeferredSyncPhase::ExpansionCopy => "v2_after_expansion_copy_flush",
-                DeferredSyncPhase::ClearErase => "clear_after_erase_flush",
-                DeferredSyncPhase::BacklinkRewrite => "v2_after_backlink_rewrite_flush",
-                DeferredSyncPhase::AppendBatch => "v2_after_add_batch_flush",
-            })?;
-        }
-
-        Ok(value)
-    }
-
-    /// Ring write using self's `data_start` and `file_len` (for use when we can't borrow inner separately).
-    fn ring_write_raw_from_self(&mut self, pos: u64, data: &[u8]) -> Result<()> {
-        let data_start = self.data_start();
-        let file_len = self.file_len();
-        Self::ring_write_raw(&mut self.inner, pos, data, data_start, file_len)
-    }
-
-    fn write_zero_chunks(&mut self, mut pos: u64, mut len: usize) -> Result<()> {
-        while len > 0 {
-            let chunk_len = min(len, Self::ZEROES.len());
-            self.inner.seek(pos);
-            self.inner.write(&Self::ZEROES[..chunk_len])?;
-            pos += chunk_len as u64;
-            len -= chunk_len;
-        }
 
         Ok(())
     }
@@ -2331,19 +2028,6 @@ impl QueueFileInner {
         self.last_seek = res.as_ref().ok().copied();
 
         res
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        if buf.is_empty() {
-            return Ok(());
-        }
-
-        self.real_seek()?;
-        self.file_mut()?.read_exact(buf)?;
-        if let Some(seek) = &mut self.last_seek {
-            *seek += buf.len() as u64;
-        }
-        Ok(())
     }
 
     fn write(&mut self, buf: &[u8]) -> Result<()> {
@@ -2448,6 +2132,92 @@ impl QueueFileInner {
         self.file_len = new_len;
         self.file_mut()?.sync_all()
     }
+
+    fn ring_read(&self, pos: u64, buf: &mut [u8], data_start: u64) -> io::Result<()> {
+        let pos = wrap_pos_fn(pos, self.file_len, data_start);
+
+        if pos + buf.len() as u64 <= self.file_len {
+            self.read_exact_at(pos, buf)
+        } else {
+            let before_eof = (self.file_len - pos) as usize;
+
+            self.read_exact_at(pos, &mut buf[..before_eof])?;
+            self.read_exact_at(data_start, &mut buf[before_eof..])
+        }
+    }
+
+    fn ring_write(&mut self, pos: u64, data: &[u8], data_start: u64) -> Result<()> {
+        let pos = wrap_pos_fn(pos, self.file_len, data_start);
+
+        if pos + data.len() as u64 <= self.file_len {
+            self.seek(pos);
+            self.write(data)
+        } else {
+            let before_eof = (self.file_len - pos) as usize;
+            self.seek(pos);
+            self.write(&data[..before_eof])?;
+            self.seek(data_start);
+            self.write(&data[before_eof..])
+        }
+    }
+
+    fn write_zero_chunks(&mut self, mut pos: u64, mut len: usize) -> Result<()> {
+        while len > 0 {
+            let chunk_len = min(len, QueueFile::ZEROES.len());
+            self.seek(pos);
+            self.write(&QueueFile::ZEROES[..chunk_len])?;
+            pos += chunk_len as u64;
+            len -= chunk_len;
+        }
+
+        Ok(())
+    }
+
+    fn with_batched_backlink_rewrite_sync<T>(
+        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.with_deferred_sync(DeferredSyncPhase::BacklinkRewrite, f)
+    }
+
+    fn with_batched_clear_erase_sync<T>(
+        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.with_deferred_sync(DeferredSyncPhase::ClearErase, f)
+    }
+
+    fn with_batched_expansion_copy_sync<T>(
+        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.with_deferred_sync(DeferredSyncPhase::ExpansionCopy, f)
+    }
+
+    fn with_deferred_sync<T>(
+        &mut self, phase: DeferredSyncPhase, f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let sync_writes = self.sync_writes;
+        let deferred_sync_phase = self.deferred_sync_phase;
+        self.sync_writes = false;
+        self.deferred_sync_phase = Some(phase);
+
+        let result = f(self);
+
+        self.deferred_sync_phase = deferred_sync_phase;
+        self.sync_writes = sync_writes;
+
+        let value = result?;
+
+        if sync_writes {
+            self.file_mut()?.sync_data()?;
+            maybe_inject_failpoint(match phase {
+                DeferredSyncPhase::ExpansionCopy => "v2_after_expansion_copy_flush",
+                DeferredSyncPhase::ClearErase => "clear_after_erase_flush",
+                DeferredSyncPhase::BacklinkRewrite => "v2_after_backlink_rewrite_flush",
+                DeferredSyncPhase::AppendBatch => "v2_after_add_batch_flush",
+            })?;
+        }
+
+        Ok(value)
+    }
 }
 
 // ── Element ───────────────────────────────────────────────────────────────────
@@ -2469,10 +2239,9 @@ impl Element {
 
     #[inline]
     fn new(pos: u64, len: usize, seq: u64) -> Result<Self> {
-        ensure!(
-            i64::try_from(pos).is_ok(),
-            CorruptedFileSnafu { msg: "element position must be less or equal to i64::MAX" }
-        );
+        ensure!(i64::try_from(pos).is_ok(), CorruptedFileSnafu {
+            msg: "element position must be less or equal to i64::MAX"
+        });
         ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu);
 
         Ok(Self { pos, len, seq })
@@ -2504,24 +2273,26 @@ impl Iterator for Iter<'_> {
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        if self.queue_file.elem_cnt - self.next_elem_index < n {
+        // Target absolute index is current index + n
+        let target_idx = self.next_elem_index.checked_add(n)?;
+
+        if target_idx >= self.queue_file.elem_cnt {
             self.next_elem_index = self.queue_file.elem_cnt;
             return None;
         }
 
-        let left = if let Some(i) = self.queue_file.cached_index_up_to(n) {
-            let (index, elem) = self.queue_file.cached_offsets[i];
+        // Use cache to find the closest jump-point <= target_idx
+        if let Some(cache_idx) = self.queue_file.cached_index_up_to(target_idx) {
+            let (index, elem) = self.queue_file.cached_offsets[cache_idx];
             if index > self.next_elem_index {
                 self.next_elem_index = index;
                 self.next_elem_pos = elem.pos;
             }
+        }
 
-            n - self.next_elem_index
-        } else {
-            n
-        };
-
-        for _ in 0..left {
+        // Now skip the remaining relative distance
+        let remaining_to_skip = target_idx - self.next_elem_index;
+        for _ in 0..remaining_to_skip {
             self.skip_next()?;
         }
 
@@ -2563,15 +2334,21 @@ impl Iter<'_> {
         if current.len > self.buffer.len() {
             self.buffer.resize(current.len, 0);
         }
-        self.queue_file.ring_read(payload_start, &mut self.buffer[..current.len]).ok()?;
+        self.queue_file
+            .inner
+            .ring_read(payload_start, &mut self.buffer[..current.len], self.queue_file.data_start())
+            .ok()?;
 
         // For v2, validate footer.
-        if self.queue_file.is_v2() {
-            let footer_pos = self.queue_file.wrap_pos(payload_start + current.len as u64);
-            self.queue_file
-                .validate_v2_footer(footer_pos, current.seq, &self.buffer[..current.len])
-                .ok()?;
-        }
+        self.queue_file
+            .format
+            .validate_footer(
+                &self.queue_file.inner,
+                payload_start,
+                &current,
+                &self.buffer[..current.len],
+            )
+            .ok()?;
 
         self.next_elem_pos =
             self.queue_file.wrap_pos(current.pos + self.queue_file.elem_span(current.len));
