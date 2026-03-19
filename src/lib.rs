@@ -2564,6 +2564,13 @@ impl Iter<'_> {
 
         let current = self.queue_file.read_element(self.next_elem_pos).ok()?;
 
+        // Validate that the stated payload length physically fits inside the file's data region
+        let max_possible_len =
+            self.queue_file.file_len().saturating_sub(self.queue_file.data_start());
+        if current.len as u64 > max_possible_len {
+            return None;
+        }
+
         let payload_start = self.queue_file.wrap_pos(current.pos + self.queue_file.elem_hdr_len());
 
         if current.len > self.buffer.len() {
