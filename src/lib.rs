@@ -95,9 +95,7 @@
     clippy::pedantic,
     clippy::mutex_atomic,
     clippy::rc_buffer,
-    clippy::rc_mutex,
-    // clippy::expect_used,
-    // clippy::unwrap_used,
+    clippy::rc_mutex
 )]
 #![allow(
     clippy::cast_possible_truncation,
@@ -111,6 +109,12 @@
     clippy::too_many_lines
 )]
 
+mod element;
+mod error;
+mod format;
+mod header;
+mod qio;
+
 use std::cell::Cell;
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -118,805 +122,30 @@ use std::fs::{File, OpenOptions, rename};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
 use std::path::Path;
 
-use bytes::{Buf, BufMut, BytesMut};
-use thiserror::Error;
+use bytes::{BufMut, BytesMut};
+pub(crate) use element::Element;
+pub use error::Error;
+pub(crate) use error::{Result, maybe_inject_failpoint};
+pub(crate) use format::{
+    ExpansionPlan, FormatState, LegacyHeaderState, QueueMetadata, QueueStateSnapshot, V2OpenState,
+    parse_legacy_header, parse_versioned_header, read_v2_open_state,
+};
+pub(crate) use header::{
+    SlotData, V2_INITIAL_LEN, V2_MAGIC, V2_SLOT_A_OFFSET, V2_SLOT_B_OFFSET, V2_SLOT_LEN,
+    VERSIONED_HEADER, build_slot_bytes,
+};
+pub(crate) use qio::{DataRing, DataRingMut, DeferredSyncPhase, QueueFileInner};
 
-use crate::Error::{CorruptedFile, ElementTooBig, TooManyElements, UnsupportedVersion};
-
-macro_rules! ensure {
-    ($cond:expr, $err:expr) => {
-        if !($cond) {
-            return Err($err);
-        }
-    };
-    ($cond:expr, $variant:ident { $($field:ident : $val:expr),* $(,)? }) => {
-        if !($cond) {
-            return Err(Error::$variant { $($field : $val),* });
-        }
-    };
-    ($cond:expr, $variant:ident) => {
-        if !($cond) {
-            return Err(Error::$variant);
-        }
-    };
-}
-
-// ── V2 constants ─────────────────────────────────────────────────────────────
-
-/// Magic number in each 56-byte header slot: ASCII "QFMH".
-const V2_MAGIC: u32 = 0x5146_4D48;
-/// File offset of slot A.
-const V2_SLOT_A_OFFSET: u64 = 0;
-/// File offset of slot B.
-const V2_SLOT_B_OFFSET: u64 = 4096;
-/// Length of each header slot in bytes.
-const V2_SLOT_LEN: usize = 56;
-/// Byte offset at which the ring-buffer data region begins.
-const V2_DATA_START: u64 = 8192;
-/// Minimum / initial file length for v2 files.
-const V2_INITIAL_LEN: u64 = 8192;
-
-/// Magic number in a v2 element header: ASCII "ITHD".
-const V2_ELEM_HDR_MAGIC: u32 = 0x4954_4844;
-/// Length of a v2 element header in bytes.
-const V2_ELEM_HDR_LEN: usize = 28;
-/// Magic number in a v2 element footer: ASCII "ITFT".
-const V2_ELEM_FTR_MAGIC: u32 = 0x4954_4654;
-/// Length of a v2 element footer in bytes.
-const V2_ELEM_FTR_LEN: usize = 16;
-/// Total per-element overhead in v2: header (28) + footer (16).
-const V2_ELEM_OVERHEAD: u64 = 44;
-
-const VERSIONED_HEADER: u32 = 0x8000_0001;
-
-// ── Errors ───────────────────────────────────────────────────────────────────
-
-/// Errors that can be returned by [`QueueFile`] operations.
-#[derive(Debug, Error)]
-pub enum Error {
-    /// An underlying I/O error occurred (e.g. a read, write, seek, or `sync_data` call failed).
-    #[error(transparent)]
-    Io {
-        #[from]
-        source: io::Error,
-    },
-
-    /// The queue already contains `i32::MAX - 1` elements and adding more would overflow the
-    /// element-count field in the file header.
-    #[error("too many elements")]
-    TooManyElements,
-
-    /// The data slice passed to [`QueueFile::add`] or [`QueueFile::add_n`] is larger than
-    /// `i32::MAX` bytes, which would overflow the 4-byte per-element length prefix in the file.
-    #[error("element too big")]
-    ElementTooBig,
-
-    /// The queue file's contents are internally inconsistent (e.g. a position stored in the
-    /// header points beyond the file, the file is shorter than the header claims, or a field
-    /// value would overflow its type when read back). The `msg` field contains a human-readable
-    /// description of which check failed.
-    #[error("corrupted file: {msg}")]
-    CorruptedFile { msg: String },
-
-    /// The versioned header was written with a format version number that this implementation
-    /// does not recognise. `detected` is the version found in the file; `supported` is the only
-    /// version this crate can read (currently `1`).
-    #[error("unsupported version {detected}. supported versions is {supported} and legacy")]
-    UnsupportedVersion { detected: u32, supported: u32 },
-}
-
-type Result<T, E = Error> = std::result::Result<T, E>;
-
-// ── Header slot ──────────────────────────────────────────────────────────────
-
-/// One of the two on-disk header slots used by the V2 format.
-///
-/// The V2 format maintains two 56-byte slots at fixed offsets so that header
-/// writes are atomic: data is always written to the *inactive* slot before the
-/// active pointer is flipped.
+/// Policy controlling how element file-positions are cached to accelerate [`Iter::nth`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeaderSlot {
-    /// Slot A at file offset [`V2_SLOT_A_OFFSET`].
-    A,
-    /// Slot B at file offset [`V2_SLOT_B_OFFSET`].
-    B,
+pub enum OffsetCacheKind {
+    /// Cache one position every `offset` elements.
+    Linear { offset: usize },
+    /// Cache positions at indices that are perfect squares (1, 4, 9, 16, 25, …).
+    Quadratic,
 }
-
-impl HeaderSlot {
-    /// Returns the other slot.
-    const fn toggle(self) -> Self {
-        match self {
-            Self::A => Self::B,
-            Self::B => Self::A,
-        }
-    }
-
-    /// Returns the file offset of this slot.
-    const fn offset(self) -> u64 {
-        match self {
-            Self::A => V2_SLOT_A_OFFSET,
-            Self::B => V2_SLOT_B_OFFSET,
-        }
-    }
-}
-
-// ── Format state ─────────────────────────────────────────────────────────────
-
-/// Which on-disk format this queue file uses, including any format-specific mutable state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FormatState {
-    /// 16-byte header; binary-compatible with the Java `QueueFile`.
-    Legacy,
-    /// 32-byte header; the previous default Rust format.
-    V1,
-    /// Dual 56-byte slots + element headers/footers with CRC-32 integrity.
-    V2 { active_slot: HeaderSlot, generation: u64, next_seq: u64 },
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LayoutMetrics {
-    header_len: u64,
-    data_start: u64,
-}
-
-impl FormatState {
-    #[inline]
-    const fn layout(&self) -> LayoutMetrics {
-        match self {
-            Self::Legacy => LayoutMetrics { header_len: 16, data_start: 16 },
-            Self::V1 => LayoutMetrics { header_len: 32, data_start: 32 },
-            Self::V2 { .. } => {
-                LayoutMetrics { header_len: V2_SLOT_LEN as u64, data_start: V2_DATA_START }
-            }
-        }
-    }
-
-    #[inline]
-    const fn header_len(&self) -> u64 {
-        self.layout().header_len
-    }
-
-    #[inline]
-    const fn data_start(&self) -> u64 {
-        self.layout().data_start
-    }
-
-    #[inline]
-    const fn elem_hdr_len(&self) -> u64 {
-        match self {
-            Self::V2 { .. } => V2_ELEM_HDR_LEN as u64,
-            _ => Element::HEADER_LENGTH as u64,
-        }
-    }
-
-    #[inline]
-    const fn elem_span(&self, payload_len: usize) -> u64 {
-        match self {
-            Self::V2 { .. } => V2_ELEM_OVERHEAD + payload_len as u64,
-            _ => Element::HEADER_LENGTH as u64 + payload_len as u64,
-        }
-    }
-
-    #[inline]
-    const fn next_seq(&self) -> u64 {
-        match self {
-            Self::V2 { next_seq, .. } => *next_seq,
-            _ => 0,
-        }
-    }
-
-    #[inline]
-    fn set_next_seq(&mut self, seq: u64) {
-        if let Self::V2 { next_seq, .. } = self {
-            *next_seq = seq;
-        }
-    }
-
-    fn commit_header(&mut self, inner: &mut QueueFileInner, metadata: QueueMetadata) -> Result<()> {
-        let ds = self.data_start();
-        let (first_phys, last_phys) = if metadata.elem_cnt == 0 {
-            (0, 0)
-        } else {
-            (ds + metadata.first_pos, ds + metadata.last_pos)
-        };
-
-        match self {
-            Self::Legacy | Self::V1 => {
-                let bytes = if matches!(self, Self::V1) {
-                    encode_v1_header(metadata.file_len, metadata.elem_cnt, first_phys, last_phys)?
-                        .to_vec()
-                } else {
-                    encode_legacy_header(
-                        metadata.file_len,
-                        metadata.elem_cnt,
-                        first_phys,
-                        last_phys,
-                    )?
-                    .to_vec()
-                };
-
-                inner.seek(0);
-                inner.write(&bytes)
-            }
-            Self::V2 { active_slot, generation, next_seq } => {
-                let next_slot = active_slot.toggle();
-
-                let slot_bytes = encode_v2_slot(
-                    metadata.file_len,
-                    metadata.elem_cnt,
-                    first_phys,
-                    last_phys,
-                    *generation + 1,
-                    *next_seq,
-                )?;
-
-                let offset = next_slot.offset();
-
-                inner.seek(offset);
-                inner.write(&slot_bytes)?;
-
-                *generation += 1;
-                *active_slot = next_slot;
-
-                Ok(())
-            }
-        }
-    }
-
-    #[allow(clippy::unused_self)]
-    fn read_element(&self, ring: &DataRing<'_>, logical_pos: u64) -> Result<Element> {
-        match self {
-            Self::Legacy | Self::V1 => {
-                let mut buf: [u8; 4] = [0; Element::HEADER_LENGTH];
-                ring.read_at(logical_pos, &mut buf)?;
-
-                Element::new(logical_pos, u32::from_be_bytes(buf) as usize, 0)
-            }
-            Self::V2 { .. } => {
-                let header = self.validate_v2_element_header(ring, logical_pos)?;
-                Ok(Element { pos: logical_pos, len: header.payload_len, seq: header.seq })
-            }
-        }
-    }
-
-    fn validate_v2_element_header(
-        &self, ring: &DataRing<'_>, logical_pos: u64,
-    ) -> Result<V2ElementHeader> {
-        let mut hdr = [0u8; V2_ELEM_HDR_LEN];
-        ring.read_at(logical_pos, &mut hdr)?;
-
-        let magic = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-        ensure!(magic == V2_ELEM_HDR_MAGIC, CorruptedFile {
-            msg: format!(
-                "v2 element header magic mismatch at logical pos {logical_pos}: {magic:#010x}"
-            )
-        });
-
-        let seq =
-            i64::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11]])
-                as u64;
-        let prev_pos = i64::from_be_bytes([
-            hdr[12], hdr[13], hdr[14], hdr[15], hdr[16], hdr[17], hdr[18], hdr[19],
-        ]) as u64;
-        let payload_len_raw = i32::from_be_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]);
-        ensure!(payload_len_raw >= 0, CorruptedFile {
-            msg: format!(
-                "v2 element payload_len {payload_len_raw} is negative at logical pos {logical_pos}"
-            )
-        });
-        let payload_len = payload_len_raw as usize;
-        ensure!(seq >= 1, CorruptedFile {
-            msg: format!("v2 element seq {seq} < 1 at logical pos {logical_pos}")
-        });
-
-        let expected_crc = compute_elem_header_crc(&hdr);
-        let stored_crc = u32::from_be_bytes([hdr[24], hdr[25], hdr[26], hdr[27]]);
-        ensure!(stored_crc == expected_crc, CorruptedFile {
-            msg: format!("v2 element header CRC mismatch at logical pos {logical_pos}")
-        });
-
-        let span = V2_ELEM_OVERHEAD + payload_len as u64;
-        ensure!(span <= ring.capacity(), CorruptedFile {
-            msg: format!("v2 element span {span} exceeds capacity")
-        });
-
-        Ok(V2ElementHeader { payload_len, seq, prev_pos })
-    }
-
-    #[allow(clippy::unused_self)]
-    fn write_element(
-        &self, ring: &mut DataRingMut<'_>, logical_pos: u64, payload: &[u8], seq: u64,
-        prev_logical_pos: Option<u64>,
-    ) -> Result<()> {
-        match self {
-            Self::Legacy | Self::V1 => {
-                let len = payload.len();
-                let mut buf = Vec::with_capacity(4 + len);
-                buf.extend(&(len as u32).to_be_bytes());
-                buf.extend(payload);
-                ring.write_at(logical_pos, &buf)
-            }
-            Self::V2 { .. } => {
-                self.write_v2_element(ring, logical_pos, seq, prev_logical_pos, payload)
-            }
-        }
-    }
-
-    fn write_v2_element(
-        &self, ring: &mut DataRingMut<'_>, logical_pos: u64, seq: u64,
-        prev_logical_pos: Option<u64>, payload: &[u8],
-    ) -> Result<()> {
-        let payload_len = payload.len();
-        let prev_phys = prev_logical_pos.map_or(0, |p| ring.data_start + p);
-
-        // Build 28-byte header.
-        let mut hdr = [0u8; V2_ELEM_HDR_LEN];
-        {
-            let mut w: &mut [u8] = &mut hdr;
-            w.put_u32(V2_ELEM_HDR_MAGIC);
-            w.put_i64(seq as i64);
-            w.put_i64(prev_phys as i64);
-            w.put_i32(payload_len as i32);
-        }
-        let hdr_crc = compute_elem_header_crc(&hdr);
-        hdr[24..28].copy_from_slice(&hdr_crc.to_be_bytes());
-
-        // Ring-write header.
-        ring.write_at(logical_pos, &hdr)?;
-
-        // Ring-write payload.
-        let payload_pos = ring.add(logical_pos, V2_ELEM_HDR_LEN as u64);
-        ring.write_at(payload_pos, payload)?;
-
-        // Build 16-byte footer.
-        let footer_pos = ring.add(logical_pos, V2_ELEM_HDR_LEN as u64 + payload_len as u64);
-        let mut ftr = [0u8; V2_ELEM_FTR_LEN];
-        {
-            let mut w: &mut [u8] = &mut ftr;
-            w.put_u32(V2_ELEM_FTR_MAGIC);
-            w.put_i64(seq as i64);
-        }
-        let ftr_crc = compute_elem_footer_crc(payload, &ftr[..12]);
-        ftr[12..16].copy_from_slice(&ftr_crc.to_be_bytes());
-
-        ring.write_at(footer_pos, &ftr)?;
-
-        Ok(())
-    }
-
-    fn on_expansion(
-        &self, ring: &mut DataRingMut<'_>, plan: &ExpansionPlan, first: Element, last: Element,
-        elem_cnt: usize,
-    ) -> Result<Option<u64>> {
-        if matches!(self, Self::V2 { .. }) {
-            self.rewrite_v2_backlinks_after_expansion(ring, plan, first, elem_cnt)?;
-            // For logical offsets, if we wrapped, the last element's logical offset
-            // might need to change if we want normalized [0..cap) logical offsets.
-            // But wait, if we use logical offsets [0..cap), and cap changed,
-            // the offsets are still the same because we moved the data to the end
-            // which in logical terms is just extending the space.
-            // Wait, if last.pos < first.pos, it means it's wrapped.
-            // When we expand, we move the wrapped portion to the end.
-            // Logical last.pos should probably be updated.
-            if last.pos < first.pos {
-                return Ok(Some(plan.orig_file_len - ring.data_start + last.pos));
-            }
-        } else if last.pos < first.pos {
-            return Ok(Some(plan.orig_file_len - ring.data_start + last.pos));
-        }
-        Ok(None)
-    }
-
-    fn rewrite_v2_backlinks_after_expansion(
-        &self, ring: &mut DataRingMut<'_>, plan: &ExpansionPlan, first: Element, elem_cnt: usize,
-    ) -> Result<()> {
-        let mut positions: Vec<Element> = Vec::with_capacity(elem_cnt);
-        let mut cur = first;
-        for _ in 0..elem_cnt {
-            positions.push(cur);
-            let next_pos = ring.add(cur.pos, V2_ELEM_OVERHEAD + cur.len as u64);
-            if positions.len() < elem_cnt {
-                let next_header =
-                    self.validate_v2_element_header(&ring.as_read_only(), next_pos)?;
-                cur = Element { pos: next_pos, len: next_header.payload_len, seq: next_header.seq };
-            }
-        }
-
-        let moved_offset = plan.orig_file_len - ring.data_start;
-
-        ring.inner.with_batched_backlink_rewrite_sync(|inner| {
-            let mut ring = DataRingMut::new(inner, ring.data_start);
-            for elem in &positions {
-                let elem_pos = elem.pos;
-                let mut hdr = [0u8; V2_ELEM_HDR_LEN];
-                ring.as_read_only().read_at(elem_pos, &mut hdr)?;
-
-                let prev_pos =
-                    self.validate_v2_element_header(&ring.as_read_only(), elem_pos)?.prev_pos;
-
-                // If prev_pos was in the wrapped portion [0..end_of_last_elem)
-                // it was moved by moved_offset.
-                if prev_pos < plan.end_of_last_elem - ring.data_start {
-                    let new_prev_pos = prev_pos + moved_offset;
-
-                    let new_prev_bytes = (new_prev_pos as i64).to_be_bytes();
-                    hdr[12..20].copy_from_slice(&new_prev_bytes);
-
-                    let new_crc = compute_elem_header_crc(&hdr);
-                    hdr[24..28].copy_from_slice(&new_crc.to_be_bytes());
-
-                    ring.write_at(elem_pos, &hdr)?;
-                }
-            }
-
-            Ok(())
-        })
-    }
-
-    #[allow(clippy::unused_self)]
-    fn validate_footer(
-        &self, ring: &DataRing<'_>, payload_start: u64, elem: &Element, payload: &[u8],
-    ) -> Result<()> {
-        if let Self::V2 { .. } = self {
-            let footer_pos = ring.add(payload_start, elem.len as u64);
-            self.validate_v2_footer(ring, footer_pos, elem.seq, payload)?;
-        }
-        Ok(())
-    }
-
-    fn validate_v2_footer(
-        &self, ring: &DataRing<'_>, footer_pos: u64, seq: u64, payload: &[u8],
-    ) -> Result<()> {
-        let mut ftr = [0u8; V2_ELEM_FTR_LEN];
-        ring.read_at(footer_pos, &mut ftr)?;
-
-        let ftr_magic = u32::from_be_bytes([ftr[0], ftr[1], ftr[2], ftr[3]]);
-        ensure!(ftr_magic == V2_ELEM_FTR_MAGIC, CorruptedFile {
-            msg: format!(
-                "v2 element footer magic mismatch at logical pos {footer_pos}: {ftr_magic:#010x}"
-            )
-        });
-
-        let ftr_seq =
-            i64::from_be_bytes([ftr[4], ftr[5], ftr[6], ftr[7], ftr[8], ftr[9], ftr[10], ftr[11]])
-                as u64;
-        ensure!(ftr_seq == seq, CorruptedFile {
-            msg: format!("v2 footer seq {ftr_seq} != element seq {seq}")
-        });
-
-        let stored_crc = u32::from_be_bytes([ftr[12], ftr[13], ftr[14], ftr[15]]);
-        let expected_crc = compute_elem_footer_crc(payload, &ftr[..12]);
-        ensure!(stored_crc == expected_crc, CorruptedFile {
-            msg: "v2 element footer CRC mismatch".to_string()
-        });
-
-        Ok(())
-    }
-
-    fn on_expansion_cleanup(&self, plan: &ExpansionPlan) -> Result<()> {
-        if matches!(self, Self::V2 { .. }) && plan.wraps {
-            maybe_inject_failpoint("v2_after_relocation_cleanup_before_add")?;
-        }
-        Ok(())
-    }
-}
-
-// ── V2 slot data ─────────────────────────────────────────────────────────────
-
-/// Parsed contents of one 56-byte v2 header slot.
-#[derive(Debug, Clone, Copy)]
-struct SlotData {
-    file_length: u64,
-    element_count: u32,
-    first_position: u64,
-    last_position: u64,
-    generation: u64,
-    next_sequence_number: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct QueueMetadata {
-    file_len: u64,
-    elem_cnt: usize,
-    first_pos: u64,
-    last_pos: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LegacyHeaderState {
-    format: FormatState,
-    file_len: u64,
-    elem_cnt: usize,
-    first_pos: u64,
-    last_pos: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct V2OpenState {
-    active_slot: HeaderSlot,
-    slot: SlotData,
-    elem_cnt: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct V2ElementHeader {
-    payload_len: usize,
-    seq: u64,
-    prev_pos: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ExpansionPlan {
-    orig_file_len: u64,
-    new_len: u64,
-    end_of_last_elem: u64,
-    wraps: bool,
-    moved_count: u64,
-}
-
-#[derive(Debug, Clone)]
-struct QueueStateSnapshot {
-    format: FormatState,
-    elem_cnt: usize,
-    first: Element,
-    last: Element,
-    overwrite_on_remove: bool,
-    cached_offsets: VecDeque<(usize, Element)>,
-}
-
-// ── CRC helpers ───────────────────────────────────────────────────────────────
-
-fn crc32(data: &[u8]) -> u32 {
-    crc32fast::hash(data)
-}
-
-fn compute_slot_crc(slot_bytes: &[u8; V2_SLOT_LEN]) -> u32 {
-    crc32(&slot_bytes[..52])
-}
-
-fn compute_elem_header_crc(hdr_bytes: &[u8; V2_ELEM_HDR_LEN]) -> u32 {
-    crc32(&hdr_bytes[..24])
-}
-
-fn compute_elem_footer_crc(payload: &[u8], ftr_bytes_0_to_11: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(payload);
-    hasher.update(ftr_bytes_0_to_11);
-    hasher.finalize()
-}
-
-// ── Header serialisation / deserialisation ────────────────────────────────────
-
-fn encode_legacy_header(
-    file_len: u64, elem_cnt: usize, first_phys: u64, last_phys: u64,
-) -> Result<[u8; 16]> {
-    ensure!(i32::try_from(file_len).is_ok(), CorruptedFile {
-        msg: "file length in header will exceed i32::MAX".to_string()
-    });
-    ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFile {
-        msg: "element count in header will exceed i32::MAX".to_string()
-    });
-    ensure!(i32::try_from(first_phys).is_ok(), CorruptedFile {
-        msg: "first element position in header will exceed i32::MAX".to_string()
-    });
-    ensure!(i32::try_from(last_phys).is_ok(), CorruptedFile {
-        msg: "last element position in header will exceed i32::MAX".to_string()
-    });
-
-    let mut header = [0u8; 16];
-    let mut header_buf: &mut [u8] = &mut header;
-
-    header_buf.put_i32(file_len as i32);
-    header_buf.put_i32(elem_cnt as i32);
-    header_buf.put_i32(first_phys as i32);
-    header_buf.put_i32(last_phys as i32);
-
-    Ok(header)
-}
-
-fn encode_v1_header(
-    file_len: u64, elem_cnt: usize, first_phys: u64, last_phys: u64,
-) -> Result<[u8; 32]> {
-    ensure!(i64::try_from(file_len).is_ok(), CorruptedFile {
-        msg: "file length in header will exceed i64::MAX".to_string()
-    });
-    ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFile {
-        msg: "element count in header will exceed i32::MAX".to_string()
-    });
-    ensure!(i64::try_from(first_phys).is_ok(), CorruptedFile {
-        msg: "first element position in header will exceed i64::MAX".to_string()
-    });
-    ensure!(i64::try_from(last_phys).is_ok(), CorruptedFile {
-        msg: "last element position in header will exceed i64::MAX".to_string()
-    });
-
-    let mut header = [0u8; 32];
-    let mut header_buf: &mut [u8] = &mut header;
-
-    header_buf.put_u32(VERSIONED_HEADER);
-    header_buf.put_u64(file_len);
-    header_buf.put_i32(elem_cnt as i32);
-    header_buf.put_u64(first_phys);
-    header_buf.put_u64(last_phys);
-
-    Ok(header)
-}
-
-fn encode_v2_slot(
-    file_len: u64, elem_cnt: usize, first_phys: u64, last_phys: u64, generation: u64, next_seq: u64,
-) -> Result<[u8; V2_SLOT_LEN]> {
-    ensure!(i64::try_from(file_len).is_ok(), CorruptedFile {
-        msg: "file length in V2 header will exceed i64::MAX".to_string()
-    });
-    ensure!(u32::try_from(elem_cnt).is_ok(), CorruptedFile {
-        msg: "element count in V2 header will exceed u32::MAX".to_string()
-    });
-    ensure!(i64::try_from(first_phys).is_ok(), CorruptedFile {
-        msg: "first element position in V2 header will exceed i64::MAX".to_string()
-    });
-    ensure!(i64::try_from(last_phys).is_ok(), CorruptedFile {
-        msg: "last element position in V2 header will exceed i64::MAX".to_string()
-    });
-
-    let slot_data = SlotData {
-        file_length: file_len,
-        element_count: elem_cnt as u32,
-        first_position: first_phys,
-        last_position: last_phys,
-        generation,
-        next_sequence_number: next_seq,
-    };
-
-    Ok(build_slot_bytes(&slot_data))
-}
-
-// ── Slot serialisation / deserialisation ─────────────────────────────────────
-
-/// Build a 56-byte slot from `data`, computing and writing the CRC.
-fn build_slot_bytes(data: &SlotData) -> [u8; V2_SLOT_LEN] {
-    let mut buf = [0u8; V2_SLOT_LEN];
-    {
-        let mut w: &mut [u8] = &mut buf;
-        w.put_u32(V2_MAGIC);
-        w.put_u8(2); // version
-        w.put_u8(0); // flags
-        w.put_u8(0); // reserved
-        w.put_u8(0); // reserved
-        // SAFETY: caller (write_header_v2) validates all fields fit in their signed widths.
-        w.put_i64(data.file_length as i64);
-        w.put_i32(data.element_count as i32);
-        w.put_i64(data.first_position as i64);
-        w.put_i64(data.last_position as i64);
-        w.put_i64(data.generation as i64);
-        w.put_i64(data.next_sequence_number as i64);
-    }
-    let crc = compute_slot_crc(&buf);
-    buf[52..56].copy_from_slice(&crc.to_be_bytes());
-    buf
-}
-
-/// Parse a 56-byte slot, returning `None` if any validation fails.
-fn parse_slot(bytes: &[u8; V2_SLOT_LEN]) -> Option<SlotData> {
-    let mut r: &[u8] = bytes;
-    let magic = r.get_u32();
-    if magic != V2_MAGIC {
-        return None;
-    }
-    let version = r.get_u8();
-    let flags = r.get_u8();
-    let res0 = r.get_u8();
-    let res1 = r.get_u8();
-    if version != 2 || flags != 0 || res0 != 0 || res1 != 0 {
-        return None;
-    }
-    let file_length = u64::try_from(r.get_i64()).ok()?;
-    let element_count = u32::try_from(r.get_i32()).ok()?;
-    let first_position = u64::try_from(r.get_i64()).ok()?;
-    let last_position = u64::try_from(r.get_i64()).ok()?;
-    let generation = u64::try_from(r.get_i64()).ok()?;
-    let next_sequence_number = u64::try_from(r.get_i64()).ok()?;
-
-    let stored_crc = u32::from_be_bytes([bytes[52], bytes[53], bytes[54], bytes[55]]);
-    let expected_crc = compute_slot_crc(bytes);
-    if stored_crc != expected_crc {
-        return None;
-    }
-
-    Some(SlotData {
-        file_length,
-        element_count,
-        first_position,
-        last_position,
-        generation,
-        next_sequence_number,
-    })
-}
-
-/// Read 56 bytes from absolute file offset `offset` (no ring-buffer wrapping).
-fn read_slot(inner: &QueueFileInner, offset: u64) -> Result<[u8; V2_SLOT_LEN]> {
-    let mut buf = [0u8; V2_SLOT_LEN];
-    inner.read_exact_at(offset, &mut buf)?;
-    Ok(buf)
-}
-
-/// Given two optional parsed slots, elect the canonical one.
-///
-/// Both invalid → error. One valid → use it. Both valid → higher generation wins (A wins ties).
-fn elect_canonical_slot(
-    slot_a: Option<SlotData>, slot_b: Option<SlotData>,
-) -> Result<(HeaderSlot, SlotData)> {
-    match (slot_a, slot_b) {
-        (None, None) => Err(CorruptedFile { msg: "both v2 header slots are invalid".to_string() }),
-        (Some(a), None) => Ok((HeaderSlot::A, a)),
-        (None, Some(b)) => Ok((HeaderSlot::B, b)),
-        (Some(a), Some(b)) => {
-            if a.generation >= b.generation {
-                Ok((HeaderSlot::A, a))
-            } else {
-                Ok((HeaderSlot::B, b))
-            }
-        }
-    }
-}
-
-fn validate_v2_slot_data(slot: &SlotData, real_file_len: u64) -> Result<()> {
-    ensure!(slot.file_length >= V2_DATA_START, CorruptedFile {
-        msg: format!("v2 file_length {} < data_start {}", slot.file_length, V2_DATA_START)
-    });
-    ensure!(slot.file_length <= real_file_len, CorruptedFile {
-        msg: format!(
-            "v2 file is truncated: header claims {}, actual {}",
-            slot.file_length, real_file_len
-        )
-    });
-    ensure!(slot.next_sequence_number >= 1, CorruptedFile {
-        msg: "v2 next_sequence_number must be >= 1".to_string()
-    });
-    if slot.element_count == 0 {
-        ensure!(slot.first_position == 0 && slot.last_position == 0, CorruptedFile {
-            msg: "v2 empty queue has non-zero pointers".to_string()
-        });
-    } else {
-        ensure!(slot.first_position != 0 && slot.last_position != 0, CorruptedFile {
-            msg: "v2 non-empty queue has zero pointer".to_string()
-        });
-        ensure!(
-            slot.first_position >= V2_DATA_START && slot.first_position < slot.file_length,
-            CorruptedFile {
-                msg: format!(
-                    "v2 first_position {} out of range [data_start={}, file_length={})",
-                    slot.first_position, V2_DATA_START, slot.file_length
-                )
-            }
-        );
-        ensure!(
-            slot.last_position >= V2_DATA_START && slot.last_position < slot.file_length,
-            CorruptedFile {
-                msg: format!(
-                    "v2 last_position {} out of range [data_start={}, file_length={})",
-                    slot.last_position, V2_DATA_START, slot.file_length
-                )
-            }
-        );
-    }
-    Ok(())
-}
-
-fn maybe_inject_failpoint(name: &str) -> Result<()> {
-    if std::env::var("QUEUE_FILE_FAILPOINT").ok().as_deref() == Some(name) {
-        return Err(CorruptedFile { msg: format!("injected failpoint: {name}") });
-    }
-
-    Ok(())
-}
-
-// ── QueueFile ────────────────────────────────────────────────────────────────
 
 /// A lightning-fast, transactional, file-based FIFO queue.
 ///
@@ -960,57 +189,17 @@ fn maybe_inject_failpoint(name: &str) -> Result<()> {
 #[derive(Debug)]
 pub struct QueueFile {
     inner: QueueFileInner,
-    /// Which on-disk format this file uses, including format-specific metadata.
     format: FormatState,
-    /// Number of elements.
     elem_cnt: usize,
-    /// Pointer to first (or eldest) element.
     first: Element,
-    /// Pointer to last (or newest) element.
     last: Element,
-    /// Minimum number of bytes the file shrinks to.
     capacity: u64,
-    /// When true, removing an element will also overwrite data with zero bytes.
     overwrite_on_remove: bool,
-    /// When true, skips header update upon adding.
     skip_write_header_on_add: bool,
-    /// Offset cache idx->Element. Sorted in ascending order, always unique.
     cached_offsets: VecDeque<(usize, Element)>,
-    /// Offset caching policy.
     offset_cache_kind: Option<OffsetCacheKind>,
-    /// Marker preventing `Send` and `Sync`. `QueueFile` is not thread-safe; wrap it in
-    /// `Mutex<QueueFile>` or `RwLock<QueueFile>` for cross-thread access.
     #[allow(dead_code)]
     _marker: PhantomData<Cell<()>>,
-}
-
-/// Policy controlling how element file-positions are cached to accelerate [`Iter::nth`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OffsetCacheKind {
-    /// Cache one position every `offset` elements.
-    Linear { offset: usize },
-    /// Cache positions at indices that are perfect squares (1, 4, 9, 16, 25, …).
-    Quadratic,
-}
-
-/// Owns the backing file handle and manages all low-level I/O.
-#[derive(Debug)]
-struct QueueFileInner {
-    file: Option<File>,
-    file_len: u64,
-    expected_seek: u64,
-    last_seek: Option<u64>,
-    transfer_buf: Box<[u8]>,
-    sync_writes: bool,
-    deferred_sync_phase: Option<DeferredSyncPhase>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeferredSyncPhase {
-    ExpansionCopy,
-    ClearErase,
-    BacklinkRewrite,
-    AppendBatch,
 }
 
 impl Drop for QueueFile {
@@ -1031,7 +220,6 @@ impl QueueFile {
 
     // ── Constructors ─────────────────────────────────────────────────────────
 
-    /// Creates a fresh, empty queue file at `path` with the given initial file size.
     fn init(path: &Path, force_legacy: bool, capacity: u64) -> Result<()> {
         let tmp_path = path.with_extension(".tmp");
 
@@ -1044,7 +232,6 @@ impl QueueFile {
                 .open(&tmp_path)?;
 
             if force_legacy {
-                // Legacy / versioned: allocate `capacity` bytes then write header.
                 file.set_len(capacity)?;
 
                 let mut buf = BytesMut::with_capacity(16);
@@ -1056,7 +243,6 @@ impl QueueFile {
                 }
                 file.write_all(buf.as_ref())?;
             } else {
-                // V2: exactly 8192 bytes, two slots written.
                 file.set_len(V2_INITIAL_LEN)?;
 
                 let slot_a = SlotData {
@@ -1098,7 +284,6 @@ impl QueueFile {
         Self::open_internal_full(path, true, true, Self::INITIAL_LENGTH, false)
     }
 
-    /// Returns `true` if the file contains `V2_MAGIC` at slot A or slot B.
     fn detect_v2_magic(file: &mut File, real_file_len: u64, force_legacy: bool) -> Result<bool> {
         if force_legacy {
             return Ok(false);
@@ -1121,55 +306,6 @@ impl QueueFile {
         Ok(false)
     }
 
-    /// Parse and validate a versioned (v1) 32-byte header.
-    /// Returns `(file_len, elem_cnt, first_pos, last_pos)`.
-    fn parse_versioned_header(buf: &mut BytesMut) -> Result<(u64, usize, u64, u64)> {
-        let version = buf.get_u32() & 0x7FFF_FFFF;
-        ensure!(version == 1, UnsupportedVersion { detected: version, supported: 1u32 });
-
-        let file_len = buf.get_u64();
-        let elem_cnt = buf.get_u32() as usize;
-        let first_pos = buf.get_u64();
-        let last_pos = buf.get_u64();
-
-        ensure!(i64::try_from(file_len).is_ok(), CorruptedFile {
-            msg: "file length in header is greater than i64::MAX".to_string()
-        });
-        ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFile {
-            msg: "element count in header is greater than i32::MAX".to_string()
-        });
-        ensure!(i64::try_from(first_pos).is_ok(), CorruptedFile {
-            msg: "first element position in header is greater than i64::MAX".to_string()
-        });
-        ensure!(i64::try_from(last_pos).is_ok(), CorruptedFile {
-            msg: "last element position in header is greater than i64::MAX".to_string()
-        });
-        Ok((file_len, elem_cnt, first_pos, last_pos))
-    }
-
-    /// Parse and validate a legacy 16-byte header.
-    /// Returns `(file_len, elem_cnt, first_pos, last_pos)`.
-    fn parse_legacy_header(buf: &mut BytesMut) -> Result<(u64, usize, u64, u64)> {
-        let file_len = u64::from(buf.get_u32());
-        let elem_cnt = buf.get_u32() as usize;
-        let first_pos = u64::from(buf.get_u32());
-        let last_pos = u64::from(buf.get_u32());
-
-        ensure!(i32::try_from(file_len).is_ok(), CorruptedFile {
-            msg: "file length in header is greater than i32::MAX".to_string()
-        });
-        ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFile {
-            msg: "element count in header is greater than i32::MAX".to_string()
-        });
-        ensure!(i32::try_from(first_pos).is_ok(), CorruptedFile {
-            msg: "first element position in header is greater than i32::MAX".to_string()
-        });
-        ensure!(i32::try_from(last_pos).is_ok(), CorruptedFile {
-            msg: "last element position in header is greater than i32::MAX".to_string()
-        });
-        Ok((file_len, elem_cnt, first_pos, last_pos))
-    }
-
     fn ensure_queue_file_exists(path: &Path, force_legacy: bool, capacity: u64) -> Result<()> {
         if !path.exists() {
             Self::init(
@@ -1188,31 +324,31 @@ impl QueueFile {
         let mut buf = [0u8; 32];
         file.seek(SeekFrom::Start(0))?;
         let bytes_read = file.read(&mut buf)?;
-        ensure!(bytes_read >= 32, CorruptedFile { msg: "file too short".to_string() });
+        ensure!(bytes_read >= 32, Error::CorruptedFile { msg: "file too short".to_string() });
 
         let versioned = !force_legacy && (buf[0] & 0x80) != 0;
         let mut buf = BytesMut::from(&buf[..]);
 
         let (format, header_len, file_len, elem_cnt, first_pos, last_pos) = if versioned {
-            let (file_len, elem_cnt, first_pos, last_pos) = Self::parse_versioned_header(&mut buf)?;
+            let (file_len, elem_cnt, first_pos, last_pos) = parse_versioned_header(&mut buf)?;
             (FormatState::V1, 32u64, file_len, elem_cnt, first_pos, last_pos)
         } else {
-            let (file_len, elem_cnt, first_pos, last_pos) = Self::parse_legacy_header(&mut buf)?;
+            let (file_len, elem_cnt, first_pos, last_pos) = parse_legacy_header(&mut buf)?;
             (FormatState::Legacy, 16u64, file_len, elem_cnt, first_pos, last_pos)
         };
 
-        ensure!(file_len <= real_file_len, CorruptedFile {
+        ensure!(file_len <= real_file_len, Error::CorruptedFile {
             msg: format!(
                 "file is truncated. expected length was {file_len} but actual length is {real_file_len}"
             )
         });
-        ensure!(file_len >= header_len, CorruptedFile {
+        ensure!(file_len >= header_len, Error::CorruptedFile {
             msg: format!("length stored in header ({file_len}) is invalid")
         });
-        ensure!(first_pos <= file_len, CorruptedFile {
+        ensure!(first_pos <= file_len, Error::CorruptedFile {
             msg: format!("position of the first element ({first_pos}) is beyond the file")
         });
-        ensure!(last_pos <= file_len, CorruptedFile {
+        ensure!(last_pos <= file_len, Error::CorruptedFile {
             msg: format!("position of the last element ({last_pos}) is beyond the file")
         });
 
@@ -1253,11 +389,11 @@ impl QueueFile {
         if state.elem_cnt > 0 {
             let data_start = state.format.data_start();
             let first_logical =
-                state.first_pos.checked_sub(data_start).ok_or_else(|| CorruptedFile {
+                state.first_pos.checked_sub(data_start).ok_or_else(|| Error::CorruptedFile {
                     msg: format!("first_pos {} < data_start {}", state.first_pos, data_start),
                 })?;
             let last_logical =
-                state.last_pos.checked_sub(data_start).ok_or_else(|| CorruptedFile {
+                state.last_pos.checked_sub(data_start).ok_or_else(|| Error::CorruptedFile {
                     msg: format!("last_pos {} < data_start {}", state.last_pos, data_start),
                 })?;
 
@@ -1294,7 +430,6 @@ impl QueueFile {
         Self::build_legacy_queue_file(file, state, capacity, overwrite_on_remove)
     }
 
-    /// Open a file already detected as v2 format.
     fn open_v2(
         file: File, real_file_len: u64, capacity: u64, overwrite_on_remove: bool, _path: &Path,
     ) -> Result<Self> {
@@ -1308,7 +443,7 @@ impl QueueFile {
             deferred_sync_phase: None,
         };
 
-        let open_state = Self::read_v2_open_state(&inner, real_file_len)?;
+        let open_state = read_v2_open_state(&inner, real_file_len)?;
         let mut qf = Self::build_v2_queue_file(inner, open_state, capacity, overwrite_on_remove);
         qf.initialize_v2_endpoints(open_state.slot)?;
 
@@ -1317,26 +452,6 @@ impl QueueFile {
         }
 
         Ok(qf)
-    }
-
-    fn read_v2_open_state(inner: &QueueFileInner, real_file_len: u64) -> Result<V2OpenState> {
-        let raw_a = if real_file_len >= V2_SLOT_LEN as u64 {
-            read_slot(inner, V2_SLOT_A_OFFSET).ok()
-        } else {
-            None
-        };
-        let raw_b = if real_file_len >= V2_SLOT_B_OFFSET + V2_SLOT_LEN as u64 {
-            read_slot(inner, V2_SLOT_B_OFFSET).ok()
-        } else {
-            None
-        };
-
-        let slot_a = raw_a.as_ref().and_then(parse_slot);
-        let slot_b = raw_b.as_ref().and_then(parse_slot);
-        let (active_slot, slot) = elect_canonical_slot(slot_a, slot_b)?;
-        validate_v2_slot_data(&slot, real_file_len)?;
-
-        Ok(V2OpenState { active_slot, slot, elem_cnt: slot.element_count as usize })
     }
 
     fn build_v2_queue_file(
@@ -1371,16 +486,16 @@ impl QueueFile {
 
         let data_start = self.data_start();
         let first_logical =
-            slot.first_position.checked_sub(data_start).ok_or_else(|| CorruptedFile {
+            slot.first_position.checked_sub(data_start).ok_or_else(|| Error::CorruptedFile {
                 msg: format!("v2 first_pos {} < data_start {}", slot.first_position, data_start),
             })?;
         let last_logical =
-            slot.last_position.checked_sub(data_start).ok_or_else(|| CorruptedFile {
+            slot.last_position.checked_sub(data_start).ok_or_else(|| Error::CorruptedFile {
                 msg: format!("v2 last_pos {} < data_start {}", slot.last_position, data_start),
             })?;
 
         let last_header = self.format.validate_v2_element_header(&self.ring(), last_logical)?;
-        ensure!(last_header.seq == slot.next_sequence_number - 1, CorruptedFile {
+        ensure!(last_header.seq == slot.next_sequence_number - 1, Error::CorruptedFile {
             msg: format!(
                 "v2 tail seq {} != next_seq-1 {}",
                 last_header.seq,
@@ -1401,7 +516,6 @@ impl QueueFile {
         Ok(())
     }
 
-    /// Attempt head recovery by walking backward via `prev_pos` backlinks from the tail.
     fn recover_v2_head(
         &self, last_logical_pos: u64, last_seq: u64, elem_cnt: usize,
     ) -> Result<Element> {
@@ -1411,12 +525,13 @@ impl QueueFile {
             let current_header =
                 self.format.validate_v2_element_header(&self.ring(), cur_logical_pos)?;
 
-            let expected_seq = last_seq.checked_sub(step as u64).ok_or_else(|| CorruptedFile {
-                msg: format!(
-                    "v2 recovery: tail seq {last_seq} too small for element_count {elem_cnt}"
-                ),
-            })?;
-            ensure!(current_header.seq == expected_seq, CorruptedFile {
+            let expected_seq =
+                last_seq.checked_sub(step as u64).ok_or_else(|| Error::CorruptedFile {
+                    msg: format!(
+                        "v2 recovery: tail seq {last_seq} too small for element_count {elem_cnt}"
+                    ),
+                })?;
+            ensure!(current_header.seq == expected_seq, Error::CorruptedFile {
                 msg: format!("v2 recovery: seq {} != expected {expected_seq}", current_header.seq)
             });
 
@@ -1430,21 +545,22 @@ impl QueueFile {
                 return Ok(current);
             }
 
-            ensure!(current_header.prev_pos != 0, CorruptedFile {
+            ensure!(current_header.prev_pos != 0, Error::CorruptedFile {
                 msg: format!("v2 recovery: walked {} elements but expected {}", step + 1, elem_cnt)
             });
 
             let data_start = self.data_start();
-            cur_logical_pos =
-                current_header.prev_pos.checked_sub(data_start).ok_or_else(|| CorruptedFile {
+            cur_logical_pos = current_header.prev_pos.checked_sub(data_start).ok_or_else(|| {
+                Error::CorruptedFile {
                     msg: format!(
                         "v2 recovery: prev_pos {} < data_start {}",
                         current_header.prev_pos, data_start
                     ),
-                })?;
+                }
+            })?;
         }
 
-        Err(CorruptedFile {
+        Err(Error::CorruptedFile {
             msg: "v2 recovery: could not walk expected live element count".to_string(),
         })
     }
@@ -1527,11 +643,11 @@ impl QueueFile {
 
     pub fn sync_all(&mut self) -> Result<()> {
         if self.skip_write_header_on_add {
-            self.inner.file_mut()?.sync_data()?; // Barrier: ensure payloads are durable
-            self.sync_header()?; // Write the header
+            self.inner.file_mut()?.sync_data()?;
+            self.sync_header()?;
         }
 
-        Ok(self.inner.file_mut()?.sync_all()?) // Barrier: ensure header is durable
+        Ok(self.inner.file_mut()?.sync_all()?)
     }
 
     // ── Cache helpers ─────────────────────────────────────────────────────────
@@ -1625,7 +741,6 @@ impl QueueFile {
 
     // ── add_n ─────────────────────────────────────────────────────────────────
 
-    /// Adds multiple elements to the end of the queue in a single write.
     pub fn add_n(&mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Result<()> {
         let elems: Vec<_> = elems.into_iter().collect();
         if elems.is_empty() {
@@ -1635,7 +750,7 @@ impl QueueFile {
         let mut total_span: u64 = 0;
         for elem in &elems {
             let len = elem.as_ref().len();
-            ensure!(i32::try_from(len).is_ok(), ElementTooBig);
+            ensure!(i32::try_from(len).is_ok(), Error::ElementTooBig);
             total_span = total_span.saturating_add(self.format.elem_span(len));
         }
 
@@ -1679,7 +794,7 @@ impl QueueFile {
     }
 
     fn append_single_element(&mut self, buf: &[u8], base_seq: u64, count: usize) -> Result<()> {
-        ensure!(self.elem_cnt + 1 < i32::MAX as usize, TooManyElements);
+        ensure!(self.elem_cnt + 1 < i32::MAX as usize, Error::TooManyElements);
 
         let is_empty = self.is_empty();
         let last_pos = self.last.pos;
@@ -1705,7 +820,6 @@ impl QueueFile {
         Ok(())
     }
 
-    /// Appends a single element to the tail of the queue.
     #[inline]
     pub fn add(&mut self, buf: &[u8]) -> Result<()> {
         self.add_n(std::iter::once(buf))
@@ -1713,7 +827,6 @@ impl QueueFile {
 
     // ── peek ──────────────────────────────────────────────────────────────────
 
-    /// Returns the head element without removing it.
     pub fn peek(&self) -> Result<Option<Vec<u8>>> {
         if self.is_empty() {
             return Ok(None);
@@ -1724,14 +837,13 @@ impl QueueFile {
         if self.peek_into(&mut buf)? { Ok(Some(buf)) } else { Ok(None) }
     }
 
-    /// Returns the head element without removing it.
     pub fn peek_into(&self, buf: &mut Vec<u8>) -> Result<bool> {
         if self.is_empty() {
             return Ok(false);
         }
 
         let len = self.first.len;
-        buf.resize(len, 0); // Reuses existing capacity without reallocating
+        buf.resize(len, 0);
 
         let ring = self.ring();
         let payload_start = ring.add(self.first.pos, self.elem_hdr_len());
@@ -1770,7 +882,6 @@ impl QueueFile {
 
         let old_first_pos = self.first.pos;
 
-        // 1. Find the new head element after removing n elements
         let mut new_first = self.first;
         let mut remaining_to_skip = n;
 
@@ -1787,7 +898,6 @@ impl QueueFile {
             new_first = self.read_element_at(next_pos)?;
         }
 
-        // 2. Update metadata
         let erase_total_len = if self.overwrite_on_remove {
             self.ring().distance(old_first_pos, new_first.pos) as usize
         } else {
@@ -1797,16 +907,13 @@ impl QueueFile {
         self.elem_cnt -= n;
         self.first = new_first;
 
-        // 3. Commit change
         self.sync_header()?;
 
-        // 4. Update cache
         if let Some(i) = cached_idx {
             self.cached_offsets.drain(..=i);
         }
         self.cached_offsets.iter_mut().for_each(|(i, _)| *i -= n);
 
-        // 5. Securely erase removed data if needed
         if self.overwrite_on_remove {
             self.ring_erase_logical(old_first_pos, erase_total_len)?;
         }
@@ -1854,18 +961,7 @@ impl QueueFile {
             next_elem_pos: self.first.pos,
         }
     }
-}
 
-impl<'a> IntoIterator for &'a QueueFile {
-    type IntoIter = Iter<'a>;
-    type Item = Vec<u8>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-impl QueueFile {
     // ── Metrics ───────────────────────────────────────────────────────────────
 
     #[inline]
@@ -1955,8 +1051,6 @@ impl QueueFile {
         Ok(())
     }
 
-    /// Compute the smallest power-of-two multiple of `current_len` that adds enough
-    /// capacity to satisfy `data_len` given `remaining_bytes` of free space.
     fn compute_expanded_len(current_len: u64, mut remaining_bytes: u64, data_len: u64) -> u64 {
         let mut prev_len = current_len;
         let mut new_len = current_len;
@@ -2055,10 +1149,8 @@ impl QueueFile {
         let tmp = path.with_extension("v2tmp");
 
         let result = (|| -> Result<()> {
-            // Open source (no migration, legacy or versioned).
             let src = Self::open_internal_full(path, true, false, Self::INITIAL_LENGTH, false)?;
 
-            // Create fresh v2 at tmp.
             Self::init(&tmp, false, V2_INITIAL_LEN)?;
             let mut dst = Self::open_internal_full(
                 &tmp,
@@ -2069,14 +1161,10 @@ impl QueueFile {
             )?;
             dst.inner.sync_writes = false;
 
-            // Copy all elements.
             {
                 let mut src_iter = src.iter();
                 while let Some(elem) = src_iter.borrowed_next() {
-                    // Need owned copy since we borrow src mutably through iter.
                     let owned: Vec<u8> = elem.to_vec();
-
-                    // We need to add to dst but iter borrows src. This is OK because dst is separate.
                     dst.add(&owned)?;
                 }
             }
@@ -2098,379 +1186,14 @@ impl QueueFile {
     }
 }
 
-// ── DataRing ──────────────────────────────────────────────────────────────
+impl<'a> IntoIterator for &'a QueueFile {
+    type IntoIter = Iter<'a>;
+    type Item = Vec<u8>;
 
-/// A view over the data region of a `QueueFile` that provides linear logical addressing.
-#[derive(Debug, Clone, Copy)]
-struct DataRing<'a> {
-    inner: &'a QueueFileInner,
-    data_start: u64,
-}
-
-impl<'a> DataRing<'a> {
-    const fn new(inner: &'a QueueFileInner, data_start: u64) -> Self {
-        Self { inner, data_start }
-    }
-
-    #[inline]
-    const fn capacity(&self) -> u64 {
-        self.inner.file_len - self.data_start
-    }
-
-    #[inline]
-    const fn phys_pos(&self, logical_pos: u64) -> u64 {
-        self.data_start + (logical_pos % self.capacity())
-    }
-
-    #[inline]
-    const fn add(&self, logical_pos: u64, delta: u64) -> u64 {
-        (logical_pos + delta) % self.capacity()
-    }
-
-    #[inline]
-    const fn distance(&self, from: u64, to: u64) -> u64 {
-        let cap = self.capacity();
-        (to + cap - from) % cap
-    }
-
-    fn read_at(&self, logical_pos: u64, buf: &mut [u8]) -> io::Result<()> {
-        let cap = self.capacity();
-        let mut pos = logical_pos % cap;
-        let mut bytes_read = 0;
-        let mut remaining = buf.len();
-
-        while remaining > 0 {
-            let phys = self.data_start + pos;
-            let can_read = min(remaining as u64, cap - pos) as usize;
-            self.inner.read_exact_at(phys, &mut buf[bytes_read..bytes_read + can_read])?;
-
-            bytes_read += can_read;
-            remaining -= can_read;
-            pos = 0;
-        }
-
-        Ok(())
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
-
-/// A mutable view over the data region of a `QueueFile` that provides linear logical addressing.
-#[derive(Debug)]
-struct DataRingMut<'a> {
-    inner: &'a mut QueueFileInner,
-    data_start: u64,
-}
-
-impl<'a> DataRingMut<'a> {
-    fn new(inner: &'a mut QueueFileInner, data_start: u64) -> Self {
-        Self { inner, data_start }
-    }
-
-    #[inline]
-    fn as_read_only(&self) -> DataRing<'_> {
-        DataRing { inner: self.inner, data_start: self.data_start }
-    }
-
-    #[inline]
-    fn capacity(&self) -> u64 {
-        self.inner.file_len - self.data_start
-    }
-
-    #[inline]
-    fn add(&self, logical_pos: u64, delta: u64) -> u64 {
-        (logical_pos + delta) % self.capacity()
-    }
-
-    fn write_at(&mut self, logical_pos: u64, buf: &[u8]) -> Result<()> {
-        let cap = self.capacity();
-        let mut pos = logical_pos % cap;
-        let mut bytes_written = 0;
-        let mut remaining = buf.len();
-
-        while remaining > 0 {
-            let phys = self.data_start + pos;
-            let can_write = min(remaining as u64, cap - pos) as usize;
-            self.inner.seek(phys);
-            self.inner.write(&buf[bytes_written..bytes_written + can_write])?;
-
-            bytes_written += can_write;
-            remaining -= can_write;
-            pos = 0;
-        }
-
-        Ok(())
-    }
-
-    fn relocate(&mut self, orig_file_len: u64, moved_count: u64) -> Result<()> {
-        if moved_count == 0 {
-            return Ok(());
-        }
-
-        let data_start = self.data_start;
-        self.inner.with_batched_expansion_copy_sync(|inner| {
-            inner.transfer(data_start, orig_file_len, moved_count)
-        })
-    }
-}
-
-// ── QueueFileInner I/O helpers ────────────────────────────────────────────────
-
-impl QueueFileInner {
-    const TRANSFER_BUFFER_SIZE: usize = 128 * 1024;
-
-    #[inline]
-    fn file(&self) -> io::Result<&File> {
-        self.file
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "queue file handle unavailable"))
-    }
-
-    #[inline]
-    fn file_mut(&mut self) -> io::Result<&mut File> {
-        self.file
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "queue file handle unavailable"))
-    }
-
-    #[inline]
-    fn seek(&mut self, pos: u64) -> u64 {
-        self.expected_seek = pos;
-        pos
-    }
-
-    fn real_seek(&mut self) -> io::Result<u64> {
-        if Some(self.expected_seek) == self.last_seek {
-            return Ok(self.expected_seek);
-        }
-
-        let expected_seek = self.expected_seek;
-        let res = self.file_mut()?.seek(SeekFrom::Start(expected_seek));
-        self.last_seek = res.as_ref().ok().copied();
-
-        res
-    }
-
-    fn write(&mut self, buf: &[u8]) -> Result<()> {
-        self.real_seek()?;
-
-        self.file_mut()?.write_all(buf)?;
-
-        if let Some(seek) = &mut self.last_seek {
-            *seek += buf.len() as u64;
-        }
-
-        if self.sync_writes {
-            if let Some(phase) = self.deferred_sync_phase {
-                match phase {
-                    DeferredSyncPhase::ExpansionCopy => {
-                        maybe_inject_failpoint("v2_expansion_copy_per_write_sync")?;
-                    }
-                    DeferredSyncPhase::ClearErase => {
-                        maybe_inject_failpoint("clear_erase_per_write_sync")?;
-                    }
-                    DeferredSyncPhase::BacklinkRewrite => {
-                        maybe_inject_failpoint("v2_backlink_rewrite_per_write_sync")?;
-                    }
-                    DeferredSyncPhase::AppendBatch => {
-                        maybe_inject_failpoint("v2_add_batch_per_write_sync")?;
-                    }
-                }
-            }
-            self.file_mut()?.sync_data()?;
-        }
-
-        Ok(())
-    }
-
-    fn read_exact_at(&self, mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
-        while !buf.is_empty() {
-            let read = self.read_at(offset, buf)?;
-            if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "failed to fill whole buffer",
-                ));
-            }
-
-            offset += read as u64;
-            buf = &mut buf[read..];
-        }
-
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        self.file()?.read_at(buf, offset)
-    }
-
-    #[cfg(windows)]
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        self.file()?.seek_read(buf, offset)
-    }
-
-    fn transfer(&mut self, read_pos: u64, write_pos: u64, count: u64) -> Result<()> {
-        // Validate Overlap (Security/Soundness Check)
-        if write_pos > read_pos && write_pos < read_pos + count {
-            return Err(Error::Io {
-                source: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "overlapping transfer ranges not supported",
-                ),
-            });
-        }
-
-        // Borrow the fields independently so they don't overlap
-        let file = self.file.as_mut().ok_or_else(|| Error::Io {
-            source: io::Error::new(io::ErrorKind::InvalidInput, "no file"),
-        })?;
-
-        let mut bytes_left = count as i64;
-        let mut current_read = read_pos;
-        let mut current_write = write_pos;
-
-        while bytes_left > 0 {
-            let bytes_to_read = min(bytes_left as usize, Self::TRANSFER_BUFFER_SIZE);
-            let slice = &mut self.transfer_buf[..bytes_to_read];
-
-            #[cfg(unix)]
-            {
-                file.read_exact_at(slice, current_read)?;
-                file.write_all_at(slice, current_write)?;
-            }
-
-            #[cfg(windows)]
-            {
-                // Use the file handle directly instead of `self.read()`
-                file.seek(SeekFrom::Start(current_read))?;
-                file.read_exact(slice)?;
-
-                file.seek(SeekFrom::Start(current_write))?;
-                file.write_all(slice)?;
-            }
-
-            current_read += bytes_to_read as u64;
-            current_write += bytes_to_read as u64;
-            bytes_left -= bytes_to_read as i64;
-        }
-
-        if self.sync_writes {
-            file.sync_data()?;
-        }
-
-        // Update the seek trackers
-        self.expected_seek = current_write;
-        self.last_seek = Some(current_write);
-
-        Ok(())
-    }
-
-    fn sync_set_len(&mut self, new_len: u64) -> io::Result<()> {
-        self.file_mut()?.set_len(new_len)?;
-        self.file_len = new_len;
-        self.file_mut()?.sync_all()
-    }
-
-    fn write_zeroes(&mut self, len: u64) -> Result<()> {
-        struct InnerWriter<'a>(&'a mut QueueFileInner);
-
-        impl<'a> Write for InnerWriter<'a> {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0
-                    .write(buf)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        io::copy(&mut io::repeat(0).take(len), &mut InnerWriter(self))?;
-        Ok(())
-    }
-
-    fn write_zero_chunks(&mut self, pos: u64, len: usize) -> Result<()> {
-        self.seek(pos);
-        self.write_zeroes(len as u64)
-    }
-
-    fn with_batched_backlink_rewrite_sync<T>(
-        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.with_deferred_sync(DeferredSyncPhase::BacklinkRewrite, f)
-    }
-
-    fn with_batched_clear_erase_sync<T>(
-        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.with_deferred_sync(DeferredSyncPhase::ClearErase, f)
-    }
-
-    fn with_batched_expansion_copy_sync<T>(
-        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.with_deferred_sync(DeferredSyncPhase::ExpansionCopy, f)
-    }
-
-    fn with_deferred_sync<T>(
-        &mut self, phase: DeferredSyncPhase, f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        let sync_writes = self.sync_writes;
-        let deferred_sync_phase = self.deferred_sync_phase;
-        self.sync_writes = false;
-        self.deferred_sync_phase = Some(phase);
-
-        let result = f(self);
-
-        self.deferred_sync_phase = deferred_sync_phase;
-        self.sync_writes = sync_writes;
-
-        let value = result?;
-
-        if sync_writes {
-            self.file_mut()?.sync_data()?;
-            maybe_inject_failpoint(match phase {
-                DeferredSyncPhase::ExpansionCopy => "v2_after_expansion_copy_flush",
-                DeferredSyncPhase::ClearErase => "clear_after_erase_flush",
-                DeferredSyncPhase::BacklinkRewrite => "v2_after_backlink_rewrite_flush",
-                DeferredSyncPhase::AppendBatch => "v2_after_add_batch_flush",
-            })?;
-        }
-
-        Ok(value)
-    }
-}
-
-// ── Element ───────────────────────────────────────────────────────────────────
-
-/// A lightweight descriptor for one element stored in the ring buffer.
-#[derive(Copy, Clone, Debug)]
-struct Element {
-    /// Logical offset of this element from the start of the data region.
-    pos: u64,
-    /// Payload length in bytes.
-    len: usize,
-    /// Sequence number (v2 only; 0 for v0/v1).
-    seq: u64,
-}
-
-impl Element {
-    const EMPTY: Self = Self { pos: 0, len: 0, seq: 0 };
-    const HEADER_LENGTH: usize = 4;
-
-    #[inline]
-    fn new(pos: u64, len: usize, seq: u64) -> Result<Self> {
-        ensure!(i64::try_from(pos).is_ok(), CorruptedFile {
-            msg: "element position must be less or equal to i64::MAX".to_string()
-        });
-        ensure!(i32::try_from(len).is_ok(), ElementTooBig);
-
-        Ok(Self { pos, len, seq })
-    }
-}
-
-// ── Iter ──────────────────────────────────────────────────────────────────────
 
 /// An iterator that yields the elements of a [`QueueFile`] from head to tail.
 #[derive(Debug)]
@@ -2495,7 +1218,6 @@ impl Iterator for Iter<'_> {
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        // Target absolute index is current index + n
         let target_idx = self.next_elem_index.checked_add(n)?;
 
         if target_idx >= self.queue_file.elem_cnt {
@@ -2503,7 +1225,6 @@ impl Iterator for Iter<'_> {
             return None;
         }
 
-        // Use cache to find the closest jump-point <= target_idx
         if let Some(cache_idx) = self.queue_file.cached_index_up_to(target_idx) {
             let (index, elem) = self.queue_file.cached_offsets[cache_idx];
             if index > self.next_elem_index {
@@ -2512,7 +1233,6 @@ impl Iterator for Iter<'_> {
             }
         }
 
-        // Now skip the remaining relative distance
         let remaining_to_skip = target_idx - self.next_elem_index;
         for _ in 0..remaining_to_skip {
             self.skip_next()?;
@@ -2523,8 +1243,6 @@ impl Iterator for Iter<'_> {
 }
 
 impl Iter<'_> {
-    /// Advance the iterator cursor by one element without reading the payload.
-    /// Used by [`Iterator::nth`] to skip elements cheaply.
     fn skip_next(&mut self) -> Option<()> {
         if self.next_elem_index >= self.queue_file.elem_cnt {
             return None;
@@ -2536,7 +1254,6 @@ impl Iter<'_> {
         Some(())
     }
 
-    /// Returns the next element as a slice into the iterator's internal buffer.
     pub fn borrowed_next(&mut self) -> Option<&[u8]> {
         if self.next_elem_index >= self.queue_file.elem_cnt {
             return None;
@@ -2544,7 +1261,6 @@ impl Iter<'_> {
 
         let current = self.queue_file.read_element_at(self.next_elem_pos).ok()?;
 
-        // Validate that the stated payload length physically fits inside the file's data region
         let max_possible_len = self.queue_file.ring().capacity();
         if current.len as u64 > max_possible_len {
             return None;
@@ -2558,7 +1274,6 @@ impl Iter<'_> {
         }
         ring.read_at(payload_start, &mut self.buffer[..current.len]).ok()?;
 
-        // For v2, validate footer.
         self.queue_file
             .format
             .validate_footer(&ring, payload_start, &current, &self.buffer[..current.len])
@@ -2617,27 +1332,21 @@ mod tests {
         let (mut inner, _p) = create_inner(100);
         let mut ring_mut = DataRingMut::new(&mut inner, 20);
 
-        // Simple write/read
         let data = b"hello world";
         ring_mut.write_at(10, data).unwrap();
         let mut buf = [0u8; 11];
         ring_mut.as_read_only().read_at(10, &mut buf).unwrap();
         assert_eq!(&buf, data);
 
-        // Wrapping write/read
-        // capacity is 80. logical pos 75, len 10. Should wrap 5 bytes to start.
         let data2 = b"wrapmebase";
         ring_mut.write_at(75, data2).unwrap();
         let mut buf2 = [0u8; 10];
         ring_mut.as_read_only().read_at(75, &mut buf2).unwrap();
         assert_eq!(&buf2, data2);
 
-        // Verify physical positions
         let mut phys_buf = [0u8; 5];
-        // 5 bytes at end of file (phys 95..100)
         ring_mut.inner.read_exact_at(95, &mut phys_buf).unwrap();
         assert_eq!(&phys_buf, b"wrapm");
-        // 5 bytes at start of data (phys 20..25)
         ring_mut.inner.read_exact_at(20, &mut phys_buf).unwrap();
         assert_eq!(&phys_buf, b"ebase");
     }
