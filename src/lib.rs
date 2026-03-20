@@ -55,6 +55,27 @@
 //!   [`QueueFile::sync_all`] to defer header writes across a series of additions.
 //! * Use [`QueueFile::set_cache_offset_policy`] to speed up random access through [`Iter::nth`]
 //!   on large queues.
+//!
+//! # Thread safety
+//!
+//! [`QueueFile`] is not thread-safe: it is neither `Send` nor `Sync`. File I/O operations on a
+//! shared object from multiple threads would corrupt the on-disk state and the in-memory queue
+//! bookkeeping. Wrap it in a synchronization primitive for cross-thread use, e.g.:
+//!
+//! ```ignore
+//! use std::sync::{Mutex, RwLock};
+//!
+//! // Safe: `Mutex` provides exclusive access
+//! let qf = Mutex::new(QueueFile::open("queue.qf")?);
+//! qf.lock().unwrap().add(b"data")?;
+//!
+//! // Safe: `RwLock` allows concurrent reads with exclusive writes
+//! let qf = RwLock::new(QueueFile::open("queue.qf")?);
+//! let data = qf.read().unwrap().peek()?;
+//! ```
+//!
+//! Opening the same queue file from multiple processes simultaneously is not supported and will
+//! result in data corruption.
 
 #![forbid(non_ascii_idents)]
 #![deny(
@@ -90,11 +111,13 @@
     clippy::too_many_lines
 )]
 
+use std::cell::Cell;
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions, rename};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::marker::PhantomData;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -955,6 +978,10 @@ pub struct QueueFile {
     cached_offsets: VecDeque<(usize, Element)>,
     /// Offset caching policy.
     offset_cache_kind: Option<OffsetCacheKind>,
+    /// Marker preventing `Send` and `Sync`. `QueueFile` is not thread-safe; wrap it in
+    /// `Mutex<QueueFile>` or `RwLock<QueueFile>` for cross-thread access.
+    #[allow(dead_code)]
+    _marker: PhantomData<Cell<()>>,
 }
 
 /// Policy controlling how element file-positions are cached to accelerate [`Iter::nth`].
@@ -996,7 +1023,6 @@ impl Drop for QueueFile {
 
 impl QueueFile {
     const INITIAL_LENGTH: u64 = 4096;
-    const ZEROES: [u8; 4096] = [0; 4096];
 
     #[inline]
     const fn data_start(&self) -> u64 {
@@ -1217,6 +1243,7 @@ impl QueueFile {
             skip_write_header_on_add: false,
             cached_offsets: VecDeque::new(),
             offset_cache_kind: None,
+            _marker: PhantomData,
         };
 
         if state.file_len < capacity {
@@ -1333,6 +1360,7 @@ impl QueueFile {
             skip_write_header_on_add: false,
             cached_offsets: VecDeque::new(),
             offset_cache_kind: None,
+            _marker: PhantomData,
         }
     }
 
@@ -1910,16 +1938,18 @@ impl QueueFile {
     }
 
     fn ring_erase_logical(&mut self, logical_pos: u64, n: usize) -> Result<()> {
-        let mut pos = logical_pos;
-        let mut len = n;
-        let mut ring = self.ring_mut();
+        let cap = self.ring_mut().capacity();
+        let mut pos = logical_pos % cap;
+        let mut remaining = n as u64;
 
-        while len > 0 {
-            let chunk_len = min(len, Self::ZEROES.len());
-            ring.write_at(pos, &Self::ZEROES[..chunk_len])?;
+        while remaining > 0 {
+            let phys = self.format.data_start() + pos;
+            let can_write = min(remaining, cap - pos);
+            self.inner.seek(phys);
+            self.inner.write_zeroes(can_write)?;
 
-            len -= chunk_len;
-            pos = ring.add(pos, chunk_len as u64);
+            remaining -= can_write;
+            pos = 0;
         }
 
         Ok(())
@@ -2279,11 +2309,20 @@ impl QueueFileInner {
     }
 
     fn transfer(&mut self, read_pos: u64, write_pos: u64, count: u64) -> Result<()> {
+        // Validate Overlap (Security/Soundness Check)
+        if write_pos > read_pos && write_pos < read_pos + count {
+            return Err(Error::Io {
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "overlapping transfer ranges not supported",
+                ),
+            });
+        }
+
         // Borrow the fields independently so they don't overlap
-        let file = self
-            .file
-            .as_mut()
-            .ok_or_else(|| Error::Io { source: io::Error::new(io::ErrorKind::Other, "no file") })?;
+        let file = self.file.as_mut().ok_or_else(|| Error::Io {
+            source: io::Error::new(io::ErrorKind::InvalidInput, "no file"),
+        })?;
 
         let mut bytes_left = count as i64;
         let mut current_read = read_pos;
@@ -2293,12 +2332,21 @@ impl QueueFileInner {
             let bytes_to_read = min(bytes_left as usize, Self::TRANSFER_BUFFER_SIZE);
             let slice = &mut self.transfer_buf[..bytes_to_read];
 
-            // Use the file handle directly instead of `self.read()`
-            file.seek(SeekFrom::Start(current_read))?;
-            file.read_exact(slice)?;
+            #[cfg(unix)]
+            {
+                file.read_exact_at(slice, current_read)?;
+                file.write_all_at(slice, current_write)?;
+            }
 
-            file.seek(SeekFrom::Start(current_write))?;
-            file.write_all(slice)?;
+            #[cfg(windows)]
+            {
+                // Use the file handle directly instead of `self.read()`
+                file.seek(SeekFrom::Start(current_read))?;
+                file.read_exact(slice)?;
+
+                file.seek(SeekFrom::Start(current_write))?;
+                file.write_all(slice)?;
+            }
 
             current_read += bytes_to_read as u64;
             current_write += bytes_to_read as u64;
@@ -2322,16 +2370,29 @@ impl QueueFileInner {
         self.file_mut()?.sync_all()
     }
 
-    fn write_zero_chunks(&mut self, mut pos: u64, mut len: usize) -> Result<()> {
-        while len > 0 {
-            let chunk_len = min(len, QueueFile::ZEROES.len());
-            self.seek(pos);
-            self.write(&QueueFile::ZEROES[..chunk_len])?;
-            pos += chunk_len as u64;
-            len -= chunk_len;
+    fn write_zeroes(&mut self, len: u64) -> Result<()> {
+        struct InnerWriter<'a>(&'a mut QueueFileInner);
+
+        impl<'a> Write for InnerWriter<'a> {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0
+                    .write(buf)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
 
+        io::copy(&mut io::repeat(0).take(len), &mut InnerWriter(self))?;
         Ok(())
+    }
+
+    fn write_zero_chunks(&mut self, pos: u64, len: usize) -> Result<()> {
+        self.seek(pos);
+        self.write_zeroes(len as u64)
     }
 
     fn with_batched_backlink_rewrite_sync<T>(
