@@ -885,11 +885,12 @@ impl QueueFile {
         let mut new_first = self.first;
         let mut remaining_to_skip = n;
 
-        let cached_idx = self.cached_index_up_to(n - 1);
-        if let Some(i) = cached_idx {
+        if let Some(i) = self.cached_index_up_to(n) {
             let (index, elem) = self.cached_offsets[i];
-            new_first = elem;
-            remaining_to_skip = n - index;
+            if index <= n {
+                new_first = elem;
+                remaining_to_skip = n - index;
+            }
         }
 
         for _ in 0..remaining_to_skip {
@@ -909,8 +910,8 @@ impl QueueFile {
 
         self.sync_header()?;
 
-        if let Some(i) = cached_idx {
-            self.cached_offsets.drain(..=i);
+        while matches!(self.cached_offsets.front(), Some((index, _)) if *index < n) {
+            self.cached_offsets.pop_front();
         }
         self.cached_offsets.iter_mut().for_each(|(i, _)| *i -= n);
 
@@ -1349,5 +1350,30 @@ mod tests {
         assert_eq!(&phys_buf, b"wrapm");
         ring_mut.inner.read_exact_at(20, &mut phys_buf).unwrap();
         assert_eq!(&phys_buf, b"ebase");
+    }
+
+    #[test]
+    fn remove_n_reindexes_cached_offsets_without_dropping_survivors() {
+        let path = auto_delete_path::AutoDeletePath::temp();
+        let mut qf = QueueFile::with_capacity(&path, 4096).unwrap();
+        qf.set_cache_offset_policy(Some(OffsetCacheKind::Linear { offset: 1 }));
+
+        for i in 0u8..8 {
+            qf.add(&[i]).unwrap();
+        }
+
+        assert_eq!(
+            qf.cached_offsets.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            (1..8).collect::<Vec<_>>()
+        );
+
+        qf.remove_n(3).unwrap();
+
+        assert_eq!(
+            qf.cached_offsets.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(qf.iter().map(|v| v[0]).collect::<Vec<_>>(), vec![3, 4, 5, 6, 7]);
+        assert_eq!(qf.iter().nth(2).map(|v| v[0]), Some(5));
     }
 }
