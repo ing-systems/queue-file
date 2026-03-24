@@ -669,6 +669,7 @@ impl QueueFile {
 
     // ── Cache helpers ─────────────────────────────────────────────────────────
 
+    #[inline]
     fn cache_last_offset_if_needed(&mut self, affected_items: usize) {
         if self.elem_cnt == 0 {
             return;
@@ -677,6 +678,7 @@ impl QueueFile {
         self.cache_elem_if_needed(self.elem_cnt - 1, self.last, affected_items);
     }
 
+    #[inline]
     fn snapshot_queue_state(&self) -> QueueStateSnapshot {
         QueueStateSnapshot {
             format: self.format,
@@ -688,6 +690,7 @@ impl QueueFile {
         }
     }
 
+    #[inline]
     fn restore_queue_state(&mut self, snapshot: QueueStateSnapshot) {
         self.format = snapshot.format;
         self.elem_cnt = snapshot.elem_cnt;
@@ -997,6 +1000,7 @@ impl QueueFile {
 
     // ── iter ──────────────────────────────────────────────────────────────────
 
+    #[inline]
     pub const fn iter(&self) -> Iter<'_> {
         Iter {
             buffer: Vec::new(),
@@ -1019,6 +1023,7 @@ impl QueueFile {
         DataRingMut::new(&mut self.inner, data_start)
     }
 
+    #[inline]
     fn read_element_at(&self, logical_pos: u64) -> Result<Element> {
         self.format.read_element(&self.ring(), logical_pos)
     }

@@ -15,6 +15,7 @@ pub enum HeaderSlot {
 }
 
 impl HeaderSlot {
+    #[inline]
     pub const fn toggle(self) -> Self {
         match self {
             Self::A => Self::B,
@@ -22,6 +23,7 @@ impl HeaderSlot {
         }
     }
 
+    #[inline]
     pub const fn offset(self) -> u64 {
         match self {
             Self::A => V2_SLOT_A_OFFSET,
@@ -40,10 +42,12 @@ pub struct SlotData {
     pub next_sequence_number: u64,
 }
 
+#[inline]
 pub fn crc32(data: &[u8]) -> u32 {
     crc32fast::hash(data)
 }
 
+#[inline]
 pub fn compute_slot_crc(slot_bytes: &[u8; V2_SLOT_LEN]) -> u32 {
     crc32(&slot_bytes[..52])
 }

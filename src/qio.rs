@@ -18,6 +18,7 @@ pub enum DeferredSyncPhase {
 }
 
 impl DeferredSyncPhase {
+    #[inline]
     pub const fn failpoint_name(self) -> &'static str {
         match self {
             Self::ExpansionCopy => "v2_expansion_copy_per_write_sync",
@@ -203,18 +204,21 @@ impl QueueFileInner {
         self.write_zeroes(len as u64)
     }
 
+    #[inline]
     pub fn with_batched_backlink_rewrite_sync<T>(
         &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
         self.with_deferred_sync(DeferredSyncPhase::BacklinkRewrite, f)
     }
 
+    #[inline]
     pub fn with_batched_clear_erase_sync<T>(
         &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
         self.with_deferred_sync(DeferredSyncPhase::ClearErase, f)
     }
 
+    #[inline]
     pub fn with_batched_expansion_copy_sync<T>(
         &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
@@ -257,6 +261,7 @@ pub struct DataRing<'a> {
 }
 
 impl<'a> DataRing<'a> {
+    #[inline]
     pub const fn new(inner: &'a QueueFileInner, data_start: u64) -> Self {
         Self { inner, data_start }
     }
@@ -310,6 +315,7 @@ pub struct DataRingMut<'a> {
 }
 
 impl<'a> DataRingMut<'a> {
+    #[inline]
     pub fn new(inner: &'a mut QueueFileInner, data_start: u64) -> Self {
         Self { inner, data_start }
     }

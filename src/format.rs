@@ -128,6 +128,7 @@ impl FormatState {
         }
     }
 
+    #[inline]
     pub fn commit_header(
         &mut self, inner: &mut QueueFileInner, metadata: QueueMetadata,
     ) -> Result<()> {
@@ -197,6 +198,7 @@ impl FormatState {
 
     #[allow(clippy::unused_self)]
     #[allow(clippy::unused_self)]
+    #[inline]
     pub fn read_element(&self, ring: &DataRing<'_>, logical_pos: u64) -> Result<Element> {
         match self {
             Self::Legacy | Self::V1 => {
@@ -259,6 +261,7 @@ impl FormatState {
 
     #[allow(clippy::unused_self)]
     #[allow(clippy::unused_self)]
+    #[inline]
     pub fn write_element(
         &self, ring: &mut DataRingMut<'_>, logical_pos: u64, payload: &[u8], seq: u64,
         prev_logical_pos: Option<u64>,
@@ -382,6 +385,7 @@ impl FormatState {
         Ok(positions)
     }
 
+    #[inline]
     fn read_next_element(&self, ring: &DataRingMut<'_>, cur: &Element) -> Result<Element> {
         let next_pos = ring.add(cur.pos, self.elem_span(cur.len));
         let next_header = self.validate_v2_element_header(&ring.as_read_only(), next_pos)?;
@@ -390,6 +394,7 @@ impl FormatState {
 
     #[allow(clippy::unused_self)]
     #[allow(clippy::unused_self)]
+    #[inline]
     pub fn validate_footer(
         &self, ring: &DataRing<'_>, payload_start: u64, elem: &Element, payload: &[u8],
     ) -> Result<()> {
@@ -521,6 +526,7 @@ fn encode_v2_slot(
     Ok(build_slot_bytes(&slot_data))
 }
 
+#[inline]
 pub fn read_slot(inner: &QueueFileInner, offset: u64) -> Result<[u8; V2_SLOT_LEN]> {
     let mut buf = [0u8; V2_SLOT_LEN];
     inner.read_exact_at(offset, &mut buf)?;
@@ -572,10 +578,12 @@ pub fn parse_legacy_header(buf: &mut bytes::BytesMut) -> Result<(u64, usize, u64
     Ok((file_len, elem_cnt, first_pos, last_pos))
 }
 
+#[inline]
 fn compute_elem_header_crc(hdr_bytes: &[u8; V2_ELEM_HDR_LEN]) -> u32 {
     crc32(&hdr_bytes[..24])
 }
 
+#[inline]
 fn compute_elem_footer_crc(payload: &[u8], ftr_bytes_0_to_11: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(payload);
@@ -649,6 +657,7 @@ pub fn validate_v2_slot_data(slot: &SlotData, real_file_len: u64) -> Result<()> 
     Ok(())
 }
 
+#[inline]
 fn validate_slot_bounds(pos: u64, file_length: u64, name: &str) -> Result<()> {
     ensure!(pos >= V2_DATA_START && pos < file_length, Error::CorruptedFile {
         msg: format!(

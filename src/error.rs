@@ -44,6 +44,7 @@ macro_rules! ensure {
     };
 }
 
+#[inline]
 pub fn maybe_inject_failpoint(name: &str) -> Result<()> {
     if std::env::var("QUEUE_FILE_FAILPOINT").ok().as_deref() == Some(name) {
         return Err(Error::CorruptedFile { msg: format!("injected failpoint: {name}") });
