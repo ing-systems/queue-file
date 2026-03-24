@@ -337,32 +337,35 @@ impl FormatState {
         let positions = self.collect_element_positions(ring, first, elem_cnt)?;
 
         let moved_offset = plan.orig_file_len - ring.data_start;
+        let boundary = plan.end_of_last_elem - ring.data_start;
 
         ring.inner.with_batched_backlink_rewrite_sync(|inner| {
             let mut ring = DataRingMut::new(inner, ring.data_start);
             for elem in &positions {
-                let elem_pos = elem.pos;
-                let mut hdr = [0u8; V2_ELEM_HDR_LEN];
-                ring.as_read_only().read_at(elem_pos, &mut hdr)?;
-
-                let prev_pos =
-                    self.validate_v2_element_header(&ring.as_read_only(), elem_pos)?.prev_pos;
-
-                if prev_pos < plan.end_of_last_elem - ring.data_start {
-                    let new_prev_pos = prev_pos + moved_offset;
-
-                    let new_prev_bytes = (new_prev_pos as i64).to_be_bytes();
-                    hdr[12..20].copy_from_slice(&new_prev_bytes);
-
-                    let new_crc = compute_elem_header_crc(&hdr);
-                    hdr[24..28].copy_from_slice(&new_crc.to_be_bytes());
-
-                    ring.write_at(elem_pos, &hdr)?;
-                }
+                self.maybe_rewrite_backlink(&mut ring, elem.pos, moved_offset, boundary)?;
             }
-
             Ok(())
         })
+    }
+
+    fn maybe_rewrite_backlink(
+        &self, ring: &mut DataRingMut<'_>, elem_pos: u64, moved_offset: u64, boundary: u64,
+    ) -> Result<()> {
+        let mut hdr = [0u8; V2_ELEM_HDR_LEN];
+        ring.as_read_only().read_at(elem_pos, &mut hdr)?;
+
+        let prev_pos = self.validate_v2_element_header(&ring.as_read_only(), elem_pos)?.prev_pos;
+
+        if prev_pos < boundary {
+            let new_prev_pos = prev_pos + moved_offset;
+            hdr[12..20].copy_from_slice(&(new_prev_pos as i64).to_be_bytes());
+
+            let new_crc = compute_elem_header_crc(&hdr);
+            hdr[24..28].copy_from_slice(&new_crc.to_be_bytes());
+
+            ring.write_at(elem_pos, &hdr)?;
+        }
+        Ok(())
     }
 
     fn collect_element_positions(
@@ -372,14 +375,17 @@ impl FormatState {
         let mut cur = first;
         for _ in 0..elem_cnt {
             positions.push(cur);
-            let next_pos = ring.add(cur.pos, V2_ELEM_OVERHEAD + cur.len as u64);
             if positions.len() < elem_cnt {
-                let next_header =
-                    self.validate_v2_element_header(&ring.as_read_only(), next_pos)?;
-                cur = Element { pos: next_pos, len: next_header.payload_len, seq: next_header.seq };
+                cur = self.read_next_element(ring, &cur)?;
             }
         }
         Ok(positions)
+    }
+
+    fn read_next_element(&self, ring: &DataRingMut<'_>, cur: &Element) -> Result<Element> {
+        let next_pos = ring.add(cur.pos, self.elem_span(cur.len));
+        let next_header = self.validate_v2_element_header(&ring.as_read_only(), next_pos)?;
+        Ok(Element { pos: next_pos, len: next_header.payload_len, seq: next_header.seq })
     }
 
     #[allow(clippy::unused_self)]

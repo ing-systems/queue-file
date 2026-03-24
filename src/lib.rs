@@ -134,7 +134,7 @@ pub(crate) use format::{
 };
 pub(crate) use header::{
     SlotData, V2_INITIAL_LEN, V2_MAGIC, V2_SLOT_A_OFFSET, V2_SLOT_B_OFFSET, V2_SLOT_LEN,
-    VERSIONED_HEADER, build_slot_bytes,
+    build_slot_bytes,
 };
 pub(crate) use qio::{DataRing, DataRingMut, DeferredSyncPhase, QueueFileInner};
 
@@ -232,40 +232,43 @@ impl QueueFile {
                 .open(&tmp_path)?;
 
             if force_legacy {
-                file.set_len(capacity)?;
-
-                let mut buf = BytesMut::with_capacity(16);
-                if force_legacy {
-                    buf.put_u32(capacity as u32);
-                } else {
-                    buf.put_u32(VERSIONED_HEADER);
-                    buf.put_u64(capacity);
-                }
-                file.write_all(buf.as_ref())?;
+                Self::init_legacy_file(&mut file, capacity)?;
             } else {
-                file.set_len(V2_INITIAL_LEN)?;
-
-                let slot_a = SlotData {
-                    file_length: V2_INITIAL_LEN,
-                    element_count: 0,
-                    first_position: 0,
-                    last_position: 0,
-                    generation: 1,
-                    next_sequence_number: 1,
-                };
-                let slot_b = SlotData { generation: 0, ..slot_a };
-
-                let bytes_a = build_slot_bytes(&slot_a);
-                file.seek(SeekFrom::Start(V2_SLOT_A_OFFSET))?;
-                file.write_all(&bytes_a)?;
-
-                let bytes_b = build_slot_bytes(&slot_b);
-                file.seek(SeekFrom::Start(V2_SLOT_B_OFFSET))?;
-                file.write_all(&bytes_b)?;
+                Self::init_v2_file(&mut file)?;
             }
         }
 
         rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    fn init_legacy_file(file: &mut File, capacity: u64) -> Result<()> {
+        file.set_len(capacity)?;
+        let mut buf = BytesMut::with_capacity(16);
+        buf.put_u32(capacity as u32);
+        file.write_all(buf.as_ref())?;
+        Ok(())
+    }
+
+    fn init_v2_file(file: &mut File) -> Result<()> {
+        file.set_len(V2_INITIAL_LEN)?;
+
+        let slot_a = SlotData {
+            file_length: V2_INITIAL_LEN,
+            element_count: 0,
+            first_position: 0,
+            last_position: 0,
+            generation: 1,
+            next_sequence_number: 1,
+        };
+        let slot_b = SlotData { generation: 0, ..slot_a };
+
+        file.seek(SeekFrom::Start(V2_SLOT_A_OFFSET))?;
+        file.write_all(&build_slot_bytes(&slot_a))?;
+
+        file.seek(SeekFrom::Start(V2_SLOT_B_OFFSET))?;
+        file.write_all(&build_slot_bytes(&slot_b))?;
+
         Ok(())
     }
 

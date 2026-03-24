@@ -17,6 +17,17 @@ pub enum DeferredSyncPhase {
     AppendBatch,
 }
 
+impl DeferredSyncPhase {
+    pub const fn failpoint_name(self) -> &'static str {
+        match self {
+            Self::ExpansionCopy => "v2_expansion_copy_per_write_sync",
+            Self::ClearErase => "clear_erase_per_write_sync",
+            Self::BacklinkRewrite => "v2_backlink_rewrite_per_write_sync",
+            Self::AppendBatch => "v2_add_batch_per_write_sync",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct QueueFileInner {
     pub file: Option<File>,
@@ -74,20 +85,7 @@ impl QueueFileInner {
 
         if self.sync_writes {
             if let Some(phase) = self.deferred_sync_phase {
-                match phase {
-                    DeferredSyncPhase::ExpansionCopy => {
-                        maybe_inject_failpoint("v2_expansion_copy_per_write_sync")?;
-                    }
-                    DeferredSyncPhase::ClearErase => {
-                        maybe_inject_failpoint("clear_erase_per_write_sync")?;
-                    }
-                    DeferredSyncPhase::BacklinkRewrite => {
-                        maybe_inject_failpoint("v2_backlink_rewrite_per_write_sync")?;
-                    }
-                    DeferredSyncPhase::AppendBatch => {
-                        maybe_inject_failpoint("v2_add_batch_per_write_sync")?;
-                    }
-                }
+                maybe_inject_failpoint(phase.failpoint_name())?;
             }
             self.file_mut()?.sync_data()?;
         }
