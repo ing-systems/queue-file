@@ -140,45 +140,59 @@ impl FormatState {
 
         match self {
             Self::Legacy | Self::V1 => {
-                let bytes = if matches!(self, Self::V1) {
-                    encode_v1_header(metadata.file_len, metadata.elem_cnt, first_phys, last_phys)?
-                        .to_vec()
-                } else {
-                    encode_legacy_header(
-                        metadata.file_len,
-                        metadata.elem_cnt,
-                        first_phys,
-                        last_phys,
-                    )?
-                    .to_vec()
-                };
-
-                inner.seek(0);
-                inner.write(&bytes)
+                self.commit_legacy_v1_header(inner, &metadata, first_phys, last_phys)
             }
-            Self::V2 { active_slot, generation, next_seq } => {
-                let next_slot = active_slot.toggle();
-
-                let slot_bytes = encode_v2_slot(
-                    metadata.file_len,
-                    metadata.elem_cnt,
-                    first_phys,
-                    last_phys,
-                    *generation + 1,
-                    *next_seq,
-                )?;
-
-                let offset = next_slot.offset();
-
-                inner.seek(offset);
-                inner.write(&slot_bytes)?;
-
-                *generation += 1;
-                *active_slot = next_slot;
-
-                Ok(())
-            }
+            Self::V2 { active_slot, generation, next_seq } => Self::commit_v2_header(
+                inner,
+                &metadata,
+                first_phys,
+                last_phys,
+                active_slot,
+                generation,
+                *next_seq,
+            ),
         }
+    }
+
+    fn commit_legacy_v1_header(
+        &self, inner: &mut QueueFileInner, metadata: &QueueMetadata, first_phys: u64,
+        last_phys: u64,
+    ) -> Result<()> {
+        let bytes = if matches!(self, Self::V1) {
+            encode_v1_header(metadata.file_len, metadata.elem_cnt, first_phys, last_phys)?.to_vec()
+        } else {
+            encode_legacy_header(metadata.file_len, metadata.elem_cnt, first_phys, last_phys)?
+                .to_vec()
+        };
+
+        inner.seek(0);
+        inner.write(&bytes)
+    }
+
+    fn commit_v2_header(
+        inner: &mut QueueFileInner, metadata: &QueueMetadata, first_phys: u64, last_phys: u64,
+        active_slot: &mut HeaderSlot, generation: &mut u64, next_seq: u64,
+    ) -> Result<()> {
+        let next_slot = active_slot.toggle();
+
+        let slot_bytes = encode_v2_slot(
+            metadata.file_len,
+            metadata.elem_cnt,
+            first_phys,
+            last_phys,
+            *generation + 1,
+            next_seq,
+        )?;
+
+        let offset = next_slot.offset();
+
+        inner.seek(offset);
+        inner.write(&slot_bytes)?;
+
+        *generation += 1;
+        *active_slot = next_slot;
+
+        Ok(())
     }
 
     #[allow(clippy::unused_self)]
@@ -320,17 +334,7 @@ impl FormatState {
     pub fn rewrite_v2_backlinks_after_expansion(
         &self, ring: &mut DataRingMut<'_>, plan: &ExpansionPlan, first: Element, elem_cnt: usize,
     ) -> Result<()> {
-        let mut positions: Vec<Element> = Vec::with_capacity(elem_cnt);
-        let mut cur = first;
-        for _ in 0..elem_cnt {
-            positions.push(cur);
-            let next_pos = ring.add(cur.pos, V2_ELEM_OVERHEAD + cur.len as u64);
-            if positions.len() < elem_cnt {
-                let next_header =
-                    self.validate_v2_element_header(&ring.as_read_only(), next_pos)?;
-                cur = Element { pos: next_pos, len: next_header.payload_len, seq: next_header.seq };
-            }
-        }
+        let positions = self.collect_element_positions(ring, first, elem_cnt)?;
 
         let moved_offset = plan.orig_file_len - ring.data_start;
 
@@ -359,6 +363,23 @@ impl FormatState {
 
             Ok(())
         })
+    }
+
+    fn collect_element_positions(
+        &self, ring: &DataRingMut<'_>, first: Element, elem_cnt: usize,
+    ) -> Result<Vec<Element>> {
+        let mut positions: Vec<Element> = Vec::with_capacity(elem_cnt);
+        let mut cur = first;
+        for _ in 0..elem_cnt {
+            positions.push(cur);
+            let next_pos = ring.add(cur.pos, V2_ELEM_OVERHEAD + cur.len as u64);
+            if positions.len() < elem_cnt {
+                let next_header =
+                    self.validate_v2_element_header(&ring.as_read_only(), next_pos)?;
+                cur = Element { pos: next_pos, len: next_header.payload_len, seq: next_header.seq };
+            }
+        }
+        Ok(positions)
     }
 
     #[allow(clippy::unused_self)]
@@ -616,24 +637,17 @@ pub fn validate_v2_slot_data(slot: &SlotData, real_file_len: u64) -> Result<()> 
         ensure!(slot.first_position != 0 && slot.last_position != 0, Error::CorruptedFile {
             msg: "v2 non-empty queue has zero pointer".to_string()
         });
-        ensure!(
-            slot.first_position >= V2_DATA_START && slot.first_position < slot.file_length,
-            Error::CorruptedFile {
-                msg: format!(
-                    "v2 first_position {} out of range [data_start={}, file_length={})",
-                    slot.first_position, V2_DATA_START, slot.file_length
-                )
-            }
-        );
-        ensure!(
-            slot.last_position >= V2_DATA_START && slot.last_position < slot.file_length,
-            Error::CorruptedFile {
-                msg: format!(
-                    "v2 last_position {} out of range [data_start={}, file_length={})",
-                    slot.last_position, V2_DATA_START, slot.file_length
-                )
-            }
-        );
+        validate_slot_bounds(slot.first_position, slot.file_length, "first_position")?;
+        validate_slot_bounds(slot.last_position, slot.file_length, "last_position")?;
     }
+    Ok(())
+}
+
+fn validate_slot_bounds(pos: u64, file_length: u64, name: &str) -> Result<()> {
+    ensure!(pos >= V2_DATA_START && pos < file_length, Error::CorruptedFile {
+        msg: format!(
+            "v2 {name} {pos} out of range [data_start={V2_DATA_START}, file_length={file_length})"
+        )
+    });
     Ok(())
 }

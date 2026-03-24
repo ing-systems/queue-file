@@ -732,6 +732,29 @@ fn v2_reopens_relocated_pre_add_queue_after_cleanup_before_final_add_commit() {
 }
 
 #[test]
+fn v2_reopens_pre_add_queue_after_wrapped_expansion_and_append_flush_without_overwrite() {
+    let _lock = lock_failpoint_env();
+    let p = temp_path();
+    let mut qf = QueueFile::open(&p).unwrap();
+    qf.set_overwrite_on_remove(false);
+    fill_wrapped_queue_until_next_add_expands(&mut qf);
+
+    let expected: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let old_file_len = qf.file_len();
+
+    let failpoint = FailpointGuard::set("v2_after_add_batch_flush");
+    let err = qf.add(&999u32.to_be_bytes()).unwrap_err().to_string();
+    drop(failpoint);
+    assert!(err.contains("v2_after_add_batch_flush"), "unexpected error: {err}");
+    assert!(qf.file_len() > old_file_len, "test setup should force a wrapped expansion");
+    drop(qf);
+
+    let reopened = QueueFile::open(&p).unwrap();
+    let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
+    assert_eq!(items, expected, "reopen should fall back to the pre-add queue state");
+}
+
+#[test]
 fn v2_expansion_copy_batch_suppresses_per_chunk_syncs() {
     let _lock = lock_failpoint_env();
     let p = temp_path();

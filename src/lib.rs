@@ -406,28 +406,31 @@ impl QueueFile {
 
     fn open_internal_full<P: AsRef<Path>>(
         path: P, overwrite_on_remove: bool, force_legacy: bool, capacity: u64,
-        allow_migration: bool,
+        mut allow_migration: bool,
     ) -> Result<Self> {
         let path = path.as_ref();
 
-        Self::ensure_queue_file_exists(path, force_legacy, capacity)?;
+        loop {
+            Self::ensure_queue_file_exists(path, force_legacy, capacity)?;
 
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        let real_file_len = file.metadata()?.len();
+            let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+            let real_file_len = file.metadata()?.len();
 
-        if Self::detect_v2_magic(&mut file, real_file_len, force_legacy)? {
-            return Self::open_v2(file, real_file_len, capacity, overwrite_on_remove, path);
+            if Self::detect_v2_magic(&mut file, real_file_len, force_legacy)? {
+                return Self::open_v2(file, real_file_len, capacity, overwrite_on_remove, path);
+            }
+
+            let state = Self::parse_legacy_or_v1_header(&mut file, real_file_len, force_legacy)?;
+
+            if allow_migration && !force_legacy {
+                drop(file);
+                Self::migrate_to_v2(path)?;
+                allow_migration = false;
+                continue;
+            }
+
+            return Self::build_legacy_queue_file(file, state, capacity, overwrite_on_remove);
         }
-
-        let state = Self::parse_legacy_or_v1_header(&mut file, real_file_len, force_legacy)?;
-
-        if allow_migration && !force_legacy {
-            drop(file);
-            Self::migrate_to_v2(path)?;
-            return Self::open_internal_full(path, overwrite_on_remove, false, capacity, false);
-        }
-
-        Self::build_legacy_queue_file(file, state, capacity, overwrite_on_remove)
     }
 
     fn open_v2(
@@ -522,47 +525,58 @@ impl QueueFile {
         let mut cur_logical_pos = last_logical_pos;
 
         for step in 0..elem_cnt {
-            let current_header =
-                self.format.validate_v2_element_header(&self.ring(), cur_logical_pos)?;
-
             let expected_seq =
                 last_seq.checked_sub(step as u64).ok_or_else(|| Error::CorruptedFile {
                     msg: format!(
                         "v2 recovery: tail seq {last_seq} too small for element_count {elem_cnt}"
                     ),
                 })?;
-            ensure!(current_header.seq == expected_seq, Error::CorruptedFile {
-                msg: format!("v2 recovery: seq {} != expected {expected_seq}", current_header.seq)
-            });
 
-            let current = Element {
-                pos: cur_logical_pos,
-                len: current_header.payload_len,
-                seq: current_header.seq,
-            };
+            let (current, next_pos) =
+                self.read_prev_v2_header_pos(cur_logical_pos, expected_seq, step, elem_cnt)?;
 
             if step + 1 == elem_cnt {
                 return Ok(current);
             }
 
-            ensure!(current_header.prev_pos != 0, Error::CorruptedFile {
-                msg: format!("v2 recovery: walked {} elements but expected {}", step + 1, elem_cnt)
-            });
-
-            let data_start = self.data_start();
-            cur_logical_pos = current_header.prev_pos.checked_sub(data_start).ok_or_else(|| {
-                Error::CorruptedFile {
-                    msg: format!(
-                        "v2 recovery: prev_pos {} < data_start {}",
-                        current_header.prev_pos, data_start
-                    ),
-                }
-            })?;
+            cur_logical_pos = next_pos;
         }
 
         Err(Error::CorruptedFile {
             msg: "v2 recovery: could not walk expected live element count".to_string(),
         })
+    }
+
+    fn read_prev_v2_header_pos(
+        &self, pos: u64, expected_seq: u64, step: usize, elem_cnt: usize,
+    ) -> Result<(Element, u64)> {
+        let current_header = self.format.validate_v2_element_header(&self.ring(), pos)?;
+
+        ensure!(current_header.seq == expected_seq, Error::CorruptedFile {
+            msg: format!("v2 recovery: seq {} != expected {expected_seq}", current_header.seq)
+        });
+
+        let current = Element { pos, len: current_header.payload_len, seq: current_header.seq };
+
+        if step + 1 == elem_cnt {
+            return Ok((current, 0));
+        }
+
+        ensure!(current_header.prev_pos != 0, Error::CorruptedFile {
+            msg: format!("v2 recovery: walked {} elements but expected {}", step + 1, elem_cnt)
+        });
+
+        let data_start = self.data_start();
+        let next_pos = current_header.prev_pos.checked_sub(data_start).ok_or_else(|| {
+            Error::CorruptedFile {
+                msg: format!(
+                    "v2 recovery: prev_pos {} < data_start {}",
+                    current_header.prev_pos, data_start
+                ),
+            }
+        })?;
+
+        Ok((current, next_pos))
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -684,31 +698,42 @@ impl QueueFile {
         debug_assert!(index <= self.elem_cnt);
         debug_assert!(index + 1 >= affected_items);
 
-        let need_to_cache = self.offset_cache_kind.map_or(false, |kind| match kind {
-            OffsetCacheKind::Linear { offset } => {
+        let need_to_cache = match self.offset_cache_kind {
+            Some(OffsetCacheKind::Linear { offset }) => {
                 let last_cached_index = self.cached_offsets.back().map_or(0, |(idx, _)| *idx);
-                index.saturating_sub(last_cached_index) >= offset
+                Self::should_cache_linear(index, offset, last_cached_index)
             }
-            OffsetCacheKind::Quadratic => {
-                let x = (index as f64).sqrt() as usize;
-                x > 1 && (index + 1 - affected_items..=index).contains(&(x * x))
-            }
-        });
+            Some(OffsetCacheKind::Quadratic) => Self::should_cache_quadratic(index, affected_items),
+            None => false,
+        };
 
-        if need_to_cache {
-            if let Some((last_cached_index, last_cached_elem)) = self.cached_offsets.back() {
-                if *last_cached_index >= index {
-                    if *last_cached_index == index {
-                        debug_assert_eq!(last_cached_elem.pos, elem.pos);
-                        debug_assert_eq!(last_cached_elem.len, elem.len);
-                    }
-
-                    return;
-                }
-            }
-
-            self.cached_offsets.push_back((index, elem));
+        if !need_to_cache {
+            return;
         }
+
+        if let Some(&(last_cached_index, last_cached_elem)) = self.cached_offsets.back() {
+            if last_cached_index >= index {
+                if last_cached_index == index {
+                    debug_assert_eq!(last_cached_elem.pos, elem.pos);
+                    debug_assert_eq!(last_cached_elem.len, elem.len);
+                }
+
+                return;
+            }
+        }
+
+        self.cached_offsets.push_back((index, elem));
+    }
+
+    #[inline]
+    const fn should_cache_linear(index: usize, offset: usize, last_cached_index: usize) -> bool {
+        index.saturating_sub(last_cached_index) >= offset
+    }
+
+    #[inline]
+    fn should_cache_quadratic(index: usize, affected_items: usize) -> bool {
+        let x = (index as f64).sqrt() as usize;
+        x > 1 && (index + 1 - affected_items..=index).contains(&(x * x))
     }
 
     #[inline]
@@ -773,16 +798,7 @@ impl QueueFile {
         match result {
             Ok(count) => {
                 if count != 0 {
-                    let next_seq = self.format.next_seq();
-                    if next_seq != 0 {
-                        self.format.set_next_seq(next_seq + count as u64);
-                    }
-
-                    if !self.skip_write_header_on_add {
-                        self.sync_header()?;
-                    }
-
-                    self.cache_last_offset_if_needed(count);
+                    self.finalize_append(count)?;
                 }
                 Ok(())
             }
@@ -791,6 +807,20 @@ impl QueueFile {
                 Err(err)
             }
         }
+    }
+
+    fn finalize_append(&mut self, count: usize) -> Result<()> {
+        let next_seq = self.format.next_seq();
+        if next_seq != 0 {
+            self.format.set_next_seq(next_seq + count as u64);
+        }
+
+        if !self.skip_write_header_on_add {
+            self.sync_header()?;
+        }
+
+        self.cache_last_offset_if_needed(count);
+        Ok(())
     }
 
     fn append_single_element(&mut self, buf: &[u8], base_seq: u64, count: usize) -> Result<()> {
@@ -882,6 +912,29 @@ impl QueueFile {
 
         let old_first_pos = self.first.pos;
 
+        let new_first = self.skip_elements_from(n)?;
+
+        let erase_total_len = if self.overwrite_on_remove {
+            self.ring().distance(old_first_pos, new_first.pos) as usize
+        } else {
+            0
+        };
+
+        self.elem_cnt -= n;
+        self.first = new_first;
+
+        self.sync_header()?;
+
+        self.drop_cached_offsets_up_to(n);
+
+        if self.overwrite_on_remove {
+            self.ring_erase_logical(old_first_pos, erase_total_len)?;
+        }
+
+        Ok(())
+    }
+
+    fn skip_elements_from(&self, n: usize) -> Result<Element> {
         let mut new_first = self.first;
         let mut remaining_to_skip = n;
 
@@ -899,27 +952,14 @@ impl QueueFile {
             new_first = self.read_element_at(next_pos)?;
         }
 
-        let erase_total_len = if self.overwrite_on_remove {
-            self.ring().distance(old_first_pos, new_first.pos) as usize
-        } else {
-            0
-        };
+        Ok(new_first)
+    }
 
-        self.elem_cnt -= n;
-        self.first = new_first;
-
-        self.sync_header()?;
-
+    fn drop_cached_offsets_up_to(&mut self, n: usize) {
         while matches!(self.cached_offsets.front(), Some((index, _)) if *index < n) {
             self.cached_offsets.pop_front();
         }
         self.cached_offsets.iter_mut().for_each(|(i, _)| *i -= n);
-
-        if self.overwrite_on_remove {
-            self.ring_erase_logical(old_first_pos, erase_total_len)?;
-        }
-
-        Ok(())
     }
 
     // ── clear ─────────────────────────────────────────────────────────────────
@@ -1070,13 +1110,7 @@ impl QueueFile {
         }
 
         let orig_file_len = self.file_len();
-        let (end_of_last_elem, wraps) = if self.elem_cnt > 0 {
-            let ring = self.ring();
-            let end = ring.add(self.last.pos, self.format.elem_span(self.last.len));
-            (end, end <= self.first.pos)
-        } else {
-            (0, false)
-        };
+        let (end_of_last_elem, wraps) = self.calculate_tail_metrics();
         let moved_count = if wraps { end_of_last_elem } else { 0 };
 
         Some(ExpansionPlan {
@@ -1086,6 +1120,16 @@ impl QueueFile {
             wraps,
             moved_count,
         })
+    }
+
+    const fn calculate_tail_metrics(&self) -> (u64, bool) {
+        if self.elem_cnt > 0 {
+            let ring = self.ring();
+            let end = ring.add(self.last.pos, self.format.elem_span(self.last.len));
+            (end, end <= self.first.pos)
+        } else {
+            (0, false)
+        }
     }
 
     fn relocate_wrapped_data(&mut self, plan: ExpansionPlan) -> Result<()> {
@@ -1226,13 +1270,7 @@ impl Iterator for Iter<'_> {
             return None;
         }
 
-        if let Some(cache_idx) = self.queue_file.cached_index_up_to(target_idx) {
-            let (index, elem) = self.queue_file.cached_offsets[cache_idx];
-            if index > self.next_elem_index {
-                self.next_elem_index = index;
-                self.next_elem_pos = elem.pos;
-            }
-        }
+        self.jump_to_cache_if_closer(target_idx);
 
         let remaining_to_skip = target_idx - self.next_elem_index;
         for _ in 0..remaining_to_skip {
@@ -1244,6 +1282,16 @@ impl Iterator for Iter<'_> {
 }
 
 impl Iter<'_> {
+    fn jump_to_cache_if_closer(&mut self, target_idx: usize) {
+        if let Some(cache_idx) = self.queue_file.cached_index_up_to(target_idx) {
+            let (index, elem) = self.queue_file.cached_offsets[cache_idx];
+            if index > self.next_elem_index {
+                self.next_elem_index = index;
+                self.next_elem_pos = elem.pos;
+            }
+        }
+    }
+
     fn skip_next(&mut self) -> Option<()> {
         if self.next_elem_index >= self.queue_file.elem_cnt {
             return None;
@@ -1369,10 +1417,9 @@ mod tests {
 
         qf.remove_n(3).unwrap();
 
-        assert_eq!(
-            qf.cached_offsets.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4]
-        );
+        assert_eq!(qf.cached_offsets.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(), vec![
+            0, 1, 2, 3, 4
+        ]);
         assert_eq!(qf.iter().map(|v| v[0]).collect::<Vec<_>>(), vec![3, 4, 5, 6, 7]);
         assert_eq!(qf.iter().nth(2).map(|v| v[0]), Some(5));
     }
