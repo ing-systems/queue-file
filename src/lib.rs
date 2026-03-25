@@ -431,17 +431,6 @@ impl QueueFile {
         Ok(self.inner.file_mut()?.sync_all()?)
     }
 
-    // ── Cache helpers ─────────────────────────────────────────────────────────
-
-    #[inline]
-    fn cache_last_offset_if_needed(&self, affected_items: usize) {
-        if self.elem_cnt == 0 {
-            return;
-        }
-
-        self.cache_elem_if_needed(self.elem_cnt - 1, self.last, affected_items);
-    }
-
     #[inline]
     fn snapshot_queue_state(&self) -> QueueStateSnapshot {
         QueueStateSnapshot {
@@ -469,8 +458,8 @@ impl QueueFile {
     }
 
     #[inline]
-    fn cached_index_up_to(&self, i: usize) -> Option<usize> {
-        self.cache.cached_index_up_to(i)
+    fn cached_offset_up_to(&self, i: usize) -> Option<(usize, Element)> {
+        self.cache.cached_offset_up_to(i)
     }
 
     fn with_batched_append_sync<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
@@ -549,7 +538,6 @@ impl QueueFile {
             self.sync_header()?;
         }
 
-        self.cache_last_offset_if_needed(count);
         Ok(())
     }
 
@@ -577,6 +565,9 @@ impl QueueFile {
         }
         self.last = elem_entry;
         self.elem_cnt += 1;
+
+        self.cache_elem_if_needed(self.elem_cnt - 1, self.last, 1);
+
         Ok(())
     }
 
@@ -669,8 +660,7 @@ impl QueueFile {
         let mut new_first = self.first;
         let mut remaining_to_skip = n;
 
-        if let Some(i) = self.cached_index_up_to(n) {
-            let (index, elem) = self.cache.offsets.borrow()[i];
+        if let Some((index, elem)) = self.cached_offset_up_to(n) {
             if index <= n {
                 new_first = elem;
                 remaining_to_skip = n - index;
@@ -951,8 +941,7 @@ impl Iterator for Iter<'_> {
 
 impl Iter<'_> {
     fn jump_to_cache_if_closer(&mut self, target_idx: usize) {
-        if let Some(cache_idx) = self.queue_file.cached_index_up_to(target_idx) {
-            let (index, elem) = self.queue_file.cache.offsets.borrow()[cache_idx];
+        if let Some((index, elem)) = self.queue_file.cached_offset_up_to(target_idx) {
             if index > self.next_elem_index {
                 self.next_elem_index = index;
                 self.next_elem_pos = elem.pos;
@@ -1093,9 +1082,36 @@ mod tests {
 
         assert_eq!(
             qf.cache.offsets.borrow().iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4]
+            vec![3, 4, 5, 6, 7]
         );
         assert_eq!(qf.iter().map(|v| v[0]).collect::<Vec<_>>(), vec![3, 4, 5, 6, 7]);
         assert_eq!(qf.iter().nth(2).map(|v| v[0]), Some(5));
+    }
+
+    #[test]
+    fn cache_respects_max_size() {
+        let path = auto_delete_path::AutoDeletePath::temp();
+        let mut qf = QueueFile::with_capacity(&path, 1024 * 1024).unwrap();
+        qf.set_cache_offset_policy(Some(OffsetCacheKind::Linear { offset: 1 }));
+
+        // MAX_CACHE_SIZE is 4096.
+        // We add more than 4096 elements.
+        for i in 0u32..5000 {
+            qf.add(&i.to_le_bytes()).unwrap();
+        }
+
+        let cache_size = qf.cache.offsets.borrow().len();
+        assert!(cache_size <= 4096);
+        assert_eq!(cache_size, 4096);
+
+        // The first elements should have been dropped from the cache.
+        // The first cached absolute index should be 5000 - 4096 = 904.
+        // Wait, index 0 is not cached. index 1 is the first one cached.
+        // So 5000 items -> indices 0..5000.
+        // Cached indices: 1, 2, ..., 4999 (total 4999).
+        // After 4096 limit, we should have the last 4096.
+        // That is 4999, 4998, ..., 4999 - 4095 = 904.
+        assert_eq!(qf.cache.offsets.borrow().front().unwrap().0, 904);
+        assert_eq!(qf.cache.offsets.borrow().back().unwrap().0, 4999);
     }
 }
