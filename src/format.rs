@@ -18,7 +18,6 @@ pub const V2_ELEM_OVERHEAD: u64 = 44;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LayoutMetrics {
-    pub header_len: u64,
     pub data_start: u64,
 }
 
@@ -100,7 +99,7 @@ pub struct LegacyFormat;
 impl FileFormat for LegacyFormat {
     #[inline]
     fn layout(&self) -> LayoutMetrics {
-        LayoutMetrics { header_len: 16, data_start: 16 }
+        LayoutMetrics { data_start: 16 }
     }
 
     #[inline]
@@ -186,7 +185,7 @@ pub struct V1Format;
 impl FileFormat for V1Format {
     #[inline]
     fn layout(&self) -> LayoutMetrics {
-        LayoutMetrics { header_len: 32, data_start: 32 }
+        LayoutMetrics { data_start: 32 }
     }
 
     #[inline]
@@ -274,7 +273,7 @@ pub struct V2Format {
 
 impl V2Format {
     pub fn validate_v2_element_header(
-        &self, ring: &DataRing<'_>, logical_pos: u64,
+        ring: &DataRing<'_>, logical_pos: u64,
     ) -> Result<V2ElementHeader> {
         let mut hdr = [0u8; V2_ELEM_HDR_LEN];
         ring.read_at(logical_pos, &mut hdr)?;
@@ -331,7 +330,7 @@ impl V2Format {
     }
 
     pub fn write_v2_element(
-        &self, ring: &mut DataRingMut<'_>, logical_pos: u64, seq: u64,
+        ring: &mut DataRingMut<'_>, logical_pos: u64, seq: u64,
         prev_logical_pos: Option<u64>, payload: &[u8],
     ) -> Result<()> {
         let payload_len = payload.len();
@@ -379,19 +378,19 @@ impl V2Format {
         ring.inner.with_batched_backlink_rewrite_sync(|inner| {
             let mut ring = DataRingMut::new(inner, ring.data_start);
             for elem in &positions {
-                self.maybe_rewrite_backlink(&mut ring, elem.pos, moved_offset, boundary)?;
+                Self::maybe_rewrite_backlink(&mut ring, elem.pos, moved_offset, boundary)?;
             }
             Ok(())
         })
     }
 
     fn maybe_rewrite_backlink(
-        &self, ring: &mut DataRingMut<'_>, elem_pos: u64, moved_offset: u64, boundary: u64,
+        ring: &mut DataRingMut<'_>, elem_pos: u64, moved_offset: u64, boundary: u64,
     ) -> Result<()> {
         let mut hdr = [0u8; V2_ELEM_HDR_LEN];
         ring.as_read_only().read_at(elem_pos, &mut hdr)?;
 
-        let prev_pos = self.validate_v2_element_header(&ring.as_read_only(), elem_pos)?.prev_pos;
+        let prev_pos = Self::validate_v2_element_header(&ring.as_read_only(), elem_pos)?.prev_pos;
 
         if prev_pos < boundary {
             let new_prev_pos = prev_pos + moved_offset;
@@ -421,12 +420,12 @@ impl V2Format {
 
     fn read_next_element(&self, ring: &DataRingMut<'_>, cur: &Element) -> Result<Element> {
         let next_pos = ring.add(cur.pos, self.elem_span(cur.len));
-        let next_header = self.validate_v2_element_header(&ring.as_read_only(), next_pos)?;
+        let next_header = Self::validate_v2_element_header(&ring.as_read_only(), next_pos)?;
         Ok(Element { pos: next_pos, len: next_header.payload_len, seq: next_header.seq })
     }
 
     pub fn validate_v2_footer(
-        &self, ring: &DataRing<'_>, footer_pos: u64, seq: u64, payload: &[u8],
+        ring: &DataRing<'_>, footer_pos: u64, seq: u64, payload: &[u8],
     ) -> Result<()> {
         let mut ftr = [0u8; V2_ELEM_FTR_LEN];
         ring.read_at(footer_pos, &mut ftr)?;
@@ -463,7 +462,7 @@ impl V2Format {
 impl FileFormat for V2Format {
     #[inline]
     fn layout(&self) -> LayoutMetrics {
-        LayoutMetrics { header_len: V2_SLOT_LEN as u64, data_start: V2_DATA_START }
+        LayoutMetrics { data_start: V2_DATA_START }
     }
 
     #[inline]
@@ -519,7 +518,7 @@ impl FileFormat for V2Format {
 
     #[inline]
     fn read_element(&self, ring: &DataRing<'_>, logical_pos: u64) -> Result<Element> {
-        let header = self.validate_v2_element_header(ring, logical_pos)?;
+        let header = Self::validate_v2_element_header(ring, logical_pos)?;
         Ok(Element { pos: logical_pos, len: header.payload_len, seq: header.seq })
     }
 
@@ -528,7 +527,7 @@ impl FileFormat for V2Format {
         &self, ring: &mut DataRingMut<'_>, logical_pos: u64, payload: &[u8], seq: u64,
         prev_logical_pos: Option<u64>,
     ) -> Result<()> {
-        self.write_v2_element(ring, logical_pos, seq, prev_logical_pos, payload)
+        Self::write_v2_element(ring, logical_pos, seq, prev_logical_pos, payload)
     }
 
     #[inline]
@@ -548,7 +547,7 @@ impl FileFormat for V2Format {
         &self, ring: &DataRing<'_>, payload_start: u64, elem: &Element, payload: &[u8],
     ) -> Result<()> {
         let footer_pos = ring.add(payload_start, elem.len as u64);
-        self.validate_v2_footer(ring, footer_pos, elem.seq, payload)
+        Self::validate_v2_footer(ring, footer_pos, elem.seq, payload)
     }
 
     #[inline]
@@ -581,7 +580,7 @@ impl FormatState {
         &self, ring: &DataRing<'_>, logical_pos: u64,
     ) -> Result<V2ElementHeader> {
         match self {
-            Self::V2(f) => f.validate_v2_element_header(ring, logical_pos),
+            Self::V2(_) => V2Format::validate_v2_element_header(ring, logical_pos),
             _ => Err(Error::UnsupportedVersion { detected: 0, supported: 2 }),
         }
     }

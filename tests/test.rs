@@ -7,7 +7,8 @@ use test_case::test_case;
 
 const FAILPOINT_ENV: &str = "QUEUE_FILE_FAILPOINT";
 
-static FAILPOINT_LOCK: Mutex<()> = Mutex::new(());
+static FAILPOINT_LOCK: once_cell::sync::Lazy<Mutex<()>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(()));
 
 struct FailpointGuard;
 
@@ -220,7 +221,7 @@ fn collect_queue_items(qf: &mut QueueFile) -> Vec<Vec<u8>> {
 
 #[track_caller]
 fn collect_queue_items_partial(qf: &mut QueueFile, skip: usize, take: usize) -> Vec<Vec<u8>> {
-    qf.iter().skip(skip).take(take).map(Vec::from).collect::<Vec<_>>()
+    qf.iter().skip(skip).take(take).collect::<Vec<_>>()
 }
 
 #[track_caller]
@@ -437,8 +438,8 @@ fn iter_nth() {
     assert_eq!(qf.iter().next(), Some(a));
     assert_eq!(qf.iter().nth(1), Some(b.clone()));
     assert_eq!(qf.iter().nth(2), Some(c.clone()));
-    assert_eq!(qf.iter().skip(0).nth(1), Some(b.clone()));
-    assert_eq!(qf.iter().skip(0).nth(2), Some(c.clone()));
+    assert_eq!(qf.iter().nth(1), Some(b.clone()));
+    assert_eq!(qf.iter().nth(2), Some(c.clone()));
     assert_eq!(qf.iter().nth(1), Some(b));
     assert_eq!(qf.iter().skip(1).nth(1), Some(c));
     assert_eq!(qf.iter().nth(3), None);
@@ -453,7 +454,7 @@ fn add_n_accepts_non_clone_iterator_on_legacy_queue() {
     let batch = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
     qf.add_n(NonCloneIter::new(batch.clone())).unwrap();
 
-    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = qf.iter().collect();
     assert_eq!(items, batch);
 }
 
@@ -474,7 +475,7 @@ fn iter_supports_shared_borrow() {
     qf.add(b"one").unwrap();
     qf.add(b"two").unwrap();
 
-    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = qf.iter().collect();
     assert_eq!(items, vec![b"one".to_vec(), b"two".to_vec()]);
 }
 
@@ -489,7 +490,7 @@ fn read_lock_can_peek_and_iter() {
     let guard = qf.read().unwrap();
 
     let head = guard.peek().unwrap().unwrap();
-    let items: Vec<Vec<u8>> = guard.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = guard.iter().collect();
 
     assert_eq!(head.as_slice(), b"alpha");
     assert_eq!(items, vec![b"alpha".to_vec(), b"beta".to_vec()]);
@@ -506,7 +507,7 @@ fn iter_nth_large_payloads() {
         q.add(p).unwrap();
     }
 
-    assert_eq!(q.iter().nth(0).unwrap(), payloads[0]);
+    assert_eq!(q.iter().next().unwrap(), payloads[0]);
     assert_eq!(q.iter().nth(10).unwrap(), payloads[10]);
     assert_eq!(q.iter().nth(19).unwrap(), payloads[19]);
     assert!(q.iter().nth(20).is_none());

@@ -13,7 +13,8 @@ const V2_SLOT_LEN: usize = 56;
 const V2_DATA_START: u64 = 8192;
 const FAILPOINT_ENV: &str = "QUEUE_FILE_FAILPOINT";
 
-static FAILPOINT_LOCK: Mutex<()> = Mutex::new(());
+static FAILPOINT_LOCK: once_cell::sync::Lazy<Mutex<()>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(()));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -169,7 +170,7 @@ fn v2_slot_a_corrupt_slot_b_valid() {
     // Should open successfully using slot B (gen=2, has "hello" only).
     let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 1, "slot B had 1 element when slot A was written");
-    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = qf.iter().collect();
     assert_eq!(items, vec![b"hello".to_vec()]);
 }
 
@@ -189,7 +190,7 @@ fn v2_slot_b_corrupt_slot_a_valid() {
 
     let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 2);
-    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = qf.iter().collect();
     assert_eq!(items, vec![b"data1".to_vec(), b"data2".to_vec()]);
 }
 
@@ -445,7 +446,7 @@ fn v2_head_recovery() {
     match result {
         Ok(qf) => {
             assert_eq!(qf.size(), 2, "recovered queue should have 2 elements");
-            let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+            let items: Vec<Vec<u8>> = qf.iter().collect();
             assert_eq!(items.len(), 2);
             // Last element should be intact.
             assert_eq!(items[1], b"tail_elem".to_vec());
@@ -539,7 +540,7 @@ fn v2_recover_head_after_dequeues_with_historical_backlink() {
 
     let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 2);
-    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = qf.iter().collect();
     assert_eq!(items, vec![b"third".to_vec(), b"fourth".to_vec()]);
 }
 
@@ -718,7 +719,7 @@ fn v2_reopens_relocated_pre_add_queue_after_cleanup_before_final_add_commit() {
     let mut qf = QueueFile::open(&p).unwrap();
     fill_wrapped_queue_until_next_add_expands(&mut qf);
 
-    let expected: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let expected: Vec<Vec<u8>> = qf.iter().collect();
 
     let failpoint = FailpointGuard::set("v2_after_relocation_cleanup_before_add");
     let err = qf.add(&999u32.to_be_bytes()).unwrap_err().to_string();
@@ -727,7 +728,7 @@ fn v2_reopens_relocated_pre_add_queue_after_cleanup_before_final_add_commit() {
     drop(qf);
 
     let reopened = QueueFile::open(&p).unwrap();
-    let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = reopened.iter().collect();
     assert_eq!(items, expected, "reopen should see the relocated pre-add queue only");
 }
 
@@ -739,7 +740,7 @@ fn v2_reopens_pre_add_queue_after_wrapped_expansion_and_append_flush_without_ove
     qf.set_overwrite_on_remove(false);
     fill_wrapped_queue_until_next_add_expands(&mut qf);
 
-    let expected: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let expected: Vec<Vec<u8>> = qf.iter().collect();
     let old_file_len = qf.file_len();
 
     let failpoint = FailpointGuard::set("v2_after_add_batch_flush");
@@ -750,7 +751,7 @@ fn v2_reopens_pre_add_queue_after_wrapped_expansion_and_append_flush_without_ove
     drop(qf);
 
     let reopened = QueueFile::open(&p).unwrap();
-    let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = reopened.iter().collect();
     assert_eq!(items, expected, "reopen should fall back to the pre-add queue state");
 }
 
@@ -794,7 +795,7 @@ fn v2_expansion_copy_flush_restores_sync_state_on_failure() {
     drop(qf);
 
     let reopened = QueueFile::open(&p).unwrap();
-    let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = reopened.iter().collect();
     assert_eq!(items.len(), before.element_count as usize);
 }
 
@@ -838,7 +839,7 @@ fn v2_backlink_rewrite_flush_happens_before_relocation_commit() {
     drop(qf);
 
     let reopened = QueueFile::open(&p).unwrap();
-    let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = reopened.iter().collect();
     assert_eq!(items.len(), before.element_count as usize);
 }
 
@@ -859,7 +860,7 @@ fn v2_migrate_v0() {
     let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 2);
 
-    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = qf.iter().collect();
     assert_eq!(items[0], b"legacy_elem_1".to_vec());
     assert_eq!(items[1], b"legacy_elem_2".to_vec());
 
@@ -940,7 +941,7 @@ fn v2_queue_like_vecdeque() {
     }
 
     // Verify.
-    let qf_items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let qf_items: Vec<Vec<u8>> = qf.iter().collect();
     let vd_items: Vec<Vec<u8>> = vd.iter().cloned().collect();
     assert_eq!(qf_items, vd_items);
 
@@ -956,7 +957,7 @@ fn v2_queue_like_vecdeque() {
     }
 
     // Verify again.
-    let qf_items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let qf_items: Vec<Vec<u8>> = qf.iter().collect();
     let vd_items: Vec<Vec<u8>> = vd.iter().cloned().collect();
     assert_eq!(qf_items, vd_items);
 
@@ -1012,12 +1013,12 @@ fn v2_add_n_batch() {
     let p = temp_path();
     let mut qf = QueueFile::open(&p).unwrap();
 
-    let batch = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
+    let batch = [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
     qf.add_n(batch.iter().map(|v| v.as_slice())).unwrap();
 
     assert_eq!(qf.size(), 3);
 
-    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = qf.iter().collect();
     assert_eq!(items[0], b"one".to_vec());
     assert_eq!(items[1], b"two".to_vec());
     assert_eq!(items[2], b"three".to_vec());
@@ -1032,7 +1033,7 @@ fn v2_add_n_accepts_non_clone_iterator() {
     let batch = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
     qf.add_n(NonCloneIter::new(batch.clone())).unwrap();
 
-    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = qf.iter().collect();
     assert_eq!(items, batch);
 }
 
@@ -1057,7 +1058,7 @@ fn v2_add_n_reopens_after_mid_batch_expansion() {
     drop(qf);
 
     let reopened = QueueFile::open(&p).unwrap();
-    let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = reopened.iter().collect();
     assert_eq!(items.len(), next as usize + batch.len());
     assert_eq!(items[items.len() - 2..], batch);
 }
@@ -1078,7 +1079,7 @@ fn v2_add_n_batch_two_expansion_boundaries() {
     assert_eq!(qf.file_len(), 8192, "sanity: initial file len");
 
     let payload = vec![0xABu8; 4097];
-    let batch = vec![payload.clone(), payload.clone(), payload.clone()];
+    let batch = [payload.clone(), payload.clone(), payload.clone()];
     qf.add_n(batch.iter().map(|v| v.as_slice())).unwrap();
 
     // File must have grown.
@@ -1088,7 +1089,7 @@ fn v2_add_n_batch_two_expansion_boundaries() {
 
     // All elements must survive a reopen.
     let reopened = QueueFile::open(&p).unwrap();
-    let items: Vec<Vec<u8>> = reopened.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = reopened.iter().collect();
     assert_eq!(items.len(), 3);
     assert!(items.iter().all(|v| v == &payload));
 }
@@ -1100,7 +1101,7 @@ fn v2_add_n_batch_suppresses_per_write_syncs() {
     let mut qf = QueueFile::open(&p).unwrap();
     qf.set_sync_writes(true);
 
-    let batch = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
+    let batch = [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
     let failpoint = FailpointGuard::set("v2_add_batch_per_write_sync");
     qf.add_n(batch.iter().map(|v| v.as_slice())).unwrap();
     drop(failpoint);
@@ -1118,7 +1119,7 @@ fn v2_add_n_batch_restores_sync_state_after_flush_failure() {
     let (before_bytes, _) = active_slot(&p);
     let before = parse_slot_fields(&before_bytes);
 
-    let batch = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
+    let batch = [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
     let failpoint = FailpointGuard::set("v2_after_add_batch_flush");
     let err = qf.add_n(batch.iter().map(|v| v.as_slice())).unwrap_err().to_string();
     drop(failpoint);
@@ -1245,7 +1246,7 @@ fn v2_persistence() {
 
     let qf = QueueFile::open(&p).unwrap();
     assert_eq!(qf.size(), 2);
-    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = qf.iter().collect();
     assert_eq!(items[0], b"persistent_data".to_vec());
     assert_eq!(items[1], b"more_data".to_vec());
 }
@@ -1263,7 +1264,7 @@ fn v2_empty_elements() {
 
     assert_eq!(qf.size(), 3);
 
-    let items: Vec<Vec<u8>> = qf.iter().map(Vec::from).collect();
+    let items: Vec<Vec<u8>> = qf.iter().collect();
     assert_eq!(items[0], b"before".to_vec());
     assert_eq!(items[1], b"".to_vec());
     assert_eq!(items[2], b"after".to_vec());
