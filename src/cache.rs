@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use crate::Element;
@@ -13,36 +14,36 @@ pub enum OffsetCacheKind {
 
 #[derive(Debug, Clone)]
 pub struct OffsetCache {
-    pub(crate) offsets: VecDeque<(usize, Element)>,
+    pub(crate) offsets: RefCell<VecDeque<(usize, Element)>>,
     pub(crate) kind: Option<OffsetCacheKind>,
 }
 
 impl OffsetCache {
     pub fn new() -> Self {
-        Self { offsets: VecDeque::new(), kind: None }
+        Self { offsets: RefCell::new(VecDeque::new()), kind: None }
     }
 
     pub fn set_policy(&mut self, kind: impl Into<Option<OffsetCacheKind>>) {
         self.kind = kind.into();
 
         if self.kind.is_none() {
-            self.offsets.clear();
+            self.offsets.borrow_mut().clear();
         }
     }
 
-    pub fn clear(&mut self) {
-        self.offsets.clear();
+    pub fn clear(&self) {
+        self.offsets.borrow_mut().clear();
     }
 
     pub fn cache_elem_if_needed(
-        &mut self, index: usize, elem: Element, elem_cnt: usize, affected_items: usize,
+        &self, index: usize, elem: Element, elem_cnt: usize, affected_items: usize,
     ) {
         debug_assert!(index <= elem_cnt);
         debug_assert!(index + 1 >= affected_items);
 
         let need_to_cache = match self.kind {
             Some(OffsetCacheKind::Linear { offset }) => {
-                let last_cached_index = self.offsets.back().map_or(0, |(idx, _)| *idx);
+                let last_cached_index = self.offsets.borrow().back().map_or(0, |(idx, _)| *idx);
                 Self::should_cache_linear(index, offset, last_cached_index)
             }
             Some(OffsetCacheKind::Quadratic) => Self::should_cache_quadratic(index, affected_items),
@@ -53,7 +54,9 @@ impl OffsetCache {
             return;
         }
 
-        if let Some(&(last_cached_index, last_cached_elem)) = self.offsets.back() {
+        let mut offsets = self.offsets.borrow_mut();
+
+        if let Some(&(last_cached_index, last_cached_elem)) = offsets.back() {
             if last_cached_index >= index {
                 if last_cached_index == index {
                     debug_assert_eq!(last_cached_elem.pos, elem.pos);
@@ -64,7 +67,7 @@ impl OffsetCache {
             }
         }
 
-        self.offsets.push_back((index, elem));
+        offsets.push_back((index, elem));
     }
 
     #[inline]
@@ -81,14 +84,16 @@ impl OffsetCache {
     #[inline]
     pub fn cached_index_up_to(&self, i: usize) -> Option<usize> {
         self.offsets
+            .borrow()
             .binary_search_by(|(idx, _)| idx.cmp(&i))
             .map_or_else(|i| i.checked_sub(1), Some)
     }
 
-    pub fn drop_up_to(&mut self, n: usize) {
-        while matches!(self.offsets.front(), Some((index, _)) if *index < n) {
-            self.offsets.pop_front();
+    pub fn drop_up_to(&self, n: usize) {
+        let mut offsets = self.offsets.borrow_mut();
+        while matches!(offsets.front(), Some((index, _)) if *index < n) {
+            offsets.pop_front();
         }
-        self.offsets.iter_mut().for_each(|(i, _)| *i -= n);
+        offsets.iter_mut().for_each(|(i, _)| *i -= n);
     }
 }

@@ -434,7 +434,7 @@ impl QueueFile {
     // ── Cache helpers ─────────────────────────────────────────────────────────
 
     #[inline]
-    fn cache_last_offset_if_needed(&mut self, affected_items: usize) {
+    fn cache_last_offset_if_needed(&self, affected_items: usize) {
         if self.elem_cnt == 0 {
             return;
         }
@@ -464,7 +464,7 @@ impl QueueFile {
         self.cache = snapshot.cache;
     }
 
-    fn cache_elem_if_needed(&mut self, index: usize, elem: Element, affected_items: usize) {
+    fn cache_elem_if_needed(&self, index: usize, elem: Element, affected_items: usize) {
         self.cache.cache_elem_if_needed(index, elem, self.elem_cnt, affected_items);
     }
 
@@ -631,15 +631,15 @@ impl QueueFile {
             return self.clear();
         }
 
-        debug_assert!(
-            self.cache
-                .offsets
-                .iter()
-                .zip(self.cache.offsets.iter().skip(1))
-                .all(|(a, b)| a.0 < b.0),
-            "{:?}",
-            self.cache.offsets
-        );
+        #[cfg(debug_assertions)]
+        {
+            let offsets = self.cache.offsets.borrow();
+            debug_assert!(
+                offsets.iter().zip(offsets.iter().skip(1)).all(|(a, b)| a.0 < b.0),
+                "{:?}",
+                *offsets
+            );
+        }
 
         let old_first_pos = self.first.pos;
 
@@ -670,7 +670,7 @@ impl QueueFile {
         let mut remaining_to_skip = n;
 
         if let Some(i) = self.cached_index_up_to(n) {
-            let (index, elem) = self.cache.offsets[i];
+            let (index, elem) = self.cache.offsets.borrow()[i];
             if index <= n {
                 new_first = elem;
                 remaining_to_skip = n - index;
@@ -686,7 +686,7 @@ impl QueueFile {
         Ok(new_first)
     }
 
-    fn drop_cached_offsets_up_to(&mut self, n: usize) {
+    fn drop_cached_offsets_up_to(&self, n: usize) {
         self.cache.drop_up_to(n);
     }
 
@@ -952,7 +952,7 @@ impl Iterator for Iter<'_> {
 impl Iter<'_> {
     fn jump_to_cache_if_closer(&mut self, target_idx: usize) {
         if let Some(cache_idx) = self.queue_file.cached_index_up_to(target_idx) {
-            let (index, elem) = self.queue_file.cache.offsets[cache_idx];
+            let (index, elem) = self.queue_file.cache.offsets.borrow()[cache_idx];
             if index > self.next_elem_index {
                 self.next_elem_index = index;
                 self.next_elem_pos = elem.pos;
@@ -965,6 +965,9 @@ impl Iter<'_> {
             return None;
         }
         let current = self.queue_file.read_element_at(self.next_elem_pos).ok()?;
+        
+        self.queue_file.cache_elem_if_needed(self.next_elem_index, current, 1);
+
         self.next_elem_pos =
             self.queue_file.ring().add(current.pos, self.queue_file.elem_span(current.len));
         self.next_elem_index += 1;
@@ -995,6 +998,8 @@ impl Iter<'_> {
             .format
             .validate_footer(&ring, payload_start, &current, &self.buffer[..current.len])
             .ok()?;
+
+        self.queue_file.cache_elem_if_needed(self.next_elem_index, current, 1);
 
         self.next_elem_pos = ring.add(current.pos, self.queue_file.elem_span(current.len));
         self.next_elem_index += 1;
@@ -1080,14 +1085,14 @@ mod tests {
         }
 
         assert_eq!(
-            qf.cache.offsets.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            qf.cache.offsets.borrow().iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
             (1..8).collect::<Vec<_>>()
         );
 
         qf.remove_n(3).unwrap();
 
         assert_eq!(
-            qf.cache.offsets.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            qf.cache.offsets.borrow().iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
             vec![0, 1, 2, 3, 4]
         );
         assert_eq!(qf.iter().map(|v| v[0]).collect::<Vec<_>>(), vec![3, 4, 5, 6, 7]);
