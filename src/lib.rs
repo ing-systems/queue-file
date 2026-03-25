@@ -76,6 +76,83 @@
 //!
 //! Opening the same queue file from multiple processes simultaneously is not supported and will
 //! result in data corruption.
+//!
+//! # Quick Start
+//!
+//! ```
+//! use queue_file::QueueFile;
+//! use std::fs::remove_file;
+//!
+//! // Create a new queue file
+//! let path = "example.qf";
+//! let mut qf = QueueFile::open(path).unwrap();
+//!
+//! // Add elements
+//! qf.add(b"hello").unwrap();
+//! qf.add(b"world").unwrap();
+//!
+//! // Peek at the front element
+//! assert_eq!(qf.peek().unwrap(), Some(b"hello".to_vec()));
+//!
+//! // Iterate over all elements
+//! for elem in &qf {
+//!     println!("{}", String::from_utf8_lossy(&elem));
+//! }
+//!
+//! // Remove elements
+//! qf.remove().unwrap();
+//! assert_eq!(qf.peek().unwrap(), Some(b"world".to_vec()));
+//!
+//! // Clean up
+//! drop(qf);
+//! remove_file(path).ok();
+//! ```
+//!
+//! # Batch Operations
+//!
+//! For better performance when adding multiple elements, use [`QueueFile::add_n`]:
+//!
+//! ```
+//! use queue_file::QueueFile;
+//! use std::fs::remove_file;
+//!
+//! let path = "batch.qf";
+//! let mut qf = QueueFile::open(path).unwrap();
+//!
+//! // Add multiple elements in a single batch (more efficient)
+//! qf.add_n(vec![b"a", b"b", b"c"]).unwrap();
+//! assert_eq!(qf.size(), 3);
+//!
+//! drop(qf);
+//! remove_file(path).ok();
+//! ```
+//!
+//! # Random Access with Caching
+//!
+//! For frequent access to elements by index, enable the cache:
+//!
+//! ```
+//! use queue_file::{QueueFile, OffsetCacheKind};
+//! use std::fs::remove_file;
+//!
+//! let path = "cache.qf";
+//! let mut qf = QueueFile::open(path).unwrap();
+//!
+//! // Enable linear caching for faster nth() lookups
+//! qf.set_cache_offset_policy(Some(OffsetCacheKind::Linear { offset: 100 }));
+//!
+//! // Add many elements
+//! for i in 0usize..1000 {
+//!     qf.add(&i.to_le_bytes()).unwrap();
+//! }
+//!
+//! // Jump to element 500 (much faster with caching)
+//! let elem = qf.iter().nth(500);
+//! assert!(elem.is_some());
+//!
+//! drop(qf);
+//! remove_file(path).ok();
+//! ```
 
 #![forbid(non_ascii_idents)]
 #![deny(
@@ -954,7 +1031,7 @@ impl Iter<'_> {
             return None;
         }
         let current = self.queue_file.read_element_at(self.next_elem_pos).ok()?;
-        
+
         self.queue_file.cache_elem_if_needed(self.next_elem_index, current, 1);
 
         self.next_elem_pos =

@@ -1,8 +1,16 @@
+//! Element position caching for optimized random access.
+//!
+//! This module provides the [`OffsetCache`] which stores element positions
+//! to accelerate [`Iter::nth`] operations on large queues. Without caching,
+//! seeking to element N requires O(N) reads from the beginning. With caching,
+//! this is reduced based on the chosen policy.
+
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 use crate::Element;
 
+/// Maximum number of cached element positions.
 const MAX_CACHE_SIZE: usize = 4096;
 
 /// Policy controlling how element file-positions are cached to accelerate [`Iter::nth`].
@@ -20,18 +28,26 @@ pub enum OffsetCacheKind {
     Quadratic,
 }
 
+/// Cache for element positions to accelerate random access iteration.
 #[derive(Debug, Clone)]
 pub struct OffsetCache {
+    /// Cached (index, element) pairs.
     pub(crate) offsets: RefCell<VecDeque<(usize, Element)>>,
+    /// The caching policy, if any.
     pub(crate) kind: Option<OffsetCacheKind>,
+    /// Number of elements removed since cache creation.
     pub(crate) total_removed: Cell<usize>,
 }
 
 impl OffsetCache {
+    /// Creates a new empty cache.
     pub fn new() -> Self {
         Self { offsets: RefCell::new(VecDeque::new()), kind: None, total_removed: Cell::new(0) }
     }
 
+    /// Sets the caching policy.
+    ///
+    /// Passing `None` disables caching and clears any existing cache.
     pub fn set_policy(&mut self, kind: impl Into<Option<OffsetCacheKind>>) {
         self.kind = kind.into();
 
@@ -40,11 +56,15 @@ impl OffsetCache {
         }
     }
 
+    /// Clears all cached offsets.
     pub fn clear(&self) {
         self.offsets.borrow_mut().clear();
         self.total_removed.set(0);
     }
 
+    /// Conditionally caches an element position based on the current policy.
+    ///
+    /// Called during iteration to cache element positions for future lookups.
     pub fn cache_elem_if_needed(
         &self, index: usize, elem: Element, elem_cnt: usize, affected_items: usize,
     ) {
@@ -98,6 +118,9 @@ impl OffsetCache {
         x > 1 && (index + 1 - affected_items..=index).contains(&(x * x))
     }
 
+    /// Returns the cached offset closest to but not exceeding `i`.
+    ///
+    /// Used by [`Iter::nth`] to jump directly to a cached position.
     #[inline]
     pub fn cached_offset_up_to(&self, i: usize) -> Option<(usize, Element)> {
         let abs_i = i + self.total_removed.get();
@@ -110,6 +133,9 @@ impl OffsetCache {
         Some((abs_idx.saturating_sub(self.total_removed.get()), elem))
     }
 
+    /// Marks `n` elements as removed, updating internal counters.
+    ///
+    /// Called after [`QueueFile::remove_n`] to adjust cache state.
     pub fn drop_up_to(&self, n: usize) {
         self.total_removed.set(self.total_removed.get() + n);
         let mut offsets = self.offsets.borrow_mut();

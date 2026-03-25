@@ -1,3 +1,13 @@
+//! Low-level I/O operations for queue file reading and writing.
+//!
+//! This module provides the core I/O abstractions:
+//! - [`QueueFileInner`] - the low-level file handle and buffer management
+//! - [`DataRing`] - ring buffer abstraction for reading
+//! - [`DataRingMut`] - ring buffer abstraction for writing
+//!
+//! The ring buffer handles the wraparound logic for the queue's circular
+//! file layout, where writes can wrap from the end of the file to the beginning.
+
 use std::cmp::min;
 use std::fs::File;
 use std::io as io_std;
@@ -9,11 +19,18 @@ use std::os::windows::fs::FileExt;
 
 use crate::error::{Result, maybe_inject_failpoint};
 
+/// Represents a phase of batched operations that can defer syncing.
+///
+/// Used to inject test failures at specific points during large operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferredSyncPhase {
+    /// Copying data during file expansion.
     ExpansionCopy,
+    /// Erasing data during clear.
     ClearErase,
+    /// Rewriting backlinks after expansion.
     BacklinkRewrite,
+    /// Appending multiple elements in a batch.
     AppendBatch,
 }
 
@@ -29,20 +46,33 @@ impl DeferredSyncPhase {
     }
 }
 
+/// Low-level file handle and buffer management for queue operations.
+///
+/// This struct wraps the raw file handle and maintains internal state
+/// for efficient I/O, including seek optimization and transfer buffers.
 #[derive(Debug)]
 pub struct QueueFileInner {
+    /// The underlying file handle.
     pub file: Option<File>,
+    /// Current file length.
     pub file_len: u64,
+    /// The position we expect to be at after a seek.
     pub expected_seek: u64,
+    /// The last position actually seeked to (for optimization).
     pub last_seek: Option<u64>,
+    /// Buffer used for transfer operations (expansion, relocation).
     pub transfer_buf: Box<[u8]>,
+    /// Whether to sync after each write.
     pub sync_writes: bool,
+    /// Current deferred sync phase, if any.
     pub deferred_sync_phase: Option<DeferredSyncPhase>,
 }
 
 impl QueueFileInner {
+    /// Size of the transfer buffer used for file expansion.
     pub const TRANSFER_BUFFER_SIZE: usize = 128 * 1024;
 
+    /// Returns a reference to the underlying file.
     #[inline]
     pub fn file_ref(&self) -> io_std::Result<&File> {
         self.file.as_ref().ok_or_else(|| {
@@ -50,6 +80,7 @@ impl QueueFileInner {
         })
     }
 
+    /// Returns a mutable reference to the underlying file.
     #[inline]
     pub fn file_mut(&mut self) -> io_std::Result<&mut File> {
         self.file.as_mut().ok_or_else(|| {
@@ -57,12 +88,14 @@ impl QueueFileInner {
         })
     }
 
+    /// Sets the expected seek position (without actually seeking).
     #[inline]
     pub fn seek(&mut self, pos: u64) -> u64 {
         self.expected_seek = pos;
         pos
     }
 
+    /// Performs the actual seek operation, using optimization to skip redundant seeks.
     pub fn real_seek(&mut self) -> io_std::Result<u64> {
         if Some(self.expected_seek) == self.last_seek {
             return Ok(self.expected_seek);
@@ -75,6 +108,9 @@ impl QueueFileInner {
         res
     }
 
+    /// Writes the given buffer to the file at the expected seek position.
+    ///
+    /// Handles sync behavior based on `sync_writes` and `deferred_sync_phase`.
     pub fn write(&mut self, buf: &[u8]) -> Result<()> {
         self.real_seek()?;
 
@@ -254,9 +290,14 @@ impl QueueFileInner {
     }
 }
 
+/// Ring buffer abstraction for reading from the queue data region.
+///
+/// Provides logical addressing where positions wrap around, handling
+/// the circular nature of the queue file.
 #[derive(Debug, Clone, Copy)]
 pub struct DataRing<'a> {
     inner: &'a QueueFileInner,
+    /// Offset where data region starts in the file.
     pub data_start: u64,
 }
 
@@ -308,9 +349,12 @@ impl<'a> DataRing<'a> {
     }
 }
 
+/// Ring buffer abstraction for writing to the queue data region.
 #[derive(Debug)]
 pub struct DataRingMut<'a> {
+    /// Mutable reference to the inner queue file state.
     pub inner: &'a mut QueueFileInner,
+    /// Offset where data region starts in the file.
     pub data_start: u64,
 }
 

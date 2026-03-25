@@ -1,3 +1,9 @@
+//! File format abstractions for different queue versions.
+//!
+//! This module provides the [`FileFormat`] trait and implementations for
+//! each supported format (legacy, v1, and v2), along with supporting structs
+//! for element headers, footers, and metadata.
+
 use bytes::{Buf, BufMut};
 
 use crate::cache::OffsetCache;
@@ -10,67 +16,110 @@ use crate::header::{
 };
 use crate::qio::{DataRing, DataRingMut, QueueFileInner};
 
+/// Magic number for V2 element headers: `0x49544844` (ASCII "ITHD")
 pub const V2_ELEM_HDR_MAGIC: u32 = 0x4954_4844;
+/// Size of V2 element header (including magic and CRC).
 pub const V2_ELEM_HDR_LEN: usize = 28;
+/// Magic number for V2 element footers: `0x49544654` (ASCII "ITFT")
 pub const V2_ELEM_FTR_MAGIC: u32 = 0x4954_4654;
+/// Size of V2 element footer (including magic, seq, and CRC).
 pub const V2_ELEM_FTR_LEN: usize = 16;
+/// Total overhead per element in V2 format (header + footer).
 pub const V2_ELEM_OVERHEAD: u64 = 44;
 
+/// Layout metrics for a specific format.
 #[derive(Debug, Clone, Copy)]
 pub struct LayoutMetrics {
+    /// Offset where data region begins.
     pub data_start: u64,
 }
 
+/// Metadata stored in queue file headers.
 #[derive(Debug, Clone, Copy)]
 pub struct QueueMetadata {
+    /// Current file length.
     pub file_len: u64,
+    /// Number of elements in queue.
     pub elem_cnt: usize,
+    /// Position of first element.
     pub first_pos: u64,
+    /// Position of last element.
     pub last_pos: u64,
 }
 
+/// State from parsing a legacy or v1 header.
 #[derive(Debug, Clone, Copy)]
 pub struct LegacyHeaderState {
+    /// The detected format version.
     pub format: FormatState,
+    /// File length from header.
     pub file_len: u64,
+    /// Element count from header.
     pub elem_cnt: usize,
+    /// First element position.
     pub first_pos: u64,
+    /// Last element position.
     pub last_pos: u64,
 }
 
+/// State from parsing a v2 header.
 #[derive(Debug, Clone, Copy)]
 pub struct V2OpenState {
+    /// Which slot (A or B) is currently active.
     pub active_slot: HeaderSlot,
+    /// The parsed slot data.
     pub slot: SlotData,
+    /// Number of elements.
     pub elem_cnt: usize,
 }
 
+/// V2 element header information.
 #[derive(Debug, Clone, Copy)]
 pub struct V2ElementHeader {
+    /// Length of the element payload.
     pub payload_len: usize,
+    /// Sequence number.
     pub seq: u64,
+    /// Position of previous element (for backlink).
     pub prev_pos: u64,
 }
 
+/// Plan for file expansion operations.
 #[derive(Debug, Clone, Copy)]
 pub struct ExpansionPlan {
+    /// Original file length before expansion.
     pub orig_file_len: u64,
+    /// New file length after expansion.
     pub new_len: u64,
+    /// Physical position of end of last element.
     pub end_of_last_elem: u64,
+    /// Whether the queue data wraps around in the ring buffer.
     pub wraps: bool,
+    /// Number of bytes that need to be moved.
     pub moved_count: u64,
 }
 
+/// Snapshot of queue state for rollback support.
 #[derive(Debug, Clone)]
 pub struct QueueStateSnapshot {
+    /// Current format state.
     pub format: FormatState,
+    /// Current element count.
     pub elem_cnt: usize,
+    /// First element.
     pub first: Element,
+    /// Last element.
     pub last: Element,
+    /// Current overwrite policy.
     pub overwrite_on_remove: bool,
+    /// Current cache state.
     pub cache: OffsetCache,
 }
 
+/// Trait for format-specific queue file operations.
+///
+/// Each format (legacy, v1, v2) implements this trait to handle
+/// format-specific logic for reading, writing, and managing elements.
 pub trait FileFormat {
     fn layout(&self) -> LayoutMetrics;
     fn elem_hdr_len(&self) -> u64;
@@ -93,6 +142,9 @@ pub trait FileFormat {
     fn on_expansion_cleanup(&self, plan: &ExpansionPlan) -> Result<()>;
 }
 
+/// Legacy format (16-byte header, 4-byte element length).
+///
+/// Binary-compatible with the original Java `QueueFile`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LegacyFormat;
 
@@ -179,6 +231,7 @@ impl FileFormat for LegacyFormat {
     }
 }
 
+/// V1 format (32-byte header, supports files up to `i64::MAX`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V1Format;
 
@@ -264,10 +317,14 @@ impl FileFormat for V1Format {
     }
 }
 
+/// V2 format with dual-slot headers, CRC-32 integrity, and sequence numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V2Format {
+    /// Currently active header slot.
     pub active_slot: HeaderSlot,
+    /// Generation counter for this format instance.
     pub generation: u64,
+    /// Next sequence number to assign.
     pub next_seq: u64,
 }
 
@@ -330,8 +387,8 @@ impl V2Format {
     }
 
     pub fn write_v2_element(
-        ring: &mut DataRingMut<'_>, logical_pos: u64, seq: u64,
-        prev_logical_pos: Option<u64>, payload: &[u8],
+        ring: &mut DataRingMut<'_>, logical_pos: u64, seq: u64, prev_logical_pos: Option<u64>,
+        payload: &[u8],
     ) -> Result<()> {
         let payload_len = payload.len();
         let prev_phys = prev_logical_pos.map_or(0, |p| ring.data_start + p);

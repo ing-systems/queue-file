@@ -1,3 +1,8 @@
+//! Queue file initialization and opening.
+//!
+//! This module handles the creation, detection, and opening of queue files
+//! in various formats (legacy, v1, and v2), including format migration.
+
 use bytes::{BufMut, BytesMut};
 use std::fs::{File, OpenOptions, rename};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -16,6 +21,7 @@ use crate::{
     qio::QueueFileInner,
 };
 
+/// Initializes a new queue file at the given path.
 pub fn init(path: &Path, force_legacy: bool, capacity: u64) -> Result<()> {
     let tmp_path = path.with_extension(".tmp");
 
@@ -38,6 +44,7 @@ pub fn init(path: &Path, force_legacy: bool, capacity: u64) -> Result<()> {
     Ok(())
 }
 
+/// Initializes a new legacy-format queue file.
 pub fn init_legacy_file(file: &mut File, capacity: u64) -> Result<()> {
     file.set_len(capacity)?;
     let mut buf = BytesMut::with_capacity(16);
@@ -46,6 +53,7 @@ pub fn init_legacy_file(file: &mut File, capacity: u64) -> Result<()> {
     Ok(())
 }
 
+/// Initializes a new V2-format queue file.
 pub fn init_v2_file(file: &mut File) -> Result<()> {
     file.set_len(V2_INITIAL_LEN)?;
 
@@ -68,6 +76,7 @@ pub fn init_v2_file(file: &mut File) -> Result<()> {
     Ok(())
 }
 
+/// Detects whether a file uses the V2 format by checking for the V2 magic number.
 pub fn detect_v2_magic(file: &mut File, real_file_len: u64, force_legacy: bool) -> Result<bool> {
     if force_legacy {
         return Ok(false);
@@ -90,6 +99,7 @@ pub fn detect_v2_magic(file: &mut File, real_file_len: u64, force_legacy: bool) 
     Ok(false)
 }
 
+/// Ensures a queue file exists at the given path, creating it if necessary.
 pub fn ensure_queue_file_exists(path: &Path, force_legacy: bool, capacity: u64) -> Result<()> {
     if !path.exists() {
         init(
@@ -102,6 +112,7 @@ pub fn ensure_queue_file_exists(path: &Path, force_legacy: bool, capacity: u64) 
     Ok(())
 }
 
+/// Parses either a legacy (16-byte) or v1 (32-byte) header from a file.
 pub fn parse_legacy_or_v1_header(
     file: &mut File, real_file_len: u64, force_legacy: bool,
 ) -> Result<LegacyHeaderState> {
@@ -180,6 +191,7 @@ pub fn open_internal_full<P: AsRef<Path>>(
     }
 }
 
+/// Opens a V2-format queue file.
 pub fn open_v2(
     file: File, real_file_len: u64, capacity: u64, overwrite_on_remove: bool, _path: &Path,
 ) -> Result<QueueFile> {
@@ -204,6 +216,10 @@ pub fn open_v2(
     Ok(qf)
 }
 
+/// Migrates a legacy or v1 queue file to v2 format.
+///
+/// Creates a new v2 file, copies all elements, and atomically replaces
+/// the original file.
 pub fn migrate_to_v2(path: &Path) -> Result<()> {
     use std::fs;
 
