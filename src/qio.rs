@@ -355,6 +355,23 @@ impl<'a> DataRingMut<'a> {
         Ok(())
     }
 
+    pub fn erase_at(&mut self, logical_pos: u64, len: usize) -> Result<()> {
+        let cap = self.capacity();
+        let mut pos = logical_pos % cap;
+        let mut remaining = len as u64;
+
+        while remaining > 0 {
+            let phys = self.data_start + pos;
+            let can_erase = min(remaining, cap - pos);
+            self.inner.write_zero_chunks(phys, can_erase as usize)?;
+
+            remaining -= can_erase;
+            pos = 0;
+        }
+
+        Ok(())
+    }
+
     pub fn relocate(&mut self, orig_file_len: u64, moved_count: u64) -> Result<()> {
         if moved_count == 0 {
             return Ok(());

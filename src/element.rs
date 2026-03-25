@@ -14,10 +14,11 @@ impl Element {
 
     #[inline]
     pub fn new(pos: u64, len: usize, seq: u64) -> Result<Self> {
-        ensure!(i64::try_from(pos).is_ok(), crate::error::Error::CorruptedFile {
-            msg: "element position must be less or equal to i64::MAX".to_string()
-        });
-        ensure!(i32::try_from(len).is_ok(), crate::error::Error::ElementTooBig);
+        ensure!(
+            i64::try_from(pos).is_ok(),
+            OutOfBounds { msg: "element position must be less or equal to i64::MAX".to_string() }
+        );
+        ensure!(i32::try_from(len).is_ok(), ElementTooBig);
 
         Ok(Self { pos, len, seq })
     }

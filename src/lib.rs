@@ -109,95 +109,43 @@
     clippy::too_many_lines
 )]
 
+mod cache;
 mod element;
 mod error;
+mod factory;
 mod format;
 mod header;
 mod qio;
 
 use std::cell::Cell;
-use std::cmp::min;
-use std::collections::VecDeque;
-use std::fs::{File, OpenOptions, rename};
+use std::fs::File;
 use std::io;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::Path;
 
-use bytes::{BufMut, BytesMut};
+use cache::OffsetCache;
+pub use cache::OffsetCacheKind;
 pub(crate) use element::Element;
 pub use error::Error;
 pub(crate) use error::{Result, maybe_inject_failpoint};
 pub(crate) use format::{
-    ExpansionPlan, FormatState, LegacyHeaderState, QueueMetadata, QueueStateSnapshot, V2OpenState,
-    parse_legacy_header, parse_versioned_header, read_v2_open_state,
+    ExpansionPlan, FileFormat, FormatState, LegacyHeaderState, QueueMetadata, QueueStateSnapshot,
+    V2Format, V2OpenState,
 };
-pub(crate) use header::{
-    SlotData, V2_INITIAL_LEN, V2_MAGIC, V2_SLOT_A_OFFSET, V2_SLOT_B_OFFSET, V2_SLOT_LEN,
-    build_slot_bytes,
-};
+pub(crate) use header::{SlotData, V2_INITIAL_LEN};
 pub(crate) use qio::{DataRing, DataRingMut, DeferredSyncPhase, QueueFileInner};
 
-/// Policy controlling how element file-positions are cached to accelerate [`Iter::nth`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OffsetCacheKind {
-    /// Cache one position every `offset` elements.
-    Linear { offset: usize },
-    /// Cache positions at indices that are perfect squares (1, 4, 9, 16, 25, …).
-    Quadratic,
-}
-
-/// A lightning-fast, transactional, file-based FIFO queue.
-///
-/// [`QueueFile`] stores a sequence of arbitrary byte blobs in a single backing file. Adding and
-/// removing elements are both O(1) operations. By default every write is immediately flushed to
-/// disk via `sync_data`, making the queue crash-safe.
-///
-/// # Ring-buffer layout
-///
-/// After the fixed-size header, the remaining file space is treated as a circular buffer.
-/// - `first` points to the head element (the next one to be dequeued).
-/// - `last` points to the tail element (the most-recently enqueued one).
-/// - When `last.pos >= first.pos` the data is **contiguous** in the file.
-/// - When `last.pos < first.pos` the data **wraps**: the tail portion of the live data is stored
-///   near the beginning of the file (just after the header) and the head portion is stored near
-///   the end.
-/// - The file grows by doubling when there is no room for the next write.
-///
-/// # Atomicity
-///
-/// The header is the last thing written on every mutation.
-///
-/// # Example
-///
-/// ```
-/// use queue_file::QueueFile;
-///
-/// # let path = auto_delete_path::AutoDeletePath::temp();
-/// let mut qf = QueueFile::open(path)
-///     .expect("cannot open queue file");
-/// let data = "Welcome to QueueFile!".as_bytes();
-///
-/// qf.add(&data).expect("add failed");
-///
-/// if let Ok(Some(bytes)) = qf.peek() {
-///     assert_eq!(data, bytes.as_slice());
-/// }
-///
-/// qf.remove().expect("remove failed");
-/// ```
 #[derive(Debug)]
 pub struct QueueFile {
-    inner: QueueFileInner,
+    pub(crate) inner: QueueFileInner,
     format: FormatState,
     elem_cnt: usize,
     first: Element,
     last: Element,
-    capacity: u64,
+    pub(crate) capacity: u64,
     overwrite_on_remove: bool,
     skip_write_header_on_add: bool,
-    cached_offsets: VecDeque<(usize, Element)>,
-    offset_cache_kind: Option<OffsetCacheKind>,
+    cache: OffsetCache,
     #[allow(dead_code)]
     _marker: PhantomData<Cell<()>>,
 }
@@ -211,7 +159,7 @@ impl Drop for QueueFile {
 }
 
 impl QueueFile {
-    const INITIAL_LENGTH: u64 = 4096;
+    pub(crate) const INITIAL_LENGTH: u64 = 4096;
 
     #[inline]
     const fn data_start(&self) -> u64 {
@@ -220,61 +168,9 @@ impl QueueFile {
 
     // ── Constructors ─────────────────────────────────────────────────────────
 
-    fn init(path: &Path, force_legacy: bool, capacity: u64) -> Result<()> {
-        let tmp_path = path.with_extension(".tmp");
-
-        {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-
-            if force_legacy {
-                Self::init_legacy_file(&mut file, capacity)?;
-            } else {
-                Self::init_v2_file(&mut file)?;
-            }
-        }
-
-        rename(tmp_path, path)?;
-        Ok(())
-    }
-
-    fn init_legacy_file(file: &mut File, capacity: u64) -> Result<()> {
-        file.set_len(capacity)?;
-        let mut buf = BytesMut::with_capacity(16);
-        buf.put_u32(capacity as u32);
-        file.write_all(buf.as_ref())?;
-        Ok(())
-    }
-
-    fn init_v2_file(file: &mut File) -> Result<()> {
-        file.set_len(V2_INITIAL_LEN)?;
-
-        let slot_a = SlotData {
-            file_length: V2_INITIAL_LEN,
-            element_count: 0,
-            first_position: 0,
-            last_position: 0,
-            generation: 1,
-            next_sequence_number: 1,
-        };
-        let slot_b = SlotData { generation: 0, ..slot_a };
-
-        file.seek(SeekFrom::Start(V2_SLOT_A_OFFSET))?;
-        file.write_all(&build_slot_bytes(&slot_a))?;
-
-        file.seek(SeekFrom::Start(V2_SLOT_B_OFFSET))?;
-        file.write_all(&build_slot_bytes(&slot_b))?;
-
-        Ok(())
-    }
-
     /// Opens or creates a [`QueueFile`] at `path` with the given initial file size.
     pub fn with_capacity<P: AsRef<Path>>(path: P, capacity: u64) -> Result<Self> {
-        Self::open_internal_full(path, true, false, capacity, true)
+        factory::open_internal_full(path, true, false, capacity, true)
     }
 
     /// Opens or creates a [`QueueFile`] at `path` using v2 format with a 4 KiB initial file size.
@@ -284,83 +180,10 @@ impl QueueFile {
 
     /// Opens or creates a [`QueueFile`] at `path` using the legacy (16-byte) header format.
     pub fn open_legacy<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_internal_full(path, true, true, Self::INITIAL_LENGTH, false)
+        factory::open_internal_full(path, true, true, Self::INITIAL_LENGTH, false)
     }
 
-    fn detect_v2_magic(file: &mut File, real_file_len: u64, force_legacy: bool) -> Result<bool> {
-        if force_legacy {
-            return Ok(false);
-        }
-        let mut magic_buf = [0u8; 4];
-        if real_file_len >= V2_SLOT_LEN as u64 {
-            file.seek(SeekFrom::Start(V2_SLOT_A_OFFSET))?;
-            file.read_exact(&mut magic_buf)?;
-            if u32::from_be_bytes(magic_buf) == V2_MAGIC {
-                return Ok(true);
-            }
-        }
-        if real_file_len >= V2_SLOT_B_OFFSET + V2_SLOT_LEN as u64 {
-            file.seek(SeekFrom::Start(V2_SLOT_B_OFFSET))?;
-            file.read_exact(&mut magic_buf)?;
-            if u32::from_be_bytes(magic_buf) == V2_MAGIC {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn ensure_queue_file_exists(path: &Path, force_legacy: bool, capacity: u64) -> Result<()> {
-        if !path.exists() {
-            Self::init(
-                path,
-                force_legacy,
-                capacity.max(if force_legacy { Self::INITIAL_LENGTH } else { V2_INITIAL_LEN }),
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn parse_legacy_or_v1_header(
-        file: &mut File, real_file_len: u64, force_legacy: bool,
-    ) -> Result<LegacyHeaderState> {
-        let mut buf = [0u8; 32];
-        file.seek(SeekFrom::Start(0))?;
-        let bytes_read = file.read(&mut buf)?;
-        ensure!(bytes_read >= 32, Error::CorruptedFile { msg: "file too short".to_string() });
-
-        let versioned = !force_legacy && (buf[0] & 0x80) != 0;
-        let mut buf = BytesMut::from(&buf[..]);
-
-        let (format, header_len, file_len, elem_cnt, first_pos, last_pos) = if versioned {
-            let (file_len, elem_cnt, first_pos, last_pos) = parse_versioned_header(&mut buf)?;
-            (FormatState::V1, 32u64, file_len, elem_cnt, first_pos, last_pos)
-        } else {
-            let (file_len, elem_cnt, first_pos, last_pos) = parse_legacy_header(&mut buf)?;
-            (FormatState::Legacy, 16u64, file_len, elem_cnt, first_pos, last_pos)
-        };
-
-        ensure!(file_len <= real_file_len, Error::CorruptedFile {
-            msg: format!(
-                "file is truncated. expected length was {file_len} but actual length is {real_file_len}"
-            )
-        });
-        ensure!(file_len >= header_len, Error::CorruptedFile {
-            msg: format!("length stored in header ({file_len}) is invalid")
-        });
-        ensure!(first_pos <= file_len, Error::CorruptedFile {
-            msg: format!("position of the first element ({first_pos}) is beyond the file")
-        });
-        ensure!(last_pos <= file_len, Error::CorruptedFile {
-            msg: format!("position of the last element ({last_pos}) is beyond the file")
-        });
-
-        let _ = header_len;
-
-        Ok(LegacyHeaderState { format, file_len, elem_cnt, first_pos, last_pos })
-    }
-
-    fn build_legacy_queue_file(
+    pub(crate) fn build_legacy_queue_file(
         file: File, state: LegacyHeaderState, capacity: u64, overwrite_on_remove: bool,
     ) -> Result<Self> {
         let mut queue_file = Self {
@@ -380,8 +203,7 @@ impl QueueFile {
             capacity,
             overwrite_on_remove,
             skip_write_header_on_add: false,
-            cached_offsets: VecDeque::new(),
-            offset_cache_kind: None,
+            cache: OffsetCache::new(),
             _marker: PhantomData,
         };
 
@@ -392,11 +214,11 @@ impl QueueFile {
         if state.elem_cnt > 0 {
             let data_start = state.format.data_start();
             let first_logical =
-                state.first_pos.checked_sub(data_start).ok_or_else(|| Error::CorruptedFile {
+                state.first_pos.checked_sub(data_start).ok_or_else(|| Error::OutOfBounds {
                     msg: format!("first_pos {} < data_start {}", state.first_pos, data_start),
                 })?;
             let last_logical =
-                state.last_pos.checked_sub(data_start).ok_or_else(|| Error::CorruptedFile {
+                state.last_pos.checked_sub(data_start).ok_or_else(|| Error::OutOfBounds {
                     msg: format!("last_pos {} < data_start {}", state.last_pos, data_start),
                 })?;
 
@@ -407,60 +229,7 @@ impl QueueFile {
         Ok(queue_file)
     }
 
-    fn open_internal_full<P: AsRef<Path>>(
-        path: P, overwrite_on_remove: bool, force_legacy: bool, capacity: u64,
-        mut allow_migration: bool,
-    ) -> Result<Self> {
-        let path = path.as_ref();
-
-        loop {
-            Self::ensure_queue_file_exists(path, force_legacy, capacity)?;
-
-            let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-            let real_file_len = file.metadata()?.len();
-
-            if Self::detect_v2_magic(&mut file, real_file_len, force_legacy)? {
-                return Self::open_v2(file, real_file_len, capacity, overwrite_on_remove, path);
-            }
-
-            let state = Self::parse_legacy_or_v1_header(&mut file, real_file_len, force_legacy)?;
-
-            if allow_migration && !force_legacy {
-                drop(file);
-                Self::migrate_to_v2(path)?;
-                allow_migration = false;
-                continue;
-            }
-
-            return Self::build_legacy_queue_file(file, state, capacity, overwrite_on_remove);
-        }
-    }
-
-    fn open_v2(
-        file: File, real_file_len: u64, capacity: u64, overwrite_on_remove: bool, _path: &Path,
-    ) -> Result<Self> {
-        let inner = QueueFileInner {
-            file: Some(file),
-            file_len: real_file_len,
-            expected_seek: 0,
-            last_seek: None,
-            transfer_buf: vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
-            sync_writes: cfg!(not(test)),
-            deferred_sync_phase: None,
-        };
-
-        let open_state = read_v2_open_state(&inner, real_file_len)?;
-        let mut qf = Self::build_v2_queue_file(inner, open_state, capacity, overwrite_on_remove);
-        qf.initialize_v2_endpoints(open_state.slot)?;
-
-        if open_state.slot.file_length < qf.capacity {
-            qf.inner.sync_set_len(qf.capacity)?;
-        }
-
-        Ok(qf)
-    }
-
-    fn build_v2_queue_file(
+    pub(crate) fn build_v2_queue_file(
         mut inner: QueueFileInner, open_state: V2OpenState, capacity: u64,
         overwrite_on_remove: bool,
     ) -> Self {
@@ -468,46 +237,42 @@ impl QueueFile {
 
         Self {
             inner,
-            format: FormatState::V2 {
+            format: FormatState::V2(V2Format {
                 active_slot: open_state.active_slot,
                 generation: open_state.slot.generation,
                 next_seq: open_state.slot.next_sequence_number,
-            },
+            }),
             elem_cnt: open_state.elem_cnt,
             first: Element::EMPTY,
             last: Element::EMPTY,
             capacity: capacity.max(V2_INITIAL_LEN),
             overwrite_on_remove,
             skip_write_header_on_add: false,
-            cached_offsets: VecDeque::new(),
-            offset_cache_kind: None,
+            cache: OffsetCache::new(),
             _marker: PhantomData,
         }
     }
 
-    fn initialize_v2_endpoints(&mut self, slot: SlotData) -> Result<()> {
+    pub(crate) fn initialize_v2_endpoints(&mut self, slot: SlotData) -> Result<()> {
         if self.elem_cnt == 0 {
             return Ok(());
         }
 
         let data_start = self.data_start();
         let first_logical =
-            slot.first_position.checked_sub(data_start).ok_or_else(|| Error::CorruptedFile {
+            slot.first_position.checked_sub(data_start).ok_or_else(|| Error::OutOfBounds {
                 msg: format!("v2 first_pos {} < data_start {}", slot.first_position, data_start),
             })?;
         let last_logical =
-            slot.last_position.checked_sub(data_start).ok_or_else(|| Error::CorruptedFile {
+            slot.last_position.checked_sub(data_start).ok_or_else(|| Error::OutOfBounds {
                 msg: format!("v2 last_pos {} < data_start {}", slot.last_position, data_start),
             })?;
 
         let last_header = self.format.validate_v2_element_header(&self.ring(), last_logical)?;
-        ensure!(last_header.seq == slot.next_sequence_number - 1, Error::CorruptedFile {
-            msg: format!(
-                "v2 tail seq {} != next_seq-1 {}",
-                last_header.seq,
-                slot.next_sequence_number - 1
-            )
-        });
+        ensure!(
+            last_header.seq == slot.next_sequence_number - 1,
+            SequenceMismatch { expected: slot.next_sequence_number - 1, found: last_header.seq }
+        );
 
         self.last =
             Element { pos: last_logical, len: last_header.payload_len, seq: last_header.seq };
@@ -529,7 +294,7 @@ impl QueueFile {
 
         for step in 0..elem_cnt {
             let expected_seq =
-                last_seq.checked_sub(step as u64).ok_or_else(|| Error::CorruptedFile {
+                last_seq.checked_sub(step as u64).ok_or_else(|| Error::InvalidValue {
                     msg: format!(
                         "v2 recovery: tail seq {last_seq} too small for element_count {elem_cnt}"
                     ),
@@ -555,9 +320,10 @@ impl QueueFile {
     ) -> Result<(Element, u64)> {
         let current_header = self.format.validate_v2_element_header(&self.ring(), pos)?;
 
-        ensure!(current_header.seq == expected_seq, Error::CorruptedFile {
-            msg: format!("v2 recovery: seq {} != expected {expected_seq}", current_header.seq)
-        });
+        ensure!(
+            current_header.seq == expected_seq,
+            SequenceMismatch { expected: expected_seq, found: current_header.seq }
+        );
 
         let current = Element { pos, len: current_header.payload_len, seq: current_header.seq };
 
@@ -565,19 +331,21 @@ impl QueueFile {
             return Ok((current, 0));
         }
 
-        ensure!(current_header.prev_pos != 0, Error::CorruptedFile {
-            msg: format!("v2 recovery: walked {} elements but expected {}", step + 1, elem_cnt)
-        });
+        ensure!(
+            current_header.prev_pos != 0,
+            InvalidValue {
+                msg: format!("v2 recovery: walked {} elements but expected {}", step + 1, elem_cnt)
+            }
+        );
 
         let data_start = self.data_start();
-        let next_pos = current_header.prev_pos.checked_sub(data_start).ok_or_else(|| {
-            Error::CorruptedFile {
+        let next_pos =
+            current_header.prev_pos.checked_sub(data_start).ok_or_else(|| Error::OutOfBounds {
                 msg: format!(
                     "v2 recovery: prev_pos {} < data_start {}",
                     current_header.prev_pos, data_start
                 ),
-            }
-        })?;
+            })?;
 
         Ok((current, next_pos))
     }
@@ -631,7 +399,7 @@ impl QueueFile {
 
     #[inline]
     pub const fn cache_offset_policy(&self) -> Option<OffsetCacheKind> {
-        self.offset_cache_kind
+        self.cache.kind
     }
 
     #[deprecated(since = "1.4.7", note = "Use `cache_offset_policy` instead.")]
@@ -641,11 +409,7 @@ impl QueueFile {
 
     #[inline]
     pub fn set_cache_offset_policy(&mut self, kind: impl Into<Option<OffsetCacheKind>>) {
-        self.offset_cache_kind = kind.into();
-
-        if self.offset_cache_kind.is_none() {
-            self.cached_offsets.clear();
-        }
+        self.cache.set_policy(kind);
     }
 
     #[inline]
@@ -686,7 +450,7 @@ impl QueueFile {
             first: self.first,
             last: self.last,
             overwrite_on_remove: self.overwrite_on_remove,
-            cached_offsets: self.cached_offsets.clone(),
+            cache: self.cache.clone(),
         }
     }
 
@@ -697,56 +461,16 @@ impl QueueFile {
         self.first = snapshot.first;
         self.last = snapshot.last;
         self.overwrite_on_remove = snapshot.overwrite_on_remove;
-        self.cached_offsets = snapshot.cached_offsets;
+        self.cache = snapshot.cache;
     }
 
     fn cache_elem_if_needed(&mut self, index: usize, elem: Element, affected_items: usize) {
-        debug_assert!(index <= self.elem_cnt);
-        debug_assert!(index + 1 >= affected_items);
-
-        let need_to_cache = match self.offset_cache_kind {
-            Some(OffsetCacheKind::Linear { offset }) => {
-                let last_cached_index = self.cached_offsets.back().map_or(0, |(idx, _)| *idx);
-                Self::should_cache_linear(index, offset, last_cached_index)
-            }
-            Some(OffsetCacheKind::Quadratic) => Self::should_cache_quadratic(index, affected_items),
-            None => false,
-        };
-
-        if !need_to_cache {
-            return;
-        }
-
-        if let Some(&(last_cached_index, last_cached_elem)) = self.cached_offsets.back() {
-            if last_cached_index >= index {
-                if last_cached_index == index {
-                    debug_assert_eq!(last_cached_elem.pos, elem.pos);
-                    debug_assert_eq!(last_cached_elem.len, elem.len);
-                }
-
-                return;
-            }
-        }
-
-        self.cached_offsets.push_back((index, elem));
-    }
-
-    #[inline]
-    const fn should_cache_linear(index: usize, offset: usize, last_cached_index: usize) -> bool {
-        index.saturating_sub(last_cached_index) >= offset
-    }
-
-    #[inline]
-    fn should_cache_quadratic(index: usize, affected_items: usize) -> bool {
-        let x = (index as f64).sqrt() as usize;
-        x > 1 && (index + 1 - affected_items..=index).contains(&(x * x))
+        self.cache.cache_elem_if_needed(index, elem, self.elem_cnt, affected_items);
     }
 
     #[inline]
     fn cached_index_up_to(&self, i: usize) -> Option<usize> {
-        self.cached_offsets
-            .binary_search_by(|(idx, _)| idx.cmp(&i))
-            .map_or_else(|i| i.checked_sub(1), Some)
+        self.cache.cached_index_up_to(i)
     }
 
     fn with_batched_append_sync<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
@@ -908,12 +632,13 @@ impl QueueFile {
         }
 
         debug_assert!(
-            self.cached_offsets
+            self.cache
+                .offsets
                 .iter()
-                .zip(self.cached_offsets.iter().skip(1))
+                .zip(self.cache.offsets.iter().skip(1))
                 .all(|(a, b)| a.0 < b.0),
             "{:?}",
-            self.cached_offsets
+            self.cache.offsets
         );
 
         let old_first_pos = self.first.pos;
@@ -934,7 +659,7 @@ impl QueueFile {
         self.drop_cached_offsets_up_to(n);
 
         if self.overwrite_on_remove {
-            self.ring_erase_logical(old_first_pos, erase_total_len)?;
+            self.ring_mut().erase_at(old_first_pos, erase_total_len)?;
         }
 
         Ok(())
@@ -945,7 +670,7 @@ impl QueueFile {
         let mut remaining_to_skip = n;
 
         if let Some(i) = self.cached_index_up_to(n) {
-            let (index, elem) = self.cached_offsets[i];
+            let (index, elem) = self.cache.offsets[i];
             if index <= n {
                 new_first = elem;
                 remaining_to_skip = n - index;
@@ -962,10 +687,7 @@ impl QueueFile {
     }
 
     fn drop_cached_offsets_up_to(&mut self, n: usize) {
-        while matches!(self.cached_offsets.front(), Some((index, _)) if *index < n) {
-            self.cached_offsets.pop_front();
-        }
-        self.cached_offsets.iter_mut().for_each(|(i, _)| *i -= n);
+        self.cache.drop_up_to(n);
     }
 
     // ── clear ─────────────────────────────────────────────────────────────────
@@ -989,7 +711,7 @@ impl QueueFile {
             }
         }
 
-        self.cached_offsets.clear();
+        self.cache.clear();
 
         if self.file_len() > new_cap {
             self.inner.sync_set_len(new_cap)?;
@@ -1034,7 +756,7 @@ impl QueueFile {
     }
 
     #[inline]
-    pub const fn used_bytes(&self) -> u64 {
+    pub fn used_bytes(&self) -> u64 {
         if self.elem_cnt == 0 {
             self.data_start()
         } else {
@@ -1057,7 +779,7 @@ impl QueueFile {
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     #[inline]
-    const fn remaining_bytes(&self) -> u64 {
+    fn remaining_bytes(&self) -> u64 {
         self.file_len() - self.used_bytes()
     }
 
@@ -1066,12 +788,12 @@ impl QueueFile {
     }
 
     #[inline]
-    const fn elem_hdr_len(&self) -> u64 {
+    fn elem_hdr_len(&self) -> u64 {
         self.format.elem_hdr_len()
     }
 
     #[inline]
-    const fn elem_span(&self, payload_len: usize) -> u64 {
+    fn elem_span(&self, payload_len: usize) -> u64 {
         self.format.elem_span(payload_len)
     }
 
@@ -1080,24 +802,6 @@ impl QueueFile {
     ) -> Result<()> {
         let metadata = QueueMetadata { file_len, elem_cnt, first_pos, last_pos };
         self.format.commit_header(&mut self.inner, metadata)
-    }
-
-    fn ring_erase_logical(&mut self, logical_pos: u64, n: usize) -> Result<()> {
-        let cap = self.ring_mut().capacity();
-        let mut pos = logical_pos % cap;
-        let mut remaining = n as u64;
-
-        while remaining > 0 {
-            let phys = self.format.data_start() + pos;
-            let can_write = min(remaining, cap - pos);
-            self.inner.seek(phys);
-            self.inner.write_zeroes(can_write)?;
-
-            remaining -= can_write;
-            pos = 0;
-        }
-
-        Ok(())
     }
 
     fn compute_expanded_len(current_len: u64, mut remaining_bytes: u64, data_len: u64) -> u64 {
@@ -1130,7 +834,7 @@ impl QueueFile {
         })
     }
 
-    const fn calculate_tail_metrics(&self) -> (u64, bool) {
+    fn calculate_tail_metrics(&self) -> (u64, bool) {
         if self.elem_cnt > 0 {
             let ring = self.ring();
             let end = ring.add(self.last.pos, self.format.elem_span(self.last.len));
@@ -1170,7 +874,7 @@ impl QueueFile {
 
     fn cleanup_after_expansion(&mut self, plan: ExpansionPlan) -> Result<()> {
         if self.overwrite_on_remove {
-            self.ring_erase_logical(0, plan.moved_count as usize)?;
+            self.ring_mut().erase_at(0, plan.moved_count as usize)?;
             self.format.on_expansion_cleanup(&plan)?;
         }
 
@@ -1185,57 +889,13 @@ impl QueueFile {
         let bytes_used_before = self.used_bytes();
         self.inner.sync_set_len(plan.new_len)?;
         self.relocate_wrapped_data(plan)?;
-        self.cached_offsets.clear();
+        self.cache.clear();
         self.cleanup_after_expansion(plan)?;
 
         let bytes_used_after = self.used_bytes();
         debug_assert_eq!(bytes_used_before, bytes_used_after);
 
         Ok(())
-    }
-
-    // ── Migration ─────────────────────────────────────────────────────────────
-
-    fn migrate_to_v2(path: &Path) -> Result<()> {
-        use std::fs;
-
-        let tmp = path.with_extension("v2tmp");
-
-        let result = (|| -> Result<()> {
-            let src = Self::open_internal_full(path, true, false, Self::INITIAL_LENGTH, false)?;
-
-            Self::init(&tmp, false, V2_INITIAL_LEN)?;
-            let mut dst = Self::open_internal_full(
-                &tmp,
-                src.overwrite_on_remove,
-                false,
-                V2_INITIAL_LEN,
-                false,
-            )?;
-            dst.inner.sync_writes = false;
-
-            {
-                let mut src_iter = src.iter();
-                while let Some(elem) = src_iter.borrowed_next() {
-                    let owned: Vec<u8> = elem.to_vec();
-                    dst.add(&owned)?;
-                }
-            }
-
-            dst.sync_all()?;
-
-            drop(src);
-            drop(dst);
-
-            rename(&tmp, path)?;
-            Ok(())
-        })();
-
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-
-        result
     }
 }
 
@@ -1292,7 +952,7 @@ impl Iterator for Iter<'_> {
 impl Iter<'_> {
     fn jump_to_cache_if_closer(&mut self, target_idx: usize) {
         if let Some(cache_idx) = self.queue_file.cached_index_up_to(target_idx) {
-            let (index, elem) = self.queue_file.cached_offsets[cache_idx];
+            let (index, elem) = self.queue_file.cache.offsets[cache_idx];
             if index > self.next_elem_index {
                 self.next_elem_index = index;
                 self.next_elem_pos = elem.pos;
@@ -1346,6 +1006,7 @@ impl Iter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
 
     fn create_inner(len: u64) -> (QueueFileInner, auto_delete_path::AutoDeletePath) {
         let p = auto_delete_path::AutoDeletePath::temp();
@@ -1419,15 +1080,16 @@ mod tests {
         }
 
         assert_eq!(
-            qf.cached_offsets.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            qf.cache.offsets.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
             (1..8).collect::<Vec<_>>()
         );
 
         qf.remove_n(3).unwrap();
 
-        assert_eq!(qf.cached_offsets.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(), vec![
-            0, 1, 2, 3, 4
-        ]);
+        assert_eq!(
+            qf.cache.offsets.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
         assert_eq!(qf.iter().map(|v| v[0]).collect::<Vec<_>>(), vec![3, 4, 5, 6, 7]);
         assert_eq!(qf.iter().nth(2).map(|v| v[0]), Some(5));
     }
