@@ -213,6 +213,11 @@ impl FileFormat for LegacyFormat {
         _elem_cnt: usize,
     ) -> Result<Option<u64>> {
         if last.pos < first.pos {
+            // The wrapped data at logical [0, moved_count) was just copied to
+            // logical [orig_capacity, orig_capacity + moved_count).  `last.pos`
+            // falls in that range, so its new logical position is
+            // `last.pos + orig_capacity`, where
+            // `orig_capacity = orig_file_len - data_start`.
             return Ok(Some(plan.orig_file_len - ring.data_start + last.pos));
         }
         Ok(None)
@@ -299,6 +304,10 @@ impl FileFormat for V1Format {
         _elem_cnt: usize,
     ) -> Result<Option<u64>> {
         if last.pos < first.pos {
+            // Same logic as LegacyFormat: the wrapped data at logical
+            // [0, moved_count) was copied to [orig_capacity, orig_capacity +
+            // moved_count), so `last.pos` shifts by `orig_capacity =
+            // orig_file_len - data_start`.
             return Ok(Some(plan.orig_file_len - ring.data_start + last.pos));
         }
         Ok(None)

@@ -512,3 +512,56 @@ fn iter_nth_large_payloads() {
     assert_eq!(q.iter().nth(19).unwrap(), payloads[19]);
     assert!(q.iter().nth(20).is_none());
 }
+
+/// Regression test: verify that `on_expansion` correctly updates `last.pos`
+/// after a wrapped-queue expansion in the legacy (16-byte header) format.
+#[test]
+fn legacy_wrapped_expansion() {
+    let p = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::open_legacy(&p).unwrap();
+
+    for i in 0..50u32 {
+        qf.add(&i.to_be_bytes()).unwrap();
+    }
+    qf.remove_n(20).unwrap();
+    for i in 50..80u32 {
+        qf.add(&i.to_be_bytes()).unwrap();
+    }
+
+    let items: Vec<u32> =
+        qf.iter().map(|b| u32::from_be_bytes(b[..].try_into().unwrap())).collect();
+    assert_eq!(items, (20..80u32).collect::<Vec<_>>());
+
+    // Reopen to verify the header was committed with the relocated position.
+    drop(qf);
+    let qf2 = QueueFile::open_legacy(&p).unwrap();
+    let items2: Vec<u32> =
+        qf2.iter().map(|b| u32::from_be_bytes(b[..].try_into().unwrap())).collect();
+    assert_eq!(items2, (20..80u32).collect::<Vec<_>>());
+}
+
+/// Same as `legacy_wrapped_expansion` but for the V1 (32-byte header) format.
+#[test]
+fn v1_wrapped_expansion() {
+    let p = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::open(&p).unwrap();
+
+    for i in 0..50u32 {
+        qf.add(&i.to_be_bytes()).unwrap();
+    }
+    qf.remove_n(20).unwrap();
+    for i in 50..80u32 {
+        qf.add(&i.to_be_bytes()).unwrap();
+    }
+
+    let items: Vec<u32> =
+        qf.iter().map(|b| u32::from_be_bytes(b[..].try_into().unwrap())).collect();
+    assert_eq!(items, (20..80u32).collect::<Vec<_>>());
+
+    // Reopen to verify the header was committed with the relocated position.
+    drop(qf);
+    let qf2 = QueueFile::open(&p).unwrap();
+    let items2: Vec<u32> =
+        qf2.iter().map(|b| u32::from_be_bytes(b[..].try_into().unwrap())).collect();
+    assert_eq!(items2, (20..80u32).collect::<Vec<_>>());
+}
