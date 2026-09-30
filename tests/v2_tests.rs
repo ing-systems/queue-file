@@ -1269,3 +1269,46 @@ fn v2_empty_elements() {
     assert_eq!(items[1], b"".to_vec());
     assert_eq!(items[2], b"after".to_vec());
 }
+
+/// Backlinks of elements relocated by a wrapped expansion must be rewritten, even when the
+/// relocated region is larger than the v2 data start offset, so that head recovery still works.
+#[test]
+fn v2_recover_head_after_large_wrapped_expansion() {
+    let _lock = lock_failpoint_env();
+    let p = temp_path();
+    let payload = |i: u32| {
+        let mut buf = vec![0u8; 956];
+        buf[..4].copy_from_slice(&i.to_be_bytes());
+        buf
+    };
+
+    let expected = {
+        // 64 KiB data region; each element spans 956 + 44 = 1000 bytes.
+        let mut qf = QueueFile::with_capacity(&p, V2_DATA_START + 65536).unwrap();
+        for i in 0..60 {
+            qf.add(&payload(i)).unwrap();
+        }
+        qf.remove_n(40).unwrap();
+        // Wrap roughly 24 KiB of elements around the end of the ring.
+        for i in 60..90 {
+            qf.add(&payload(i)).unwrap();
+        }
+
+        let old_file_len = qf.file_len();
+        qf.add(&vec![7u8; 20_000]).unwrap();
+        assert!(qf.file_len() > old_file_len, "test setup should force a wrapped expansion");
+
+        qf.iter().collect::<Vec<_>>()
+    };
+
+    // Point first_position at garbage so open must recover the head through backlinks.
+    let (mut active_bytes, active_offset) = active_slot(&p);
+    let last_pos = i64::from_be_bytes(active_bytes[28..36].try_into().unwrap()) as u64;
+    active_bytes[20..28].copy_from_slice(&((last_pos + 1) as i64).to_be_bytes());
+    let new_crc = crc32(&active_bytes[..52]);
+    active_bytes[52..56].copy_from_slice(&new_crc.to_be_bytes());
+    write_bytes_at(&p, active_offset, &active_bytes);
+
+    let qf = QueueFile::open(&p).unwrap();
+    assert_eq!(qf.iter().collect::<Vec<_>>(), expected);
+}

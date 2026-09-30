@@ -377,7 +377,6 @@ fn rewrite_v2_backlinks_after_expansion(
 ) -> Result<()> {
     let data_start = ring.data_start;
     let moved_offset = plan.orig_file_len - data_start;
-    let boundary = plan.end_of_last_elem - data_start;
 
     ring.inner.with_deferred_sync(DeferredSyncPhase::BacklinkRewrite, |inner| {
         let mut ring = DataRingMut::new(inner, data_start);
@@ -388,7 +387,9 @@ fn rewrite_v2_backlinks_after_expansion(
             ring.as_read_only().read_at(pos, &mut hdr)?;
             let header = parse_v2_element_header(&hdr, pos, ring.capacity())?;
 
-            if header.prev_pos < boundary {
+            // `prev_pos` is physical (0 means "no predecessor"); only predecessors in the
+            // relocated physical range [data_start, end_of_last_elem) have moved.
+            if header.prev_pos != 0 && header.prev_pos < plan.end_of_last_elem {
                 let patched = encode_v2_element_header(
                     header.seq,
                     header.prev_pos + moved_offset,
