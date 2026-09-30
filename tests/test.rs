@@ -565,3 +565,34 @@ fn v1_wrapped_expansion() {
         qf2.iter().map(|b| u32::from_be_bytes(b[..].try_into().unwrap())).collect();
     assert_eq!(items2, (20..80u32).collect::<Vec<_>>());
 }
+
+/// With `overwrite_on_remove`, every byte of removed elements must be zeroed, including
+/// elements larger than a single internal write chunk.
+#[test_case(false, false; "v2 remove")]
+#[test_case(false, true; "v2 clear")]
+#[test_case(true, false; "legacy remove")]
+#[test_case(true, true; "legacy clear")]
+fn overwrite_on_remove_erases_large_elements(legacy: bool, clear: bool) {
+    const MARKER: u8 = 0xAB;
+    let p = auto_delete_path::AutoDeletePath::temp();
+    {
+        let mut qf = if legacy {
+            QueueFile::open_legacy(&p).unwrap()
+        } else {
+            QueueFile::with_capacity(&p, 1024 * 1024).unwrap()
+        };
+        assert!(qf.overwrite_on_remove());
+
+        qf.add(&vec![MARKER; 200 * 1024]).unwrap();
+        qf.add(b"tail").unwrap();
+        if clear {
+            qf.clear().unwrap();
+        } else {
+            qf.remove().unwrap();
+        }
+    }
+
+    let contents = std::fs::read(&p).unwrap();
+    let leftover = contents.iter().filter(|&&b| b == MARKER).count();
+    assert_eq!(leftover, 0, "{leftover} bytes of removed element data remain on disk");
+}

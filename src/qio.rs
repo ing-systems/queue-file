@@ -118,6 +118,9 @@ impl QueueFileInner {
 
         self.file_mut()?.write_all(buf)?;
 
+        // Advance the logical cursor too, so consecutive writes append instead of rewriting
+        // the same range.
+        self.expected_seek += buf.len() as u64;
         if let Some(seek) = &mut self.last_seek {
             *seek += buf.len() as u64;
         }
