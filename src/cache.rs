@@ -41,7 +41,7 @@ pub struct OffsetCache {
 
 impl OffsetCache {
     /// Creates a new empty cache.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { offsets: RefCell::new(VecDeque::new()), kind: None, total_removed: Cell::new(0) }
     }
 

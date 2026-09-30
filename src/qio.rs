@@ -11,7 +11,9 @@
 use std::cmp::min;
 use std::fs::File;
 use std::io as io_std;
-use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(windows)]
+use std::io::Read;
+use std::io::{Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -171,12 +173,12 @@ impl QueueFileInner {
             source: io_std::Error::new(io_std::ErrorKind::InvalidInput, "no file"),
         })?;
 
-        let mut bytes_left = count as i64;
+        let mut bytes_left = count;
         let mut current_read = read_pos;
         let mut current_write = write_pos;
 
         while bytes_left > 0 {
-            let bytes_to_read = min(bytes_left as usize, Self::TRANSFER_BUFFER_SIZE);
+            let bytes_to_read = min(bytes_left, Self::TRANSFER_BUFFER_SIZE as u64) as usize;
             let slice = &mut self.transfer_buf[..bytes_to_read];
 
             #[cfg(unix)]
@@ -196,7 +198,7 @@ impl QueueFileInner {
 
             current_read += bytes_to_read as u64;
             current_write += bytes_to_read as u64;
-            bytes_left -= bytes_to_read as i64;
+            bytes_left -= bytes_to_read as u64;
         }
 
         if self.sync_writes {
@@ -216,49 +218,21 @@ impl QueueFileInner {
     }
 
     pub fn write_zeroes(&mut self, len: u64) -> Result<()> {
-        struct InnerWriter<'a>(&'a mut QueueFileInner);
+        static ZEROES: [u8; 64 * 1024] = [0; 64 * 1024];
 
-        impl Write for InnerWriter<'_> {
-            fn write(&mut self, buf: &[u8]) -> io_std::Result<usize> {
-                self.0
-                    .write(buf)
-                    .map_err(|e| io_std::Error::new(io_std::ErrorKind::Other, e.to_string()))?;
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io_std::Result<()> {
-                Ok(())
-            }
+        let mut remaining = len;
+        while remaining > 0 {
+            let chunk = min(remaining, ZEROES.len() as u64) as usize;
+            self.write(&ZEROES[..chunk])?;
+            remaining -= chunk as u64;
         }
 
-        io_std::copy(&mut io_std::repeat(0).take(len), &mut InnerWriter(self))?;
         Ok(())
     }
 
     pub fn write_zero_chunks(&mut self, pos: u64, len: usize) -> Result<()> {
         self.seek(pos);
         self.write_zeroes(len as u64)
-    }
-
-    #[inline]
-    pub fn with_batched_backlink_rewrite_sync<T>(
-        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.with_deferred_sync(DeferredSyncPhase::BacklinkRewrite, f)
-    }
-
-    #[inline]
-    pub fn with_batched_clear_erase_sync<T>(
-        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.with_deferred_sync(DeferredSyncPhase::ClearErase, f)
-    }
-
-    #[inline]
-    pub fn with_batched_expansion_copy_sync<T>(
-        &mut self, f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.with_deferred_sync(DeferredSyncPhase::ExpansionCopy, f)
     }
 
     pub fn with_deferred_sync<T>(
@@ -371,12 +345,12 @@ impl<'a> DataRingMut<'a> {
 
     #[inline]
     pub fn capacity(&self) -> u64 {
-        self.inner.file_len - self.data_start
+        self.as_read_only().capacity()
     }
 
     #[inline]
     pub fn add(&self, logical_pos: u64, delta: u64) -> u64 {
-        (logical_pos + delta) % self.capacity()
+        self.as_read_only().add(logical_pos, delta)
     }
 
     pub fn write_at(&mut self, logical_pos: u64, buf: &[u8]) -> Result<()> {
@@ -422,7 +396,7 @@ impl<'a> DataRingMut<'a> {
         }
 
         let data_start = self.data_start;
-        self.inner.with_batched_expansion_copy_sync(|inner| {
+        self.inner.with_deferred_sync(DeferredSyncPhase::ExpansionCopy, |inner| {
             inner.transfer(data_start, orig_file_len, moved_count)
         })
     }

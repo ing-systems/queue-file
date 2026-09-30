@@ -3,23 +3,19 @@
 //! This module handles the creation, detection, and opening of queue files
 //! in various formats (legacy, v1, and v2), including format migration.
 
-use bytes::{BufMut, BytesMut};
 use std::fs::{File, OpenOptions, rename};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::{
-    QueueFile, Result, ensure,
-    format::{
-        FormatState, LegacyFormat, LegacyHeaderState, V1Format, parse_legacy_header,
-        parse_versioned_header, read_v2_open_state,
-    },
-    header::{
-        SlotData, V2_INITIAL_LEN, V2_MAGIC, V2_SLOT_A_OFFSET, V2_SLOT_B_OFFSET, V2_SLOT_LEN,
-        build_slot_bytes,
-    },
-    qio::QueueFileInner,
+use crate::format::{
+    FormatState, LegacyHeaderState, parse_legacy_header, parse_versioned_header, read_v2_open_state,
 };
+use crate::header::{
+    SlotData, V2_INITIAL_LEN, V2_MAGIC, V2_SLOT_A_OFFSET, V2_SLOT_B_OFFSET, V2_SLOT_LEN,
+    build_slot_bytes,
+};
+use crate::qio::QueueFileInner;
+use crate::{QueueFile, Result, ensure};
 
 /// Initializes a new queue file at the given path.
 pub fn init(path: &Path, force_legacy: bool, capacity: u64) -> Result<()> {
@@ -47,9 +43,7 @@ pub fn init(path: &Path, force_legacy: bool, capacity: u64) -> Result<()> {
 /// Initializes a new legacy-format queue file.
 pub fn init_legacy_file(file: &mut File, capacity: u64) -> Result<()> {
     file.set_len(capacity)?;
-    let mut buf = BytesMut::with_capacity(16);
-    buf.put_u32(capacity as u32);
-    file.write_all(buf.as_ref())?;
+    file.write_all(&(capacity as u32).to_be_bytes())?;
     Ok(())
 }
 
@@ -99,19 +93,6 @@ pub fn detect_v2_magic(file: &mut File, real_file_len: u64, force_legacy: bool) 
     Ok(false)
 }
 
-/// Ensures a queue file exists at the given path, creating it if necessary.
-pub fn ensure_queue_file_exists(path: &Path, force_legacy: bool, capacity: u64) -> Result<()> {
-    if !path.exists() {
-        init(
-            path,
-            force_legacy,
-            capacity.max(if force_legacy { QueueFile::INITIAL_LENGTH } else { V2_INITIAL_LEN }),
-        )?;
-    }
-
-    Ok(())
-}
-
 /// Parses either a legacy (16-byte) or v1 (32-byte) header from a file.
 pub fn parse_legacy_or_v1_header(
     file: &mut File, real_file_len: u64, force_legacy: bool,
@@ -122,42 +103,28 @@ pub fn parse_legacy_or_v1_header(
     ensure!(bytes_read >= 32, OutOfBounds { msg: "file too short".to_string() });
 
     let versioned = !force_legacy && (buf[0] & 0x80) != 0;
-    let mut buf = BytesMut::from(&buf[..]);
-
-    let (format, header_len, file_len, elem_cnt, first_pos, last_pos) = if versioned {
-        let (file_len, elem_cnt, first_pos, last_pos) = parse_versioned_header(&mut buf)?;
-        (FormatState::V1(V1Format), 32u64, file_len, elem_cnt, first_pos, last_pos)
+    let (format, parse): (_, fn(&mut &[u8]) -> Result<_>) = if versioned {
+        (FormatState::V1, parse_versioned_header)
     } else {
-        let (file_len, elem_cnt, first_pos, last_pos) = parse_legacy_header(&mut buf)?;
-        (FormatState::Legacy(LegacyFormat), 16u64, file_len, elem_cnt, first_pos, last_pos)
+        (FormatState::Legacy, parse_legacy_header)
     };
+    let (file_len, elem_cnt, first_pos, last_pos) = parse(&mut &buf[..])?;
+    let header_len = format.data_start();
 
-    ensure!(
-        file_len <= real_file_len,
-        OutOfBounds {
-            msg: format!(
-                "file is truncated. expected length was {file_len} but actual length is {real_file_len}"
-            )
-        }
-    );
-    ensure!(
-        file_len >= header_len,
-        InvalidValue { msg: format!("length stored in header ({file_len}) is invalid") }
-    );
-    ensure!(
-        first_pos <= file_len,
-        OutOfBounds {
-            msg: format!("position of the first element ({first_pos}) is beyond the file")
-        }
-    );
-    ensure!(
-        last_pos <= file_len,
-        OutOfBounds {
-            msg: format!("position of the last element ({last_pos}) is beyond the file")
-        }
-    );
-
-    let _ = header_len;
+    ensure!(file_len <= real_file_len, OutOfBounds {
+        msg: format!(
+            "file is truncated. expected length was {file_len} but actual length is {real_file_len}"
+        )
+    });
+    ensure!(file_len >= header_len, InvalidValue {
+        msg: format!("length stored in header ({file_len}) is invalid")
+    });
+    ensure!(first_pos <= file_len, OutOfBounds {
+        msg: format!("position of the first element ({first_pos}) is beyond the file")
+    });
+    ensure!(last_pos <= file_len, OutOfBounds {
+        msg: format!("position of the last element ({last_pos}) is beyond the file")
+    });
 
     Ok(LegacyHeaderState { format, file_len, elem_cnt, first_pos, last_pos })
 }
@@ -168,14 +135,18 @@ pub fn open_internal_full<P: AsRef<Path>>(
 ) -> Result<QueueFile> {
     let path = path.as_ref();
 
+    let min_len = if force_legacy { QueueFile::INITIAL_LENGTH } else { V2_INITIAL_LEN };
+
     loop {
-        ensure_queue_file_exists(path, force_legacy, capacity)?;
+        if !path.exists() {
+            init(path, force_legacy, capacity.max(min_len))?;
+        }
 
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let real_file_len = file.metadata()?.len();
 
         if detect_v2_magic(&mut file, real_file_len, force_legacy)? {
-            return open_v2(file, real_file_len, capacity, overwrite_on_remove, path);
+            return open_v2(file, real_file_len, capacity, overwrite_on_remove);
         }
 
         let state = parse_legacy_or_v1_header(&mut file, real_file_len, force_legacy)?;
@@ -193,7 +164,7 @@ pub fn open_internal_full<P: AsRef<Path>>(
 
 /// Opens a V2-format queue file.
 pub fn open_v2(
-    file: File, real_file_len: u64, capacity: u64, overwrite_on_remove: bool, _path: &Path,
+    file: File, real_file_len: u64, capacity: u64, overwrite_on_remove: bool,
 ) -> Result<QueueFile> {
     let inner = QueueFileInner {
         file: Some(file),
@@ -233,13 +204,11 @@ pub fn migrate_to_v2(path: &Path) -> Result<()> {
             open_internal_full(&tmp, src.overwrite_on_remove(), false, V2_INITIAL_LEN, false)?;
         dst.set_sync_writes(false);
 
-        {
-            let mut src_iter = src.iter();
-            while let Some(elem) = src_iter.borrowed_next() {
-                let owned: Vec<u8> = elem.to_vec();
-                dst.add(&owned)?;
-            }
+        let mut src_iter = src.iter();
+        while let Some(elem) = src_iter.borrowed_next() {
+            dst.add(elem)?;
         }
+        drop(src_iter);
 
         dst.sync_all()?;
 

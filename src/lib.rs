@@ -206,8 +206,7 @@ pub(crate) use element::Element;
 pub use error::Error;
 pub(crate) use error::{Result, maybe_inject_failpoint};
 pub(crate) use format::{
-    ExpansionPlan, FileFormat, FormatState, LegacyHeaderState, QueueMetadata, QueueStateSnapshot,
-    V2Format, V2OpenState,
+    ExpansionPlan, FormatState, LegacyHeaderState, QueueMetadata, V2Format, V2OpenState,
 };
 pub(crate) use header::{SlotData, V2_INITIAL_LEN};
 pub(crate) use qio::{DataRing, DataRingMut, DeferredSyncPhase, QueueFileInner};
@@ -223,6 +222,8 @@ pub struct QueueFile {
     overwrite_on_remove: bool,
     skip_write_header_on_add: bool,
     cache: OffsetCache,
+    /// Reusable scratch buffer for encoding appended elements.
+    write_buf: Vec<u8>,
     #[allow(dead_code)]
     _marker: PhantomData<Cell<()>>,
 }
@@ -237,10 +238,20 @@ impl Drop for QueueFile {
 
 impl QueueFile {
     pub(crate) const INITIAL_LENGTH: u64 = 4096;
+    /// Encoded appends are flushed to disk whenever the write buffer reaches this size.
+    const WRITE_BUF_FLUSH_LEN: usize = QueueFileInner::TRANSFER_BUFFER_SIZE;
 
     #[inline]
     const fn data_start(&self) -> u64 {
         self.format.data_start()
+    }
+
+    /// Converts a physical header position into a logical ring position.
+    fn to_logical(&self, phys: u64, what: &str) -> Result<u64> {
+        let data_start = self.data_start();
+        phys.checked_sub(data_start).ok_or_else(|| Error::OutOfBounds {
+            msg: format!("{what} {phys} < data_start {data_start}"),
+        })
     }
 
     // ── Constructors ─────────────────────────────────────────────────────────
@@ -281,6 +292,7 @@ impl QueueFile {
             overwrite_on_remove,
             skip_write_header_on_add: false,
             cache: OffsetCache::new(),
+            write_buf: Vec::new(),
             _marker: PhantomData,
         };
 
@@ -289,15 +301,8 @@ impl QueueFile {
         }
 
         if state.elem_cnt > 0 {
-            let data_start = state.format.data_start();
-            let first_logical =
-                state.first_pos.checked_sub(data_start).ok_or_else(|| Error::OutOfBounds {
-                    msg: format!("first_pos {} < data_start {}", state.first_pos, data_start),
-                })?;
-            let last_logical =
-                state.last_pos.checked_sub(data_start).ok_or_else(|| Error::OutOfBounds {
-                    msg: format!("last_pos {} < data_start {}", state.last_pos, data_start),
-                })?;
+            let first_logical = queue_file.to_logical(state.first_pos, "first_pos")?;
+            let last_logical = queue_file.to_logical(state.last_pos, "last_pos")?;
 
             queue_file.first = queue_file.read_element_at(first_logical)?;
             queue_file.last = queue_file.read_element_at(last_logical)?;
@@ -326,6 +331,7 @@ impl QueueFile {
             overwrite_on_remove,
             skip_write_header_on_add: false,
             cache: OffsetCache::new(),
+            write_buf: Vec::new(),
             _marker: PhantomData,
         }
     }
@@ -335,21 +341,14 @@ impl QueueFile {
             return Ok(());
         }
 
-        let data_start = self.data_start();
-        let first_logical =
-            slot.first_position.checked_sub(data_start).ok_or_else(|| Error::OutOfBounds {
-                msg: format!("v2 first_pos {} < data_start {}", slot.first_position, data_start),
-            })?;
-        let last_logical =
-            slot.last_position.checked_sub(data_start).ok_or_else(|| Error::OutOfBounds {
-                msg: format!("v2 last_pos {} < data_start {}", slot.last_position, data_start),
-            })?;
+        let first_logical = self.to_logical(slot.first_position, "v2 first_pos")?;
+        let last_logical = self.to_logical(slot.last_position, "v2 last_pos")?;
 
         let last_header = self.format.validate_v2_element_header(&self.ring(), last_logical)?;
-        ensure!(
-            last_header.seq == slot.next_sequence_number - 1,
-            SequenceMismatch { expected: slot.next_sequence_number - 1, found: last_header.seq }
-        );
+        ensure!(last_header.seq == slot.next_sequence_number - 1, SequenceMismatch {
+            expected: slot.next_sequence_number - 1,
+            found: last_header.seq
+        });
 
         self.last =
             Element { pos: last_logical, len: last_header.payload_len, seq: last_header.seq };
@@ -364,10 +363,11 @@ impl QueueFile {
         Ok(())
     }
 
+    /// Recovers the head element by walking backlinks from the tail.
     fn recover_v2_head(
         &self, last_logical_pos: u64, last_seq: u64, elem_cnt: usize,
     ) -> Result<Element> {
-        let mut cur_logical_pos = last_logical_pos;
+        let mut pos = last_logical_pos;
 
         for step in 0..elem_cnt {
             let expected_seq =
@@ -377,54 +377,25 @@ impl QueueFile {
                     ),
                 })?;
 
-            let (current, next_pos) =
-                self.read_prev_v2_header_pos(cur_logical_pos, expected_seq, step, elem_cnt)?;
+            let header = self.format.validate_v2_element_header(&self.ring(), pos)?;
+            ensure!(header.seq == expected_seq, SequenceMismatch {
+                expected: expected_seq,
+                found: header.seq
+            });
 
             if step + 1 == elem_cnt {
-                return Ok(current);
+                return Ok(Element { pos, len: header.payload_len, seq: header.seq });
             }
 
-            cur_logical_pos = next_pos;
+            ensure!(header.prev_pos != 0, InvalidValue {
+                msg: format!("v2 recovery: walked {} elements but expected {}", step + 1, elem_cnt)
+            });
+            pos = self.to_logical(header.prev_pos, "v2 recovery: prev_pos")?;
         }
 
         Err(Error::CorruptedFile {
             msg: "v2 recovery: could not walk expected live element count".to_string(),
         })
-    }
-
-    fn read_prev_v2_header_pos(
-        &self, pos: u64, expected_seq: u64, step: usize, elem_cnt: usize,
-    ) -> Result<(Element, u64)> {
-        let current_header = self.format.validate_v2_element_header(&self.ring(), pos)?;
-
-        ensure!(
-            current_header.seq == expected_seq,
-            SequenceMismatch { expected: expected_seq, found: current_header.seq }
-        );
-
-        let current = Element { pos, len: current_header.payload_len, seq: current_header.seq };
-
-        if step + 1 == elem_cnt {
-            return Ok((current, 0));
-        }
-
-        ensure!(
-            current_header.prev_pos != 0,
-            InvalidValue {
-                msg: format!("v2 recovery: walked {} elements but expected {}", step + 1, elem_cnt)
-            }
-        );
-
-        let data_start = self.data_start();
-        let next_pos =
-            current_header.prev_pos.checked_sub(data_start).ok_or_else(|| Error::OutOfBounds {
-                msg: format!(
-                    "v2 recovery: prev_pos {} < data_start {}",
-                    current_header.prev_pos, data_start
-                ),
-            })?;
-
-        Ok((current, next_pos))
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -508,58 +479,6 @@ impl QueueFile {
         Ok(self.inner.file_mut()?.sync_all()?)
     }
 
-    #[inline]
-    fn snapshot_queue_state(&self) -> QueueStateSnapshot {
-        QueueStateSnapshot {
-            format: self.format,
-            elem_cnt: self.elem_cnt,
-            first: self.first,
-            last: self.last,
-            overwrite_on_remove: self.overwrite_on_remove,
-            cache: self.cache.clone(),
-        }
-    }
-
-    #[inline]
-    fn restore_queue_state(&mut self, snapshot: QueueStateSnapshot) {
-        self.format = snapshot.format;
-        self.elem_cnt = snapshot.elem_cnt;
-        self.first = snapshot.first;
-        self.last = snapshot.last;
-        self.overwrite_on_remove = snapshot.overwrite_on_remove;
-        self.cache = snapshot.cache;
-    }
-
-    fn cache_elem_if_needed(&self, index: usize, elem: Element, affected_items: usize) {
-        self.cache.cache_elem_if_needed(index, elem, self.elem_cnt, affected_items);
-    }
-
-    #[inline]
-    fn cached_offset_up_to(&self, i: usize) -> Option<(usize, Element)> {
-        self.cache.cached_offset_up_to(i)
-    }
-
-    fn with_batched_append_sync<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        let sync_writes = self.inner.sync_writes;
-        let deferred_sync_phase = self.inner.deferred_sync_phase;
-        self.inner.sync_writes = false;
-        self.inner.deferred_sync_phase = Some(DeferredSyncPhase::AppendBatch);
-
-        let result = f(self);
-
-        self.inner.deferred_sync_phase = deferred_sync_phase;
-        self.inner.sync_writes = sync_writes;
-
-        let value = result?;
-
-        if sync_writes {
-            self.inner.file_mut()?.sync_data()?;
-            maybe_inject_failpoint("v2_after_add_batch_flush")?;
-        }
-
-        Ok(value)
-    }
-
     // ── add_n ─────────────────────────────────────────────────────────────────
 
     pub fn add_n(&mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Result<()> {
@@ -574,76 +493,77 @@ impl QueueFile {
             ensure!(i32::try_from(len).is_ok(), Error::ElementTooBig);
             total_span = total_span.saturating_add(self.format.elem_span(len));
         }
+        ensure!(self.elem_cnt + elems.len() < i32::MAX as usize, Error::TooManyElements);
 
         self.expand_if_necessary(total_span)?;
 
-        let snapshot = self.snapshot_queue_state();
+        let format = self.format;
+        let base_seq = format.next_seq();
+        let elem_cnt = self.elem_cnt;
+        let prev_last = if self.is_empty() { None } else { Some(self.last) };
+        let start_pos =
+            prev_last.map_or(0, |last| self.ring().add(last.pos, self.elem_span(last.len)));
 
-        let result = self.with_batched_append_sync(|queue_file| {
-            let mut count = 0usize;
-            let base_seq = queue_file.format.next_seq();
+        // Encode the elements into one buffer and write it with as few calls as possible.
+        // In-memory state is only updated once every write has succeeded, so a failure leaves
+        // the queue exactly as it was (the header is committed last).
+        let cache = &self.cache;
+        let mut buf = std::mem::take(&mut self.write_buf);
+        let result = self.inner.with_deferred_sync(DeferredSyncPhase::AppendBatch, |inner| {
+            let mut ring = DataRingMut::new(inner, format.data_start());
+            let mut prev = prev_last;
+            let mut pos = start_pos;
+            let mut flush_pos = start_pos;
 
-            for elem in &elems {
-                queue_file.append_single_element(elem.as_ref(), base_seq, count)?;
-                count += 1;
+            for (i, elem) in elems.iter().enumerate() {
+                let payload = elem.as_ref();
+                let seq = if base_seq == 0 { 0 } else { base_seq + i as u64 };
+                format.encode_element(&mut buf, payload, seq, prev.map(|e| e.pos));
+
+                let entry = Element { pos, len: payload.len(), seq };
+                cache.cache_elem_if_needed(elem_cnt + i, entry, elem_cnt + i + 1, 1);
+                prev = Some(entry);
+                pos = ring.add(pos, format.elem_span(payload.len()));
+
+                if buf.len() >= Self::WRITE_BUF_FLUSH_LEN {
+                    ring.write_at(flush_pos, &buf)?;
+                    buf.clear();
+                    flush_pos = pos;
+                }
             }
 
-            Ok(count)
+            if !buf.is_empty() {
+                ring.write_at(flush_pos, &buf)?;
+            }
+
+            Ok(prev)
         });
 
-        match result {
-            Ok(count) => {
-                if count != 0 {
-                    self.finalize_append(count)?;
-                }
-                Ok(())
-            }
-            Err(err) => {
-                self.restore_queue_state(snapshot);
-                Err(err)
-            }
-        }
-    }
+        buf.clear();
+        buf.shrink_to(Self::WRITE_BUF_FLUSH_LEN);
+        self.write_buf = buf;
 
-    fn finalize_append(&mut self, count: usize) -> Result<()> {
-        let next_seq = self.format.next_seq();
-        if next_seq != 0 {
-            self.format.set_next_seq(next_seq + count as u64);
+        let last = match result {
+            Ok(last) => last.expect("at least one element was appended"),
+            Err(err) => {
+                // The cache may reference elements that never made it to disk.
+                self.cache.clear();
+                return Err(err);
+            }
+        };
+
+        if elem_cnt == 0 {
+            self.first = Element { pos: start_pos, len: elems[0].as_ref().len(), seq: base_seq };
+        }
+        self.last = last;
+        self.elem_cnt += elems.len();
+        if base_seq != 0 {
+            self.format.set_next_seq(base_seq + elems.len() as u64);
         }
 
         if !self.skip_write_header_on_add {
             self.sync_header()?;
         }
-
-        Ok(())
-    }
-
-    fn append_single_element(&mut self, buf: &[u8], base_seq: u64, count: usize) -> Result<()> {
-        ensure!(self.elem_cnt + 1 < i32::MAX as usize, Error::TooManyElements);
-
-        let is_empty = self.is_empty();
-        let last_pos = self.last.pos;
-        let last_len = self.last.len;
-
-        let len = buf.len();
-
-        let pos =
-            if is_empty { 0 } else { self.ring().add(last_pos, self.format.elem_span(last_len)) };
-        let seq = if base_seq == 0 { 0 } else { base_seq + count as u64 };
-        let prev_pos = if is_empty { None } else { Some(last_pos) };
-
-        let format = self.format;
-        let mut ring = self.ring_mut();
-        format.write_element(&mut ring, pos, buf, seq, prev_pos)?;
-
-        let elem_entry = Element::new(pos, len, seq)?;
-        if self.is_empty() {
-            self.first = elem_entry;
-        }
-        self.last = elem_entry;
-        self.elem_cnt += 1;
-
-        self.cache_elem_if_needed(self.elem_cnt - 1, self.last, 1);
 
         Ok(())
     }
@@ -660,9 +580,9 @@ impl QueueFile {
             return Ok(None);
         }
 
-        let mut buf = Vec::with_capacity(self.first.len);
-
-        if self.peek_into(&mut buf)? { Ok(Some(buf)) } else { Ok(None) }
+        let mut buf = vec![0; self.first.len];
+        self.read_payload(&self.first, &mut buf)?;
+        Ok(Some(buf))
     }
 
     pub fn peek_into(&self, buf: &mut Vec<u8>) -> Result<bool> {
@@ -670,17 +590,17 @@ impl QueueFile {
             return Ok(false);
         }
 
-        let len = self.first.len;
-        buf.resize(len, 0);
-
-        let ring = self.ring();
-        let payload_start = ring.add(self.first.pos, self.elem_hdr_len());
-
-        ring.read_at(payload_start, buf)?;
-
-        self.format.validate_footer(&ring, payload_start, &self.first, buf)?;
-
+        buf.resize(self.first.len, 0);
+        self.read_payload(&self.first, buf)?;
         Ok(true)
+    }
+
+    /// Reads and validates the payload of `elem` into `buf`, which must be `elem.len` long.
+    fn read_payload(&self, elem: &Element, buf: &mut [u8]) -> Result<()> {
+        let ring = self.ring();
+        let payload_start = ring.add(elem.pos, self.elem_hdr_len());
+        ring.read_at(payload_start, buf)?;
+        self.format.validate_footer(&ring, payload_start, elem, buf)
     }
 
     // ── remove_n ─────────────────────────────────────────────────────────────
@@ -724,7 +644,7 @@ impl QueueFile {
 
         self.sync_header()?;
 
-        self.drop_cached_offsets_up_to(n);
+        self.cache.drop_up_to(n);
 
         if self.overwrite_on_remove {
             self.ring_mut().erase_at(old_first_pos, erase_total_len)?;
@@ -734,27 +654,15 @@ impl QueueFile {
     }
 
     fn skip_elements_from(&self, n: usize) -> Result<Element> {
-        let mut new_first = self.first;
-        let mut remaining_to_skip = n;
+        let (skipped, mut elem) = self.cache.cached_offset_up_to(n).unwrap_or((0, self.first));
 
-        if let Some((index, elem)) = self.cached_offset_up_to(n) {
-            if index <= n {
-                new_first = elem;
-                remaining_to_skip = n - index;
-            }
+        let ring = self.ring();
+        for _ in skipped..n {
+            let next_pos = ring.add(elem.pos, self.elem_span(elem.len));
+            elem = self.format.read_element(&ring, next_pos)?;
         }
 
-        for _ in 0..remaining_to_skip {
-            let span = self.elem_span(new_first.len);
-            let next_pos = self.ring().add(new_first.pos, span);
-            new_first = self.read_element_at(next_pos)?;
-        }
-
-        Ok(new_first)
-    }
-
-    fn drop_cached_offsets_up_to(&self, n: usize) {
-        self.cache.drop_up_to(n);
+        Ok(elem)
     }
 
     // ── clear ─────────────────────────────────────────────────────────────────
@@ -772,7 +680,7 @@ impl QueueFile {
             let ds = self.data_start();
             let data_region_len = self.file_len().min(new_cap).saturating_sub(ds);
             if data_region_len > 0 {
-                self.inner.with_batched_clear_erase_sync(|inner| {
+                self.inner.with_deferred_sync(DeferredSyncPhase::ClearErase, |inner| {
                     inner.write_zero_chunks(ds, data_region_len as usize)
                 })?;
             }
@@ -823,7 +731,7 @@ impl QueueFile {
     }
 
     #[inline]
-    pub fn used_bytes(&self) -> u64 {
+    pub const fn used_bytes(&self) -> u64 {
         if self.elem_cnt == 0 {
             self.data_start()
         } else {
@@ -846,29 +754,28 @@ impl QueueFile {
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     #[inline]
-    fn remaining_bytes(&self) -> u64 {
+    const fn remaining_bytes(&self) -> u64 {
         self.file_len() - self.used_bytes()
     }
 
     fn sync_header(&mut self) -> Result<()> {
-        self.commit_header(self.file_len(), self.size(), self.first.pos, self.last.pos)
+        let metadata = QueueMetadata {
+            file_len: self.file_len(),
+            elem_cnt: self.elem_cnt,
+            first_pos: self.first.pos,
+            last_pos: self.last.pos,
+        };
+        self.format.commit_header(&mut self.inner, metadata)
     }
 
     #[inline]
-    fn elem_hdr_len(&self) -> u64 {
+    const fn elem_hdr_len(&self) -> u64 {
         self.format.elem_hdr_len()
     }
 
     #[inline]
-    fn elem_span(&self, payload_len: usize) -> u64 {
+    const fn elem_span(&self, payload_len: usize) -> u64 {
         self.format.elem_span(payload_len)
-    }
-
-    fn commit_header(
-        &mut self, file_len: u64, elem_cnt: usize, first_pos: u64, last_pos: u64,
-    ) -> Result<()> {
-        let metadata = QueueMetadata { file_len, elem_cnt, first_pos, last_pos };
-        self.format.commit_header(&mut self.inner, metadata)
     }
 
     fn compute_expanded_len(current_len: u64, mut remaining_bytes: u64, data_len: u64) -> u64 {
@@ -901,7 +808,7 @@ impl QueueFile {
         })
     }
 
-    fn calculate_tail_metrics(&self) -> (u64, bool) {
+    const fn calculate_tail_metrics(&self) -> (u64, bool) {
         if self.elem_cnt > 0 {
             let ring = self.ring();
             let end = ring.add(self.last.pos, self.format.elem_span(self.last.len));
@@ -988,8 +895,11 @@ impl Iterator for Iter<'_> {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let buffer = self.borrowed_next()?;
-        Some(buffer.to_vec())
+        let current = self.current_element()?;
+        let mut buf = vec![0; current.len];
+        self.queue_file.read_payload(&current, &mut buf).ok()?;
+        self.advance(current);
+        Some(buf)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1007,9 +917,9 @@ impl Iterator for Iter<'_> {
 
         self.jump_to_cache_if_closer(target_idx);
 
-        let remaining_to_skip = target_idx - self.next_elem_index;
-        for _ in 0..remaining_to_skip {
-            self.skip_next()?;
+        while self.next_elem_index < target_idx {
+            let current = self.current_element()?;
+            self.advance(current);
         }
 
         self.next()
@@ -1018,7 +928,7 @@ impl Iterator for Iter<'_> {
 
 impl Iter<'_> {
     fn jump_to_cache_if_closer(&mut self, target_idx: usize) {
-        if let Some((index, elem)) = self.queue_file.cached_offset_up_to(target_idx) {
+        if let Some((index, elem)) = self.queue_file.cache.cached_offset_up_to(target_idx) {
             if index > self.next_elem_index {
                 self.next_elem_index = index;
                 self.next_elem_pos = elem.pos;
@@ -1026,49 +936,37 @@ impl Iter<'_> {
         }
     }
 
-    fn skip_next(&mut self) -> Option<()> {
+    /// Reads the header of the element under the cursor without advancing.
+    fn current_element(&self) -> Option<Element> {
         if self.next_elem_index >= self.queue_file.elem_cnt {
             return None;
         }
+
         let current = self.queue_file.read_element_at(self.next_elem_pos).ok()?;
+        (current.len as u64 <= self.queue_file.ring().capacity()).then_some(current)
+    }
 
-        self.queue_file.cache_elem_if_needed(self.next_elem_index, current, 1);
-
-        self.next_elem_pos =
-            self.queue_file.ring().add(current.pos, self.queue_file.elem_span(current.len));
+    /// Moves the cursor past `current`, caching its position if the policy asks for it.
+    fn advance(&mut self, current: Element) {
+        let queue_file = self.queue_file;
+        queue_file.cache.cache_elem_if_needed(
+            self.next_elem_index,
+            current,
+            queue_file.elem_cnt,
+            1,
+        );
+        self.next_elem_pos = queue_file.ring().add(current.pos, queue_file.elem_span(current.len));
         self.next_elem_index += 1;
-        Some(())
     }
 
     pub fn borrowed_next(&mut self) -> Option<&[u8]> {
-        if self.next_elem_index >= self.queue_file.elem_cnt {
-            return None;
-        }
-
-        let current = self.queue_file.read_element_at(self.next_elem_pos).ok()?;
-
-        let max_possible_len = self.queue_file.ring().capacity();
-        if current.len as u64 > max_possible_len {
-            return None;
-        }
-
-        let ring = self.queue_file.ring();
-        let payload_start = ring.add(current.pos, self.queue_file.elem_hdr_len());
+        let current = self.current_element()?;
 
         if current.len > self.buffer.len() {
             self.buffer.resize(current.len, 0);
         }
-        ring.read_at(payload_start, &mut self.buffer[..current.len]).ok()?;
-
-        self.queue_file
-            .format
-            .validate_footer(&ring, payload_start, &current, &self.buffer[..current.len])
-            .ok()?;
-
-        self.queue_file.cache_elem_if_needed(self.next_elem_index, current, 1);
-
-        self.next_elem_pos = ring.add(current.pos, self.queue_file.elem_span(current.len));
-        self.next_elem_index += 1;
+        self.queue_file.read_payload(&current, &mut self.buffer[..current.len]).ok()?;
+        self.advance(current);
 
         Some(&self.buffer[..current.len])
     }
@@ -1076,8 +974,9 @@ impl Iter<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs::OpenOptions;
+
+    use super::*;
 
     fn create_inner(len: u64) -> (QueueFileInner, auto_delete_path::AutoDeletePath) {
         let p = auto_delete_path::AutoDeletePath::temp();
