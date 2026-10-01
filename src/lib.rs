@@ -204,7 +204,7 @@ use cache::OffsetCache;
 pub use cache::OffsetCacheKind;
 pub(crate) use element::Element;
 pub use error::Error;
-pub(crate) use error::{Result, maybe_inject_failpoint};
+pub(crate) use error::{Result, ensure, maybe_inject_failpoint};
 pub(crate) use format::{
     ExpansionPlan, FormatState, LegacyHeaderState, QueueMetadata, V2Format, V2OpenState,
 };

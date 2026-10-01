@@ -90,7 +90,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// - `ensure!(condition, VariantName { field: value })` - creates error with fields
 /// - `ensure!(condition, VariantName)` - creates error with no fields
 /// - `ensure!(condition, expression)` - uses the provided expression as error
-#[macro_export]
 macro_rules! ensure {
     ($cond:expr, $variant:ident { $($field:ident : $val:expr),* $(,)? }) => {
         if !($cond) {
@@ -108,6 +107,8 @@ macro_rules! ensure {
         }
     };
 }
+
+pub(crate) use ensure;
 
 /// Injects a test failure at the given failpoint if the environment variable is set.
 ///
