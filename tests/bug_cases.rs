@@ -14,34 +14,29 @@ fn reopen_bigger_capacity_wrong_file_len() {
 }
 
 #[test]
-fn bigger_write_buffer_overwrites_read_buffer() {
-    let path = auto_delete_path::AutoDeletePath::temp();
-    let mut qf = QueueFile::with_capacity(path, 32 + 4 * 2 + 2 + 4).unwrap();
-    qf.set_overwrite_on_remove(false);
-    qf.set_read_buffer_size(7);
-
-    qf.add_n(&[&[1, 2, 3], &[4, 5, 6]]).unwrap();
-    qf.remove().unwrap();
-    qf.remove().unwrap();
-
-    qf.add_n(&[&[7, 8, 9, 10][..], &[0, 0]]).unwrap();
-    qf.remove().unwrap();
-
-    qf.add(&[99]).unwrap();
-    qf.remove().unwrap();
-}
-
-#[test]
 fn transfer_expand_invalid_file_len() {
     let path = auto_delete_path::AutoDeletePath::temp();
     let mut qf = QueueFile::with_capacity(path, 32 + (4 + 1) * 3).unwrap();
-    qf.set_read_buffer_size(7);
 
-    qf.add_n(&[&[1], &[2], &[3]]).unwrap();
+    qf.add_n([&[1], &[2], &[3]]).unwrap();
     qf.remove_n(2).unwrap();
-    qf.add_n(&[&[1]]).unwrap();
+    qf.add_n([&[1]]).unwrap();
 
-    qf.add_n(&[&[2], &[4]]).unwrap();
+    qf.add_n([&[2], &[4]]).unwrap();
 
     assert_eq!(qf.iter().map(|v| v[0]).collect::<Vec<_>>(), vec![3, 1, 2, 4]);
+}
+
+#[test]
+fn into_inner_file_flushes_deferred_header_safely() {
+    let path = auto_delete_path::AutoDeletePath::temp();
+    let mut qf = QueueFile::open(&path).unwrap();
+    qf.set_skip_write_header_on_add(true);
+    qf.add(b"abc").unwrap();
+
+    let file = qf.into_inner_file().unwrap();
+    drop(file);
+
+    let reopened = QueueFile::open(&path).unwrap();
+    assert_eq!(reopened.iter().collect::<Vec<_>>(), vec![b"abc".to_vec()]);
 }

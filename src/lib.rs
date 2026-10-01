@@ -13,8 +13,146 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `queue-file` crate is a feature complete and binary compatible port of `QueueFile` class from
-//! Tape2 by Square, Inc. Check the original project [here](https://github.com/square/tape).
+//! A lightning-fast, transactional, file-based FIFO queue.
+//!
+//! This crate is a feature-complete port of the `QueueFile` class from
+//! [Tape2 by Square, Inc.](https://github.com/square/tape), extended with a new v2 format
+//! that adds per-element sequence numbers, CRC-32 integrity checks, and dual-slot atomic
+//! header commits.
+//!
+//! # Overview
+//!
+//! [`QueueFile`] stores an ordered sequence of byte blobs in a single file, using a ring-buffer
+//! layout for O(1) enqueue and dequeue. The file grows on demand (doubling its size) and shrinks
+//! back to [`QueueFile::with_capacity`]'s `capacity` floor when the queue is cleared.
+//!
+//! # Atomicity guarantee
+//!
+//! Every mutation commits by rewriting the file header **last**. Because the header is small
+//! enough that filesystem implementations typically write it atomically, a process crash after
+//! data has been written but before the header is committed leaves the queue in its previous
+//! consistent state. The stored file-length field additionally allows recovery from a failed
+//! expansion: if the file was grown but the copy was not finished, the old length can be recovered
+//! from the header.
+//!
+//! # File formats
+//!
+//! Three header formats are supported:
+//!
+//! * **V2** (dual 56-byte slots, default): created by [`QueueFile::open`] and
+//!   [`QueueFile::with_capacity`]. Supports per-element CRC integrity, sequence numbers, and
+//!   backlink recovery. Files created by older versions are automatically migrated on open.
+//! * **V1** (32 bytes): the previous default format, now migrated to V2 on open.
+//! * **Legacy** (16 bytes): created by [`QueueFile::open_legacy`]. Binary-compatible with the
+//!   original Java `QueueFile`. Supports files up to `i32::MAX` bytes only.
+//!
+//! # Performance notes
+//!
+//! * Use [`QueueFile::add_n`] to batch multiple elements into a single write.
+//! * Set [`QueueFile::set_sync_writes`] to `false` if durability after every operation is not
+//!   required (e.g. when building an in-process write-ahead log that controls flushing itself).
+//! * Enable [`QueueFile::set_skip_write_header_on_add`] with `true` together with
+//!   [`QueueFile::sync_all`] to defer header writes across a series of additions.
+//! * Use [`QueueFile::set_cache_offset_policy`] to speed up random access through [`Iter::nth`]
+//!   on large queues.
+//!
+//! # Thread safety
+//!
+//! [`QueueFile`] is not thread-safe: it is neither `Send` nor `Sync`. File I/O operations on a
+//! shared object from multiple threads would corrupt the on-disk state and the in-memory queue
+//! bookkeeping. Wrap it in a synchronization primitive for cross-thread use, e.g.:
+//!
+//! ```ignore
+//! use std::sync::{Mutex, RwLock};
+//!
+//! // Safe: `Mutex` provides exclusive access
+//! let qf = Mutex::new(QueueFile::open("queue.qf")?);
+//! qf.lock().unwrap().add(b"data")?;
+//!
+//! // Safe: `RwLock` allows concurrent reads with exclusive writes
+//! let qf = RwLock::new(QueueFile::open("queue.qf")?);
+//! let data = qf.read().unwrap().peek()?;
+//! ```
+//!
+//! Opening the same queue file from multiple processes simultaneously is not supported and will
+//! result in data corruption.
+//!
+//! # Quick Start
+//!
+//! ```
+//! use queue_file::QueueFile;
+//! use std::fs::remove_file;
+//!
+//! // Create a new queue file
+//! let path = "example.qf";
+//! let mut qf = QueueFile::open(path).unwrap();
+//!
+//! // Add elements
+//! qf.add(b"hello").unwrap();
+//! qf.add(b"world").unwrap();
+//!
+//! // Peek at the front element
+//! assert_eq!(qf.peek().unwrap(), Some(b"hello".to_vec()));
+//!
+//! // Iterate over all elements
+//! for elem in &qf {
+//!     println!("{}", String::from_utf8_lossy(&elem));
+//! }
+//!
+//! // Remove elements
+//! qf.remove().unwrap();
+//! assert_eq!(qf.peek().unwrap(), Some(b"world".to_vec()));
+//!
+//! // Clean up
+//! drop(qf);
+//! remove_file(path).ok();
+//! ```
+//!
+//! # Batch Operations
+//!
+//! For better performance when adding multiple elements, use [`QueueFile::add_n`]:
+//!
+//! ```
+//! use queue_file::QueueFile;
+//! use std::fs::remove_file;
+//!
+//! let path = "batch.qf";
+//! let mut qf = QueueFile::open(path).unwrap();
+//!
+//! // Add multiple elements in a single batch (more efficient)
+//! qf.add_n(vec![b"a", b"b", b"c"]).unwrap();
+//! assert_eq!(qf.size(), 3);
+//!
+//! drop(qf);
+//! remove_file(path).ok();
+//! ```
+//!
+//! # Random Access with Caching
+//!
+//! For frequent access to elements by index, enable the cache:
+//!
+//! ```
+//! use queue_file::{QueueFile, OffsetCacheKind};
+//! use std::fs::remove_file;
+//!
+//! let path = "cache.qf";
+//! let mut qf = QueueFile::open(path).unwrap();
+//!
+//! // Enable linear caching for faster nth() lookups
+//! qf.set_cache_offset_policy(Some(OffsetCacheKind::Linear { offset: 100 }));
+//!
+//! // Add many elements
+//! for i in 0usize..1000 {
+//!     qf.add(&i.to_le_bytes()).unwrap();
+//! }
+//!
+//! // Jump to element 500 (much faster with caching)
+//! let elem = qf.iter().nth(500);
+//! assert!(elem.is_some());
+//!
+//! drop(qf);
+//! remove_file(path).ok();
+//! ```
 
 #![forbid(non_ascii_idents)]
 #![deny(
@@ -34,9 +172,7 @@
     clippy::pedantic,
     clippy::mutex_atomic,
     clippy::rc_buffer,
-    clippy::rc_mutex,
-    // clippy::expect_used,
-    // clippy::unwrap_used,
+    clippy::rc_mutex
 )]
 #![allow(
     clippy::cast_possible_truncation,
@@ -45,373 +181,225 @@
     clippy::cast_sign_loss,
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
-    clippy::must_use_candidate
+    clippy::must_use_candidate,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
 )]
 
-use std::cmp::min;
-use std::collections::VecDeque;
-use std::fs::{rename, File, OpenOptions};
+mod cache;
+mod element;
+mod error;
+mod factory;
+mod format;
+mod header;
+mod qio;
+
+use std::cell::Cell;
+use std::fs::File;
 use std::io;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::mem::ManuallyDrop;
+use std::marker::PhantomData;
 use std::path::Path;
 
-use bytes::{Buf, BufMut, BytesMut};
-use snafu::{ensure, Snafu};
+use cache::OffsetCache;
+pub use cache::OffsetCacheKind;
+pub(crate) use element::Element;
+pub use error::Error;
+pub(crate) use error::{Result, maybe_inject_failpoint};
+pub(crate) use format::{
+    ExpansionPlan, FormatState, LegacyHeaderState, QueueMetadata, V2Format, V2OpenState,
+};
+pub(crate) use header::{SlotData, V2_INITIAL_LEN};
+pub(crate) use qio::{DataRing, DataRingMut, DeferredSyncPhase, QueueFileInner};
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(context(false))]
-    Io { source: std::io::Error },
-    #[snafu(display("too many elements"))]
-    TooManyElements {},
-    #[snafu(display("element too big"))]
-    ElementTooBig {},
-    #[snafu(display("corrupted file: {}", msg))]
-    CorruptedFile { msg: String },
-    #[snafu(display(
-        "unsupported version {}. supported versions is {} and legacy",
-        detected,
-        supported
-    ))]
-    UnsupportedVersion { detected: u32, supported: u32 },
-}
-
-type Result<T, E = Error> = std::result::Result<T, E>;
-
-/// `QueueFile` is a lightning-fast, transactional, file-based FIFO.
-///
-/// Addition and removal from an instance is an O(1) operation and is atomic.
-/// Writes are synchronous by default; data will be written to disk before an operation returns.
-///
-/// The underlying file. Uses a ring buffer to store entries. Designed so that a modification
-/// isn't committed or visible until we write the header. The header is much smaller than a
-/// segment. So long as the underlying file system supports atomic segment writes, changes to the
-/// queue are atomic. Storing the file length ensures we can recover from a failed expansion
-/// (i.e. if setting the file length succeeds but the process dies before the data can be copied).
-///
-/// # Example
-/// ```
-/// use queue_file::QueueFile;
-///
-/// # let path = auto_delete_path::AutoDeletePath::temp();
-/// let mut qf = QueueFile::open(path)
-///     .expect("cannot open queue file");
-/// let data = "Welcome to QueueFile!".as_bytes();
-///
-/// qf.add(&data).expect("add failed");
-///
-/// if let Ok(Some(bytes)) = qf.peek() {
-///     assert_eq!(data, bytes.as_ref());
-/// }
-///
-/// qf.remove().expect("remove failed");
-/// ```
-/// # File format
-///
-/// ```text
-///   16-32 bytes      Header
-///   ...              Data
-/// ```
-/// This implementation supports two versions of the header format.
-/// ```text
-/// Versioned Header (32 bytes):
-///   1 bit            Versioned indicator [0 = legacy, 1 = versioned]
-///   31 bits          Version, always 1
-///   8 bytes          File length
-///   4 bytes          Element count
-///   8 bytes          Head element position
-///   8 bytes          Tail element position
-///
-/// Legacy Header (16 bytes):
-///   1 bit            Legacy indicator, always 0
-///   31 bits          File length
-///   4 bytes          Element count
-///   4 bytes          Head element position
-///   4 bytes          Tail element position
-/// ```
-/// Each element stored is represented by:
-/// ```text
-/// Element:
-///   4 bytes          Data length
-///   ...              Data
-/// ```
 #[derive(Debug)]
 pub struct QueueFile {
-    inner: QueueFileInner,
-    /// True when using the versioned header format. Otherwise use the legacy format.
-    versioned: bool,
-    /// The header length in bytes: 16 or 32.
-    header_len: u64,
-    /// Number of elements.
+    pub(crate) inner: QueueFileInner,
+    format: FormatState,
     elem_cnt: usize,
-    /// Pointer to first (or eldest) element.
     first: Element,
-    /// Pointer to last (or newest) element.
     last: Element,
-    /// Minimum number of bytes the file shrinks to.
-    capacity: u64,
-    /// When true, removing an element will also overwrite data with zero bytes.
-    /// It's true by default.
+    pub(crate) capacity: u64,
     overwrite_on_remove: bool,
-    /// When true, skips header update upon adding.
-    /// It's false by default.
     skip_write_header_on_add: bool,
-    /// Write buffering.
+    cache: OffsetCache,
+    /// Reusable scratch buffer for encoding appended elements.
     write_buf: Vec<u8>,
-    /// Offset cache idx->Element. Sorted in ascending order, always unique.
-    /// Indices form perfect squares though may skew after removal.
-    cached_offsets: VecDeque<(usize, Element)>,
-    /// Offset caching policy.
-    offset_cache_kind: Option<OffsetCacheKind>,
-}
-
-/// Policy for offset caching if enabled.
-/// Notice that offsets frequency might be skewed due after series of adding/removal.
-/// This shall not affect functional properties, only performance one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OffsetCacheKind {
-    /// Linear offseting.
-    ///
-    /// Next offset would be cached after `offset` additions.
-    Linear { offset: usize },
-    /// Quadratic offseting.
-    ///
-    /// Cached offsets form a sequence of perfect squares (e.g. cached 1st, 4th, 9th, .. offsets).
-    Quadratic,
-}
-
-#[derive(Debug)]
-struct QueueFileInner {
-    file: ManuallyDrop<File>,
-    /// Cached file length. Always a power of 2.
-    file_len: u64,
-    /// Intention seek offset.
-    expected_seek: u64,
-    /// Real last seek offset.
-    last_seek: Option<u64>,
-    /// Offset for the next read from buffer.
-    read_buffer_offset: Option<u64>,
-    /// Buffer for reads.
-    read_buffer: Vec<u8>,
-    /// Buffer used by `transfer` function.
-    transfer_buf: Option<Box<[u8]>>,
-    /// When true, every write to file will be followed by `sync_data()` call.
-    /// It's true by default.
-    sync_writes: bool,
+    #[allow(dead_code)]
+    _marker: PhantomData<Cell<()>>,
 }
 
 impl Drop for QueueFile {
     fn drop(&mut self) {
-        if self.skip_write_header_on_add {
+        if self.skip_write_header_on_add && self.inner.file.is_some() {
             let _ = self.sync_header();
-        }
-
-        unsafe {
-            ManuallyDrop::drop(&mut self.inner.file);
         }
     }
 }
 
 impl QueueFile {
-    const BLOCK_LENGTH: u64 = 4096;
-    const INITIAL_LENGTH: u64 = 4096;
-    const READ_BUFFER_SIZE: usize = 4096;
-    const VERSIONED_HEADER: u32 = 0x8000_0001;
-    const ZEROES: [u8; 4096] = [0; 4096];
+    pub(crate) const INITIAL_LENGTH: u64 = 4096;
+    /// Encoded appends are flushed to disk whenever the write buffer reaches this size.
+    const WRITE_BUF_FLUSH_LEN: usize = QueueFileInner::TRANSFER_BUFFER_SIZE;
 
-    fn init(path: &Path, force_legacy: bool, capacity: u64) -> Result<()> {
-        let tmp_path = path.with_extension(".tmp");
-
-        // Use a temp file so we don't leave a partially-initialized file.
-        {
-            let mut file =
-                OpenOptions::new().read(true).write(true).create(true).open(&tmp_path)?;
-
-            file.set_len(capacity)?;
-
-            let mut buf = BytesMut::with_capacity(16);
-
-            if force_legacy {
-                buf.put_u32(capacity as u32);
-            } else {
-                buf.put_u32(Self::VERSIONED_HEADER);
-                buf.put_u64(capacity);
-            }
-
-            file.write_all(buf.as_ref())?;
-        }
-
-        // A rename is atomic.
-        rename(tmp_path, path)?;
-
-        Ok(())
+    #[inline]
+    const fn data_start(&self) -> u64 {
+        self.format.data_start()
     }
 
-    /// Open or create [`QueueFile`] at `path` with specified minimal file size.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use queue_file::QueueFile;
-    /// # let path = auto_delete_path::AutoDeletePath::temp();
-    /// let qf = QueueFile::with_capacity(path, 120).expect("failed to open queue");
-    /// ```
+    /// Converts a physical header position into a logical ring position.
+    fn to_logical(&self, phys: u64, what: &str) -> Result<u64> {
+        let data_start = self.data_start();
+        phys.checked_sub(data_start).ok_or_else(|| Error::OutOfBounds {
+            msg: format!("{what} {phys} < data_start {data_start}"),
+        })
+    }
+
+    // ── Constructors ─────────────────────────────────────────────────────────
+
+    /// Opens or creates a [`QueueFile`] at `path` with the given initial file size.
     pub fn with_capacity<P: AsRef<Path>>(path: P, capacity: u64) -> Result<Self> {
-        Self::open_internal(path, true, false, capacity)
+        factory::open_internal_full(path, true, false, capacity, true)
     }
 
-    /// Open or create [`QueueFile`] at `path`.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use queue_file::QueueFile;
-    /// # let path = auto_delete_path::AutoDeletePath::temp();
-    /// let qf = QueueFile::open(path).expect("failed to open queue");
-    /// ```
+    /// Opens or creates a [`QueueFile`] at `path` using v2 format with a 4 KiB initial file size.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::with_capacity(path, Self::INITIAL_LENGTH)
     }
 
-    /// Open or create [`QueueFile`] at `path` forcing legacy format.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use queue_file::QueueFile;
-    /// # let path = auto_delete_path::AutoDeletePath::temp();
-    /// let qf = QueueFile::open_legacy(path).expect("failed to open queue");
-    /// ```
+    /// Opens or creates a [`QueueFile`] at `path` using the legacy (16-byte) header format.
     pub fn open_legacy<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_internal(path, true, true, Self::INITIAL_LENGTH)
+        factory::open_internal_full(path, true, true, Self::INITIAL_LENGTH, false)
     }
 
-    fn open_internal<P: AsRef<Path>>(
-        path: P, overwrite_on_remove: bool, force_legacy: bool, capacity: u64,
+    pub(crate) fn build_legacy_queue_file(
+        file: File, state: LegacyHeaderState, capacity: u64, overwrite_on_remove: bool,
     ) -> Result<Self> {
-        if !path.as_ref().exists() {
-            Self::init(path.as_ref(), force_legacy, capacity)?;
-        }
-
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-
-        let mut buf = [0u8; 32];
-
-        let bytes_read = file.read(&mut buf)?;
-
-        ensure!(bytes_read >= 32, CorruptedFileSnafu { msg: "file too short" });
-
-        let versioned = !force_legacy && (buf[0] & 0x80) != 0;
-
-        let header_len: u64;
-        let file_len: u64;
-        let elem_cnt: usize;
-        let first_pos: u64;
-        let last_pos: u64;
-
-        let mut buf = BytesMut::from(&buf[..]);
-
-        if versioned {
-            header_len = 32;
-
-            let version = buf.get_u32() & 0x7FFF_FFFF;
-
-            ensure!(version == 1, UnsupportedVersionSnafu { detected: version, supported: 1u32 });
-
-            file_len = buf.get_u64();
-            elem_cnt = buf.get_u32() as usize;
-            first_pos = buf.get_u64();
-            last_pos = buf.get_u64();
-
-            ensure!(i64::try_from(file_len).is_ok(), CorruptedFileSnafu {
-                msg: "file length in header is greater than i64::MAX"
-            });
-            ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
-                msg: "element count in header is greater than i32::MAX"
-            });
-            ensure!(i64::try_from(first_pos).is_ok(), CorruptedFileSnafu {
-                msg: "first element position in header is greater than i64::MAX"
-            });
-            ensure!(i64::try_from(last_pos).is_ok(), CorruptedFileSnafu {
-                msg: "last element position in header is greater than i64::MAX"
-            });
-        } else {
-            header_len = 16;
-
-            file_len = u64::from(buf.get_u32());
-            elem_cnt = buf.get_u32() as usize;
-            first_pos = u64::from(buf.get_u32());
-            last_pos = u64::from(buf.get_u32());
-
-            ensure!(i32::try_from(file_len).is_ok(), CorruptedFileSnafu {
-                msg: "file length in header is greater than i32::MAX"
-            });
-            ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
-                msg: "element count in header is greater than i32::MAX"
-            });
-            ensure!(i32::try_from(first_pos).is_ok(), CorruptedFileSnafu {
-                msg: "first element position in header is greater than i32::MAX"
-            });
-            ensure!(i32::try_from(last_pos).is_ok(), CorruptedFileSnafu {
-                msg: "last element position in header is greater than i32::MAX"
-            });
-        }
-
-        let real_file_len = file.metadata()?.len();
-
-        ensure!(file_len <= real_file_len, CorruptedFileSnafu {
-            msg: format!(
-                "file is truncated. expected length was {file_len} but actual length is {real_file_len}"
-            )
-        });
-        ensure!(file_len >= header_len, CorruptedFileSnafu {
-            msg: format!("length stored in header ({file_len}) is invalid")
-        });
-        ensure!(first_pos <= file_len, CorruptedFileSnafu {
-            msg: format!("position of the first element ({first_pos}) is beyond the file")
-        });
-        ensure!(last_pos <= file_len, CorruptedFileSnafu {
-            msg: format!("position of the last element ({last_pos}) is beyond the file")
-        });
-
         let mut queue_file = Self {
             inner: QueueFileInner {
-                file: ManuallyDrop::new(file),
-                file_len,
+                file: Some(file),
+                file_len: state.file_len,
                 expected_seek: 0,
                 last_seek: Some(32),
-                read_buffer_offset: None,
-                read_buffer: vec![0; Self::READ_BUFFER_SIZE],
-                transfer_buf: Some(
-                    vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
-                ),
+                transfer_buf: vec![0u8; QueueFileInner::TRANSFER_BUFFER_SIZE].into_boxed_slice(),
                 sync_writes: cfg!(not(test)),
+                deferred_sync_phase: None,
             },
-            versioned,
-            header_len,
-            elem_cnt,
+            format: state.format,
+            elem_cnt: state.elem_cnt,
             first: Element::EMPTY,
             last: Element::EMPTY,
             capacity,
             overwrite_on_remove,
             skip_write_header_on_add: false,
+            cache: OffsetCache::new(),
             write_buf: Vec::new(),
-            cached_offsets: VecDeque::new(),
-            offset_cache_kind: None,
+            _marker: PhantomData,
         };
 
-        if file_len < capacity {
+        if state.file_len < capacity {
             queue_file.inner.sync_set_len(queue_file.capacity)?;
         }
 
-        queue_file.first = queue_file.read_element(first_pos)?;
-        queue_file.last = queue_file.read_element(last_pos)?;
+        if state.elem_cnt > 0 {
+            let first_logical = queue_file.to_logical(state.first_pos, "first_pos")?;
+            let last_logical = queue_file.to_logical(state.last_pos, "last_pos")?;
+
+            queue_file.first = queue_file.read_element_at(first_logical)?;
+            queue_file.last = queue_file.read_element_at(last_logical)?;
+        }
 
         Ok(queue_file)
     }
 
-    /// Returns true if removing an element will also overwrite data with zero bytes.
+    pub(crate) fn build_v2_queue_file(
+        mut inner: QueueFileInner, open_state: V2OpenState, capacity: u64,
+        overwrite_on_remove: bool,
+    ) -> Self {
+        inner.file_len = open_state.slot.file_length;
+
+        Self {
+            inner,
+            format: FormatState::V2(V2Format {
+                active_slot: open_state.active_slot,
+                generation: open_state.slot.generation,
+                next_seq: open_state.slot.next_sequence_number,
+            }),
+            elem_cnt: open_state.elem_cnt,
+            first: Element::EMPTY,
+            last: Element::EMPTY,
+            capacity: capacity.max(V2_INITIAL_LEN),
+            overwrite_on_remove,
+            skip_write_header_on_add: false,
+            cache: OffsetCache::new(),
+            write_buf: Vec::new(),
+            _marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn initialize_v2_endpoints(&mut self, slot: SlotData) -> Result<()> {
+        if self.elem_cnt == 0 {
+            return Ok(());
+        }
+
+        let first_logical = self.to_logical(slot.first_position, "v2 first_pos")?;
+        let last_logical = self.to_logical(slot.last_position, "v2 last_pos")?;
+
+        let last_header = self.format.validate_v2_element_header(&self.ring(), last_logical)?;
+        ensure!(last_header.seq == slot.next_sequence_number - 1, SequenceMismatch {
+            expected: slot.next_sequence_number - 1,
+            found: last_header.seq
+        });
+
+        self.last =
+            Element { pos: last_logical, len: last_header.payload_len, seq: last_header.seq };
+
+        self.first = match self.format.validate_v2_element_header(&self.ring(), first_logical) {
+            Ok(first_header) => {
+                Element { pos: first_logical, len: first_header.payload_len, seq: first_header.seq }
+            }
+            Err(_) => self.recover_v2_head(last_logical, last_header.seq, self.elem_cnt)?,
+        };
+
+        Ok(())
+    }
+
+    /// Recovers the head element by walking backlinks from the tail.
+    fn recover_v2_head(
+        &self, last_logical_pos: u64, last_seq: u64, elem_cnt: usize,
+    ) -> Result<Element> {
+        let mut pos = last_logical_pos;
+
+        for step in 0..elem_cnt {
+            let expected_seq =
+                last_seq.checked_sub(step as u64).ok_or_else(|| Error::InvalidValue {
+                    msg: format!(
+                        "v2 recovery: tail seq {last_seq} too small for element_count {elem_cnt}"
+                    ),
+                })?;
+
+            let header = self.format.validate_v2_element_header(&self.ring(), pos)?;
+            ensure!(header.seq == expected_seq, SequenceMismatch {
+                expected: expected_seq,
+                found: header.seq
+            });
+
+            if step + 1 == elem_cnt {
+                return Ok(Element { pos, len: header.payload_len, seq: header.seq });
+            }
+
+            ensure!(header.prev_pos != 0, InvalidValue {
+                msg: format!("v2 recovery: walked {} elements but expected {}", step + 1, elem_cnt)
+            });
+            pos = self.to_logical(header.prev_pos, "v2 recovery: prev_pos")?;
+        }
+
+        Err(Error::CorruptedFile {
+            msg: "v2 recovery: could not walk expected live element count".to_string(),
+        })
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
     #[inline]
     pub const fn overwrite_on_remove(&self) -> bool {
         self.overwrite_on_remove
@@ -422,13 +410,11 @@ impl QueueFile {
         self.overwrite_on_remove()
     }
 
-    /// If set to true removing an element will also overwrite data with zero bytes.
     #[inline]
     pub fn set_overwrite_on_remove(&mut self, value: bool) {
         self.overwrite_on_remove = value;
     }
 
-    /// Returns true if every write to file will be followed by `sync_data()` call.
     #[inline]
     pub const fn sync_writes(&self) -> bool {
         self.inner.sync_writes
@@ -439,13 +425,11 @@ impl QueueFile {
         self.sync_writes()
     }
 
-    /// If set to true every write to file will be followed by `sync_data()` call.
     #[inline]
     pub fn set_sync_writes(&mut self, value: bool) {
         self.inner.sync_writes = value;
     }
 
-    /// Returns true if skips header update upon adding enabled.
     #[inline]
     pub const fn skip_write_header_on_add(&self) -> bool {
         self.skip_write_header_on_add
@@ -456,23 +440,14 @@ impl QueueFile {
         self.skip_write_header_on_add()
     }
 
-    /// If set to true skips header update upon adding.
     #[inline]
     pub fn set_skip_write_header_on_add(&mut self, value: bool) {
         self.skip_write_header_on_add = value;
     }
 
-    /// Changes buffer size used for data reading.
-    pub fn set_read_buffer_size(&mut self, size: usize) {
-        if self.inner.read_buffer.len() < size {
-            self.inner.read_buffer_offset = None;
-        }
-        self.inner.read_buffer.resize(size, 0);
-    }
-
     #[inline]
     pub const fn cache_offset_policy(&self) -> Option<OffsetCacheKind> {
-        self.offset_cache_kind
+        self.cache.kind
     }
 
     #[deprecated(since = "1.4.7", note = "Use `cache_offset_policy` instead.")]
@@ -482,166 +457,159 @@ impl QueueFile {
 
     #[inline]
     pub fn set_cache_offset_policy(&mut self, kind: impl Into<Option<OffsetCacheKind>>) {
-        self.offset_cache_kind = kind.into();
-
-        if self.offset_cache_kind.is_none() {
-            self.cached_offsets.clear();
-        }
+        self.cache.set_policy(kind);
     }
 
-    /// Returns true if this queue contains no entries.
     #[inline]
     pub const fn is_empty(&self) -> bool {
         self.elem_cnt == 0
     }
 
-    /// Returns the number of elements in this queue.
     #[inline]
     pub const fn size(&self) -> usize {
         self.elem_cnt
     }
 
-    /// Synchronizes the underlying file, look at [`File::sync_all`] doc for more info.
     pub fn sync_all(&mut self) -> Result<()> {
         if self.skip_write_header_on_add {
+            self.inner.file_mut()?.sync_data()?;
             self.sync_header()?;
         }
 
-        Ok(self.inner.file.sync_all()?)
+        Ok(self.inner.file_mut()?.sync_all()?)
     }
 
-    fn cache_last_offset_if_needed(&mut self, affected_items: usize) {
-        if self.elem_cnt == 0 {
-            return;
-        }
+    // ── add_n ─────────────────────────────────────────────────────────────────
 
-        self.cache_elem_if_needed(self.elem_cnt - 1, self.last, affected_items);
-    }
-
-    fn cache_elem_if_needed(&mut self, index: usize, elem: Element, affected_items: usize) {
-        debug_assert!(index <= self.elem_cnt);
-        debug_assert!(index + 1 >= affected_items);
-
-        let need_to_cache = self.offset_cache_kind.map_or(false, |kind| match kind {
-            OffsetCacheKind::Linear { offset } => {
-                let last_cached_index = self.cached_offsets.back().map_or(0, |(idx, _)| *idx);
-                index.saturating_sub(last_cached_index) >= offset
-            }
-            OffsetCacheKind::Quadratic => {
-                let x = (index as f64).sqrt() as usize;
-                x > 1 && (index + 1 - affected_items..=index).contains(&(x * x))
-            }
-        });
-
-        if need_to_cache {
-            if let Some((last_cached_index, last_cached_elem)) = self.cached_offsets.back() {
-                if *last_cached_index >= index {
-                    if *last_cached_index == index {
-                        debug_assert_eq!(last_cached_elem.pos, elem.pos);
-                        debug_assert_eq!(last_cached_elem.len, elem.len);
-                    }
-
-                    return;
-                }
-            }
-
-            self.cached_offsets.push_back((index, elem));
-        }
-    }
-
-    #[inline]
-    fn cached_index_up_to(&self, i: usize) -> Option<usize> {
-        self.cached_offsets
-            .binary_search_by(|(idx, _)| idx.cmp(&i))
-            .map_or_else(|i| i.checked_sub(1), Some)
-    }
-
-    pub fn add_n(
-        &mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>> + Clone,
-    ) -> Result<()> {
-        let (count, total_len) = elems
-            .clone()
-            .into_iter()
-            .fold((0, 0), |(c, l), elem| (c + 1, l + Element::HEADER_LENGTH + elem.as_ref().len()));
-
-        if count == 0 {
+    pub fn add_n(&mut self, elems: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Result<()> {
+        let elems: Vec<_> = elems.into_iter().collect();
+        if elems.is_empty() {
             return Ok(());
         }
 
-        ensure!(self.elem_cnt + count < i32::max_value() as usize, TooManyElementsSnafu {});
+        let mut total_span: u64 = 0;
+        for elem in &elems {
+            let len = elem.as_ref().len();
+            ensure!(i32::try_from(len).is_ok(), Error::ElementTooBig);
+            total_span = total_span.saturating_add(self.format.elem_span(len));
+        }
+        ensure!(self.elem_cnt + elems.len() < i32::MAX as usize, Error::TooManyElements);
 
-        self.expand_if_necessary(total_len as u64)?;
+        self.expand_if_necessary(total_span)?;
 
-        let was_empty = self.is_empty();
-        let mut pos = if was_empty {
-            self.header_len
-        } else {
-            self.wrap_pos(self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64)
+        let format = self.format;
+        let base_seq = format.next_seq();
+        let elem_cnt = self.elem_cnt;
+        let prev_last = if self.is_empty() { None } else { Some(self.last) };
+        let start_pos =
+            prev_last.map_or(0, |last| self.ring().add(last.pos, self.elem_span(last.len)));
+
+        // Encode the elements into one buffer and write it with as few calls as possible.
+        // In-memory state is only updated once every write has succeeded, so a failure leaves
+        // the queue exactly as it was (the header is committed last).
+        let cache = &self.cache;
+        let mut buf = std::mem::take(&mut self.write_buf);
+        let result = self.inner.with_deferred_sync(DeferredSyncPhase::AppendBatch, |inner| {
+            let mut ring = DataRingMut::new(inner, format.data_start());
+            let mut prev = prev_last;
+            let mut pos = start_pos;
+            let mut flush_pos = start_pos;
+
+            for (i, elem) in elems.iter().enumerate() {
+                let payload = elem.as_ref();
+                let seq = if base_seq == 0 { 0 } else { base_seq + i as u64 };
+                format.encode_element(&mut buf, payload, seq, prev.map(|e| e.pos));
+
+                let entry = Element { pos, len: payload.len(), seq };
+                cache.cache_elem_if_needed(elem_cnt + i, entry, elem_cnt + i + 1, 1);
+                prev = Some(entry);
+                pos = ring.add(pos, format.elem_span(payload.len()));
+
+                if buf.len() >= Self::WRITE_BUF_FLUSH_LEN {
+                    ring.write_at(flush_pos, &buf)?;
+                    buf.clear();
+                    flush_pos = pos;
+                }
+            }
+
+            if !buf.is_empty() {
+                ring.write_at(flush_pos, &buf)?;
+            }
+
+            Ok(prev)
+        });
+
+        buf.clear();
+        buf.shrink_to(Self::WRITE_BUF_FLUSH_LEN);
+        self.write_buf = buf;
+
+        let last = match result {
+            Ok(last) => last.expect("at least one element was appended"),
+            Err(err) => {
+                // The cache may reference elements that never made it to disk.
+                self.cache.clear();
+                return Err(err);
+            }
         };
 
-        let mut first_added = None;
-        let mut last_added = None;
-
-        self.write_buf.clear();
-
-        for elem in elems {
-            let elem = elem.as_ref();
-            let len = elem.len();
-
-            if first_added.is_none() {
-                first_added = Some(Element::new(pos, len)?);
-            }
-            last_added = Some(Element::new(pos, len)?);
-
-            self.write_buf.extend(&(len as u32).to_be_bytes());
-            self.write_buf.extend(elem);
-
-            pos = self.wrap_pos(pos + Element::HEADER_LENGTH as u64 + len as u64);
+        if elem_cnt == 0 {
+            self.first = Element { pos: start_pos, len: elems[0].as_ref().len(), seq: base_seq };
+        }
+        self.last = last;
+        self.elem_cnt += elems.len();
+        if base_seq != 0 {
+            self.format.set_next_seq(base_seq + elems.len() as u64);
         }
 
-        let first_added = first_added.unwrap();
-        self.ring_write_buf(first_added.pos)?;
-
-        if was_empty {
-            self.first = first_added;
+        if !self.skip_write_header_on_add {
+            self.sync_header()?;
         }
-        self.last = last_added.unwrap();
-
-        self.write_header(self.file_len(), self.elem_cnt + count, self.first.pos, self.last.pos)?;
-        self.elem_cnt += count;
-
-        self.cache_last_offset_if_needed(count);
 
         Ok(())
     }
 
-    /// Adds an element to the end of the queue.
     #[inline]
     pub fn add(&mut self, buf: &[u8]) -> Result<()> {
         self.add_n(std::iter::once(buf))
     }
 
-    /// Reads the eldest element. Returns `OK(None)` if the queue is empty.
-    pub fn peek(&mut self) -> Result<Option<Box<[u8]>>> {
+    // ── peek ──────────────────────────────────────────────────────────────────
+
+    pub fn peek(&self) -> Result<Option<Vec<u8>>> {
         if self.is_empty() {
-            Ok(None)
-        } else {
-            let len = self.first.len;
-            let mut data = vec![0; len].into_boxed_slice();
-
-            self.ring_read(self.first.pos + Element::HEADER_LENGTH as u64, &mut data)?;
-
-            Ok(Some(data))
+            return Ok(None);
         }
+
+        let mut buf = vec![0; self.first.len];
+        self.read_payload(&self.first, &mut buf)?;
+        Ok(Some(buf))
     }
 
-    /// Removes the eldest element.
+    pub fn peek_into(&self, buf: &mut Vec<u8>) -> Result<bool> {
+        if self.is_empty() {
+            return Ok(false);
+        }
+
+        buf.resize(self.first.len, 0);
+        self.read_payload(&self.first, buf)?;
+        Ok(true)
+    }
+
+    /// Reads and validates the payload of `elem` into `buf`, which must be `elem.len` long.
+    fn read_payload(&self, elem: &Element, buf: &mut [u8]) -> Result<()> {
+        let ring = self.ring();
+        let payload_start = ring.add(elem.pos, self.elem_hdr_len());
+        ring.read_at(payload_start, buf)?;
+        self.format.validate_footer(&ring, payload_start, elem, buf)
+    }
+
+    // ── remove_n ─────────────────────────────────────────────────────────────
+
     #[inline]
     pub fn remove(&mut self) -> Result<()> {
         self.remove_n(1)
     }
 
-    /// Removes the eldest `n` elements.
     pub fn remove_n(&mut self, n: usize) -> Result<()> {
         if n == 0 || self.is_empty() {
             return Ok(());
@@ -651,169 +619,139 @@ impl QueueFile {
             return self.clear();
         }
 
-        debug_assert!(
-            self.cached_offsets
-                .iter()
-                .zip(self.cached_offsets.iter().skip(1))
-                .all(|(a, b)| a.0 < b.0),
-            "{:?}",
-            self.cached_offsets
-        );
+        #[cfg(debug_assertions)]
+        {
+            let offsets = self.cache.offsets.borrow();
+            debug_assert!(
+                offsets.iter().zip(offsets.iter().skip(1)).all(|(a, b)| a.0 < b.0),
+                "{:?}",
+                *offsets
+            );
+        }
 
-        let erase_start_pos = self.first.pos;
-        let mut erase_total_len = 0usize;
+        let old_first_pos = self.first.pos;
 
-        // Read the position and length of the new first element.
-        let mut new_first_pos = self.first.pos;
-        let mut new_first_len = self.first.len;
+        let new_first = self.skip_elements_from(n)?;
 
-        let cached_index = self.cached_index_up_to(n - 1);
-        let to_remove = if let Some(i) = cached_index {
-            let (index, elem) = self.cached_offsets[i];
-
-            if let Some(index) = index.checked_sub(1) {
-                erase_total_len += Element::HEADER_LENGTH * index;
-                erase_total_len += (elem.pos
-                    + if self.first.pos < elem.pos {
-                        0
-                    } else {
-                        self.file_len() - self.first.pos - self.header_len
-                    }) as usize;
-            }
-
-            new_first_pos = elem.pos;
-            new_first_len = elem.len;
-            n - index
+        let erase_total_len = if self.overwrite_on_remove {
+            self.ring().distance(old_first_pos, new_first.pos) as usize
         } else {
-            n
+            0
         };
 
-        for _ in 0..to_remove {
-            erase_total_len += Element::HEADER_LENGTH + new_first_len;
-            new_first_pos =
-                self.wrap_pos(new_first_pos + Element::HEADER_LENGTH as u64 + new_first_len as u64);
-
-            let mut buf: [u8; 4] = [0; 4];
-            self.ring_read(new_first_pos, &mut buf)?;
-            new_first_len = u32::from_be_bytes(buf) as usize;
-        }
-
-        // Commit the header.
-        self.write_header(self.file_len(), self.elem_cnt - n, new_first_pos, self.last.pos)?;
         self.elem_cnt -= n;
-        self.first = Element::new(new_first_pos, new_first_len)?;
+        self.first = new_first;
 
-        if let Some(cached_index) = cached_index {
-            self.cached_offsets.drain(..=cached_index);
-        }
-        self.cached_offsets.iter_mut().for_each(|(i, _)| *i -= n);
+        self.sync_header()?;
+
+        self.cache.drop_up_to(n);
 
         if self.overwrite_on_remove {
-            self.ring_erase(erase_start_pos, erase_total_len)?;
+            self.ring_mut().erase_at(old_first_pos, erase_total_len)?;
         }
 
         Ok(())
     }
 
-    /// Clears this queue. Truncates the file to the initial size.
-    pub fn clear(&mut self) -> Result<()> {
-        // Commit the header.
-        self.write_header(self.capacity, 0, 0, 0)?;
+    fn skip_elements_from(&self, n: usize) -> Result<Element> {
+        let (skipped, mut elem) = self.cache.cached_offset_up_to(n).unwrap_or((0, self.first));
 
-        if self.overwrite_on_remove {
-            self.inner.seek(self.header_len);
-            let first_block = self.capacity.min(Self::BLOCK_LENGTH) - self.header_len;
-            self.inner.write(&Self::ZEROES[..first_block as usize])?;
-
-            if let Some(left) = self.capacity.checked_sub(Self::BLOCK_LENGTH) {
-                for _ in 0..left / Self::BLOCK_LENGTH {
-                    self.inner.write(&Self::ZEROES)?;
-                }
-
-                let tail = left % Self::BLOCK_LENGTH;
-
-                if tail != 0 {
-                    self.inner.write(&Self::ZEROES[..tail as usize])?;
-                }
-            }
+        let ring = self.ring();
+        for _ in skipped..n {
+            let next_pos = ring.add(elem.pos, self.elem_span(elem.len));
+            elem = self.format.read_element(&ring, next_pos)?;
         }
 
-        self.cached_offsets.clear();
+        Ok(elem)
+    }
+
+    // ── clear ─────────────────────────────────────────────────────────────────
+
+    pub fn clear(&mut self) -> Result<()> {
+        let new_cap = self.capacity.max(self.data_start());
 
         self.elem_cnt = 0;
         self.first = Element::EMPTY;
         self.last = Element::EMPTY;
 
-        if self.file_len() > self.capacity {
-            self.inner.sync_set_len(self.capacity)?;
+        self.sync_header()?;
+
+        if self.overwrite_on_remove {
+            let ds = self.data_start();
+            let data_region_len = self.file_len().min(new_cap).saturating_sub(ds);
+            if data_region_len > 0 {
+                self.inner.with_deferred_sync(DeferredSyncPhase::ClearErase, |inner| {
+                    inner.write_zero_chunks(ds, data_region_len as usize)
+                })?;
+            }
+        }
+
+        self.cache.clear();
+
+        if self.file_len() > new_cap {
+            self.inner.sync_set_len(new_cap)?;
         }
 
         Ok(())
     }
 
-    /// Returns an iterator over elements in this queue.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use queue_file::QueueFile;
-    /// # let path = auto_delete_path::AutoDeletePath::temp();
-    /// let mut qf = QueueFile::open(path).expect("failed to open queue");
-    /// let items = vec![vec![1, 2], vec![], vec![3]];
-    /// qf.add_n(&items).expect("failed to add elements to queue");
-    ///
-    /// let stored = qf.iter().map(Vec::from).collect::<Vec<_>>();
-    /// assert_eq!(items, stored);
-    /// ```
-    pub fn iter(&mut self) -> Iter<'_> {
-        let pos = self.first.pos;
+    // ── iter ──────────────────────────────────────────────────────────────────
 
+    #[inline]
+    pub const fn iter(&self) -> Iter<'_> {
         Iter {
-            // We are using write buffer for reducing number of allocations.
-            // BorrowedIter doesn't modify any data and will return it back on drop.
-            buffer: std::mem::take(&mut self.write_buf),
+            buffer: Vec::new(),
             queue_file: self,
             next_elem_index: 0,
-            next_elem_pos: pos,
+            next_elem_pos: self.first.pos,
         }
     }
 
-    /// Returns the amount of bytes used by the backed file.
-    /// Always >= [`Self::used_bytes`].
+    // ── Metrics ───────────────────────────────────────────────────────────────
+
+    #[inline]
+    const fn ring(&self) -> DataRing<'_> {
+        DataRing::new(&self.inner, self.format.data_start())
+    }
+
+    #[inline]
+    fn ring_mut(&mut self) -> DataRingMut<'_> {
+        let data_start = self.format.data_start();
+        DataRingMut::new(&mut self.inner, data_start)
+    }
+
+    #[inline]
+    fn read_element_at(&self, logical_pos: u64) -> Result<Element> {
+        self.format.read_element(&self.ring(), logical_pos)
+    }
+
     #[inline]
     pub const fn file_len(&self) -> u64 {
         self.inner.file_len
     }
 
-    /// Returns the amount of bytes used by the queue.
     #[inline]
     pub const fn used_bytes(&self) -> u64 {
         if self.elem_cnt == 0 {
-            self.header_len
-        } else if self.last.pos >= self.first.pos {
-            // Contiguous queue.
-            (self.last.pos - self.first.pos)
-                + Element::HEADER_LENGTH as u64
-                + self.last.len as u64
-                + self.header_len
+            self.data_start()
         } else {
-            // tail < head. The queue wraps.
-            self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64 + self.file_len()
-                - self.first.pos
+            self.ring().distance(self.first.pos, self.last.pos)
+                + self.elem_span(self.last.len)
+                + self.data_start()
         }
     }
 
-    /// Returns underlying file of the queue.
-    pub fn into_inner_file(mut self) -> File {
+    pub fn into_inner_file(mut self) -> Result<File> {
         if self.skip_write_header_on_add {
-            let _ = self.sync_header();
+            self.sync_header()?;
         }
 
-        let file = unsafe { ManuallyDrop::take(&mut self.inner.file) };
-        std::mem::forget(self);
-
-        file
+        self.inner.file.take().ok_or_else(|| Error::Io {
+            source: io::Error::new(io::ErrorKind::BrokenPipe, "file handle already consumed"),
+        })
     }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
 
     #[inline]
     const fn remaining_bytes(&self) -> u64 {
@@ -821,181 +759,112 @@ impl QueueFile {
     }
 
     fn sync_header(&mut self) -> Result<()> {
-        self.write_header(self.file_len(), self.size(), self.first.pos, self.last.pos)
+        let metadata = QueueMetadata {
+            file_len: self.file_len(),
+            elem_cnt: self.elem_cnt,
+            first_pos: self.first.pos,
+            last_pos: self.last.pos,
+        };
+        self.format.commit_header(&mut self.inner, metadata)
     }
 
-    /// Writes header atomically. The arguments contain the updated values. The struct member fields
-    /// should not have changed yet. This only updates the state in the file. It's up to the caller
-    /// to update the class member variables *after* this call succeeds. Assumes segment writes are
-    /// atomic in the underlying file system.
-    fn write_header(
-        &mut self, file_len: u64, elem_cnt: usize, first_pos: u64, last_pos: u64,
-    ) -> Result<()> {
-        let mut header = [0; 32];
-        let mut header_buf = &mut header[..];
-
-        // Never allow write values that will render file unreadable by Java library.
-        if self.versioned {
-            ensure!(i64::try_from(file_len).is_ok(), CorruptedFileSnafu {
-                msg: "file length in header will exceed i64::MAX"
-            });
-            ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
-                msg: "element count in header will exceed i32::MAX"
-            });
-            ensure!(i64::try_from(first_pos).is_ok(), CorruptedFileSnafu {
-                msg: "first element position in header will exceed i64::MAX"
-            });
-            ensure!(i64::try_from(last_pos).is_ok(), CorruptedFileSnafu {
-                msg: "last element position in header will exceed i64::MAX"
-            });
-
-            header_buf.put_u32(Self::VERSIONED_HEADER);
-            header_buf.put_u64(file_len);
-            header_buf.put_i32(elem_cnt as i32);
-            header_buf.put_u64(first_pos);
-            header_buf.put_u64(last_pos);
-        } else {
-            ensure!(i32::try_from(file_len).is_ok(), CorruptedFileSnafu {
-                msg: "file length in header will exceed i32::MAX"
-            });
-            ensure!(i32::try_from(elem_cnt).is_ok(), CorruptedFileSnafu {
-                msg: "element count in header will exceed i32::MAX"
-            });
-            ensure!(i32::try_from(first_pos).is_ok(), CorruptedFileSnafu {
-                msg: "first element position in header will exceed i32::MAX"
-            });
-            ensure!(i32::try_from(last_pos).is_ok(), CorruptedFileSnafu {
-                msg: "last element position in header will exceed i32::MAX"
-            });
-
-            header_buf.put_i32(file_len as i32);
-            header_buf.put_i32(elem_cnt as i32);
-            header_buf.put_i32(first_pos as i32);
-            header_buf.put_i32(last_pos as i32);
-        }
-
-        self.inner.seek(0);
-        self.inner.write(&header.as_ref()[..self.header_len as usize])
-    }
-
-    fn read_element(&mut self, pos: u64) -> Result<Element> {
-        if pos == 0 {
-            Ok(Element::EMPTY)
-        } else {
-            let mut buf: [u8; 4] = [0; Element::HEADER_LENGTH];
-            self.ring_read(pos, &mut buf)?;
-
-            Element::new(pos, u32::from_be_bytes(buf) as usize)
-        }
-    }
-
-    /// Wraps the position if it exceeds the end of the file.
     #[inline]
-    const fn wrap_pos(&self, pos: u64) -> u64 {
-        if pos < self.file_len() { pos } else { self.header_len + pos - self.file_len() }
+    const fn elem_hdr_len(&self) -> u64 {
+        self.format.elem_hdr_len()
     }
 
-    /// Writes `n` bytes from buffer to position in file. Automatically wraps write if position is
-    /// past the end of the file or if buffer overlaps it.
-    fn ring_write_buf(&mut self, pos: u64) -> Result<()> {
-        let pos = self.wrap_pos(pos);
+    #[inline]
+    const fn elem_span(&self, payload_len: usize) -> u64 {
+        self.format.elem_span(payload_len)
+    }
 
-        if pos + self.write_buf.len() as u64 <= self.file_len() {
-            self.inner.seek(pos);
-            self.inner.write(&self.write_buf)
+    fn compute_expanded_len(current_len: u64, mut remaining_bytes: u64, data_len: u64) -> u64 {
+        let mut prev_len = current_len;
+        let mut new_len = current_len;
+        while remaining_bytes < data_len {
+            remaining_bytes = remaining_bytes.saturating_add(prev_len);
+            new_len = prev_len.checked_shl(1).unwrap_or(u64::MAX);
+            prev_len = new_len;
+        }
+        new_len
+    }
+
+    fn compute_expansion_plan(&self, data_len: u64) -> Option<ExpansionPlan> {
+        let rem_bytes = self.remaining_bytes();
+        if rem_bytes >= data_len {
+            return None;
+        }
+
+        let orig_file_len = self.file_len();
+        let (end_of_last_elem, wraps) = self.calculate_tail_metrics();
+        let moved_count = if wraps { end_of_last_elem } else { 0 };
+
+        Some(ExpansionPlan {
+            orig_file_len,
+            new_len: Self::compute_expanded_len(orig_file_len, rem_bytes, data_len),
+            end_of_last_elem: self.data_start() + end_of_last_elem,
+            wraps,
+            moved_count,
+        })
+    }
+
+    const fn calculate_tail_metrics(&self) -> (u64, bool) {
+        if self.elem_cnt > 0 {
+            let ring = self.ring();
+            let end = ring.add(self.last.pos, self.format.elem_span(self.last.len));
+            (end, end <= self.first.pos)
         } else {
-            let before_eof = (self.file_len() - pos) as usize;
-
-            self.inner.seek(pos);
-            self.inner.write(&self.write_buf[..before_eof])?;
-            self.inner.seek(self.header_len);
-            self.inner.write(&self.write_buf[before_eof..])
+            (0, false)
         }
     }
 
-    fn ring_erase(&mut self, pos: u64, n: usize) -> Result<()> {
-        let mut pos = pos;
-        let mut len = n;
+    fn relocate_wrapped_data(&mut self, plan: ExpansionPlan) -> Result<()> {
+        if !plan.wraps {
+            return Ok(());
+        }
 
-        self.write_buf.clear();
-        self.write_buf.extend(Self::ZEROES);
+        self.ring_mut().relocate(plan.orig_file_len, plan.moved_count)?;
 
-        while len > 0 {
-            let chunk_len = min(len, Self::ZEROES.len());
-            self.write_buf.truncate(chunk_len);
+        let first = self.first;
+        let last = self.last;
+        let elem_cnt = self.elem_cnt;
+        let format = self.format;
 
-            self.ring_write_buf(pos)?;
+        if let Some(new_last_pos) =
+            format.on_expansion(&mut self.ring_mut(), &plan, first, last, elem_cnt)?
+        {
+            self.last = Element { pos: new_last_pos, len: self.last.len, seq: self.last.seq };
 
-            len -= chunk_len;
-            pos += chunk_len as u64;
+            maybe_inject_failpoint("v2_before_relocation_commit")?;
+
+            if self.overwrite_on_remove {
+                self.sync_header()?;
+                maybe_inject_failpoint("v2_after_relocation_commit_before_erase")?;
+            }
         }
 
         Ok(())
     }
 
-    /// Reads `n` bytes into buffer from file. Wraps if necessary.
-    fn ring_read(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
-        let pos = self.wrap_pos(pos);
-
-        if pos + buf.len() as u64 <= self.file_len() {
-            self.inner.seek(pos);
-            self.inner.read(buf)
-        } else {
-            let before_eof = (self.file_len() - pos) as usize;
-
-            self.inner.seek(pos);
-            self.inner.read(&mut buf[..before_eof])?;
-            self.inner.seek(self.header_len);
-            self.inner.read(&mut buf[before_eof..])
+    fn cleanup_after_expansion(&mut self, plan: ExpansionPlan) -> Result<()> {
+        if self.overwrite_on_remove {
+            self.ring_mut().erase_at(0, plan.moved_count as usize)?;
+            self.format.on_expansion_cleanup(&plan)?;
         }
+
+        Ok(())
     }
 
-    /// If necessary, expands the file to accommodate an additional element of the given length.
     fn expand_if_necessary(&mut self, data_len: u64) -> Result<()> {
-        let mut rem_bytes = self.remaining_bytes();
-
-        if rem_bytes >= data_len {
+        let Some(plan) = self.compute_expansion_plan(data_len) else {
             return Ok(());
-        }
-
-        let orig_file_len = self.file_len();
-        let mut prev_len = orig_file_len;
-        let mut new_len = prev_len;
-
-        while rem_bytes < data_len {
-            rem_bytes += prev_len;
-            new_len = prev_len << 1;
-            prev_len = new_len;
-        }
+        };
 
         let bytes_used_before = self.used_bytes();
-
-        // Calculate the position of the tail end of the data in the ring buffer
-        let end_of_last_elem =
-            self.wrap_pos(self.last.pos + Element::HEADER_LENGTH as u64 + self.last.len as u64);
-        self.inner.sync_set_len(new_len)?;
-
-        let mut count = 0u64;
-
-        // If the buffer is split, we need to make it contiguous
-        if end_of_last_elem <= self.first.pos {
-            count = end_of_last_elem - self.header_len;
-
-            self.inner.transfer(self.header_len, orig_file_len, count)?;
-        }
-
-        // Commit the expansion.
-        if self.last.pos < self.first.pos {
-            let new_last_pos = orig_file_len + self.last.pos - self.header_len;
-            self.last = Element::new(new_last_pos, self.last.len)?;
-        }
-
-        // TODO: cached offsets might be recalculated after transfer
-        self.cached_offsets.clear();
-
-        if self.overwrite_on_remove {
-            self.ring_erase(self.header_len, count as usize)?;
-        }
+        self.inner.sync_set_len(plan.new_len)?;
+        self.relocate_wrapped_data(plan)?;
+        self.cache.clear();
+        self.cleanup_after_expansion(plan)?;
 
         let bytes_used_after = self.used_bytes();
         debug_assert_eq!(bytes_used_before, bytes_used_after);
@@ -1004,270 +873,53 @@ impl QueueFile {
     }
 }
 
-// I/O Helpers
-impl QueueFileInner {
-    const TRANSFER_BUFFER_SIZE: usize = 128 * 1024;
+impl<'a> IntoIterator for &'a QueueFile {
+    type IntoIter = Iter<'a>;
+    type Item = Vec<u8>;
 
-    #[inline]
-    fn seek(&mut self, pos: u64) -> u64 {
-        self.expected_seek = pos;
-
-        pos
-    }
-
-    fn real_seek(&mut self) -> io::Result<u64> {
-        if Some(self.expected_seek) == self.last_seek {
-            return Ok(self.expected_seek);
-        }
-
-        let res = self.file.seek(SeekFrom::Start(self.expected_seek));
-        self.last_seek = res.as_ref().ok().copied();
-
-        res
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        if buf.is_empty() {
-            return Ok(());
-        }
-
-        let size = buf.len();
-
-        let not_enough_data = if let Some(left) = self.read_buffer.len().checked_sub(size) {
-            self.read_buffer_offset
-                .and_then(|o| self.expected_seek.checked_sub(o))
-                .and_then(|skip| left.checked_sub(skip as usize))
-                .is_none()
-        } else {
-            self.read_buffer.resize(size, 0);
-
-            true
-        };
-
-        if not_enough_data {
-            use std::io::{Error, ErrorKind};
-
-            self.real_seek()?;
-
-            let mut read = 0;
-            let mut res = Ok(());
-
-            while !buf.is_empty() {
-                match self.file.read(&mut self.read_buffer[read..]) {
-                    Ok(0) => break,
-                    Ok(n) => read += n,
-                    Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
-                    Err(e) => {
-                        res = Err(e);
-                        break;
-                    }
-                }
-            }
-
-            if res.is_ok() && read < size {
-                res = Err(Error::new(ErrorKind::UnexpectedEof, "failed to fill whole buffer"));
-            }
-
-            if let Err(err) = res {
-                self.read_buffer_offset = None;
-                self.last_seek = None;
-
-                return Err(err);
-            }
-
-            self.read_buffer_offset = Some(self.expected_seek);
-
-            if let Some(seek) = &mut self.last_seek {
-                *seek += read as u64;
-            }
-        }
-
-        let start = (self.expected_seek - self.read_buffer_offset.unwrap()) as usize;
-
-        buf.copy_from_slice(&self.read_buffer[start..start + size]);
-
-        Ok(())
-    }
-
-    fn write(&mut self, buf: &[u8]) -> Result<()> {
-        self.real_seek()?;
-
-        self.file.write_all(buf)?;
-
-        if let Some(seek) = &mut self.last_seek {
-            *seek += buf.len() as u64;
-        }
-
-        if let Some(read_buffer_offset) = self.read_buffer_offset {
-            let write_size_u64 = buf.len() as u64;
-            let read_buffer_end_offset = read_buffer_offset + self.read_buffer.len() as u64;
-            let read_buffered = read_buffer_offset..read_buffer_end_offset;
-
-            let has_start = read_buffered.contains(&self.expected_seek);
-            let buf_end = self.expected_seek + write_size_u64;
-            let has_end = read_buffered.contains(&buf_end);
-
-            match (has_start, has_end) {
-                // rd_buf_offset .. exp_seek .. exp_seek+buf.len .. rd_buf_end
-                // need to copy whole write buffer
-                (true, true) => {
-                    let start = (self.expected_seek - read_buffer_offset) as usize;
-
-                    self.read_buffer[start..start + buf.len()].copy_from_slice(buf);
-                }
-                // exp_seek .. rd_buf_offset .. exp_seek+buf.len .. rd_buf_end
-                // need to copy only a tail of write buffer
-                (false, true) => {
-                    let need_to_skip = (read_buffer_offset - self.expected_seek) as usize;
-                    let need_to_copy = buf.len() - need_to_skip;
-
-                    self.read_buffer[..need_to_copy].copy_from_slice(&buf[need_to_skip..]);
-                }
-                // rd_buf_offset .. exp_seek .. rd_buf_end .. exp_seek+buf.len
-                // need to copy only a head of write buffer
-                (true, false) => {
-                    let need_to_skip = (self.expected_seek - read_buffer_offset) as usize;
-                    let need_to_copy = self.read_buffer.len() - need_to_skip;
-
-                    self.read_buffer[need_to_skip..need_to_skip + need_to_copy]
-                        .copy_from_slice(&buf[..need_to_copy]);
-                }
-                // exp_seek .. rd_buf_offset .. rd_buf_end .. exp_seek+buf.len
-                // read buffer is inside writing range, need to rewrite it completely
-                (false, false)
-                    if (self.expected_seek + 1..buf_end).contains(&read_buffer_offset) =>
-                {
-                    let need_to_skip = (read_buffer_offset - self.expected_seek) as usize;
-                    let need_to_copy = self.read_buffer.len();
-
-                    self.read_buffer[..]
-                        .copy_from_slice(&buf[need_to_skip..need_to_skip + need_to_copy]);
-                }
-                // nothing to do, read & write buffers do not overlap
-                (false, false) => {}
-            }
-        }
-
-        if self.sync_writes {
-            self.file.sync_data()?;
-        }
-
-        Ok(())
-    }
-
-    fn transfer_inner(
-        &mut self, buf: &mut [u8], mut read_pos: u64, mut write_pos: u64, count: u64,
-    ) -> Result<()> {
-        debug_assert!(read_pos < self.file_len);
-        debug_assert!(write_pos <= self.file_len);
-        debug_assert!(count < self.file_len);
-        debug_assert!(i64::try_from(count).is_ok());
-
-        let mut bytes_left = count as i64;
-
-        while bytes_left > 0 {
-            self.seek(read_pos);
-            let bytes_to_read = min(bytes_left as usize, Self::TRANSFER_BUFFER_SIZE);
-            self.read(&mut buf[..bytes_to_read])?;
-
-            self.seek(write_pos);
-            self.write(&buf[..bytes_to_read])?;
-
-            read_pos += bytes_to_read as u64;
-            write_pos += bytes_to_read as u64;
-            bytes_left -= bytes_to_read as i64;
-        }
-
-        // Should we `sync_data()` in internal loop instead?
-        if self.sync_writes {
-            self.file.sync_data()?;
-        }
-
-        Ok(())
-    }
-
-    /// Transfer `count` bytes starting from `read_pos` to `write_pos`.
-    fn transfer(&mut self, read_pos: u64, write_pos: u64, count: u64) -> Result<()> {
-        let mut buf = self.transfer_buf.take().unwrap();
-        let res = self.transfer_inner(&mut buf, read_pos, write_pos, count);
-        self.transfer_buf = Some(buf);
-
-        res
-    }
-
-    fn sync_set_len(&mut self, new_len: u64) -> io::Result<()> {
-        self.file.set_len(new_len)?;
-        self.file_len = new_len;
-        self.file.sync_all()
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-struct Element {
-    pos: u64,
-    len: usize,
-}
-
-impl Element {
-    const EMPTY: Self = Self { pos: 0, len: 0 };
-    const HEADER_LENGTH: usize = 4;
-
-    #[inline]
-    fn new(pos: u64, len: usize) -> Result<Self> {
-        ensure!(i64::try_from(pos).is_ok(), CorruptedFileSnafu {
-            msg: "element position must be less or equal to i64::MAX"
-        });
-        ensure!(i32::try_from(len).is_ok(), ElementTooBigSnafu);
-
-        Ok(Self { pos, len })
-    }
-}
-
-/// Iterator over items in the queue.
+/// An iterator that yields the elements of a [`QueueFile`] from head to tail.
 #[derive(Debug)]
 pub struct Iter<'a> {
-    queue_file: &'a mut QueueFile,
+    queue_file: &'a QueueFile,
     buffer: Vec<u8>,
     next_elem_index: usize,
     next_elem_pos: u64,
 }
 
-impl<'a> Iterator for Iter<'a> {
-    type Item = Box<[u8]>;
+impl Iterator for Iter<'_> {
+    type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let buffer = self.borrowed_next()?;
-
-        Some(buffer.to_vec().into_boxed_slice())
+        let current = self.current_element()?;
+        let mut buf = vec![0; current.len];
+        self.queue_file.read_payload(&current, &mut buf).ok()?;
+        self.advance(current);
+        Some(buf)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let elems_left = self.queue_file.elem_cnt - self.next_elem_index;
-
         (elems_left, Some(elems_left))
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        if self.queue_file.elem_cnt - self.next_elem_index < n {
-            self.next_elem_index = self.queue_file.elem_cnt;
+        let target_idx = self.next_elem_index.checked_add(n)?;
 
+        if target_idx >= self.queue_file.elem_cnt {
+            self.next_elem_index = self.queue_file.elem_cnt;
             return None;
         }
 
-        let left = if let Some(i) = self.queue_file.cached_index_up_to(n) {
-            let (index, elem) = self.queue_file.cached_offsets[i];
-            if index > self.next_elem_index {
-                self.next_elem_index = index;
-                self.next_elem_pos = elem.pos;
-            }
+        self.jump_to_cache_if_closer(target_idx);
 
-            n - self.next_elem_index
-        } else {
-            n
-        };
-
-        for _ in 0..left {
-            self.borrowed_next();
+        while self.next_elem_index < target_idx {
+            let current = self.current_element()?;
+            self.advance(current);
         }
 
         self.next()
@@ -1275,35 +927,167 @@ impl<'a> Iterator for Iter<'a> {
 }
 
 impl Iter<'_> {
-    /// Returns the next element in the queue.
-    /// Similar to `Iter::next` but returned value bounded to internal buffer,
-    /// i.e not allocated at each call.
-    pub fn borrowed_next(&mut self) -> Option<&[u8]> {
+    fn jump_to_cache_if_closer(&mut self, target_idx: usize) {
+        if let Some((index, elem)) = self.queue_file.cache.cached_offset_up_to(target_idx) {
+            if index > self.next_elem_index {
+                self.next_elem_index = index;
+                self.next_elem_pos = elem.pos;
+            }
+        }
+    }
+
+    /// Reads the header of the element under the cursor without advancing.
+    fn current_element(&self) -> Option<Element> {
         if self.next_elem_index >= self.queue_file.elem_cnt {
             return None;
         }
 
-        let current = self.queue_file.read_element(self.next_elem_pos).ok()?;
-        self.next_elem_pos = self.queue_file.wrap_pos(current.pos + Element::HEADER_LENGTH as u64);
+        let current = self.queue_file.read_element_at(self.next_elem_pos).ok()?;
+        (current.len as u64 <= self.queue_file.ring().capacity()).then_some(current)
+    }
+
+    /// Moves the cursor past `current`, caching its position if the policy asks for it.
+    fn advance(&mut self, current: Element) {
+        let queue_file = self.queue_file;
+        queue_file.cache.cache_elem_if_needed(
+            self.next_elem_index,
+            current,
+            queue_file.elem_cnt,
+            1,
+        );
+        self.next_elem_pos = queue_file.ring().add(current.pos, queue_file.elem_span(current.len));
+        self.next_elem_index += 1;
+    }
+
+    pub fn borrowed_next(&mut self) -> Option<&[u8]> {
+        let current = self.current_element()?;
 
         if current.len > self.buffer.len() {
             self.buffer.resize(current.len, 0);
         }
-        self.queue_file.ring_read(self.next_elem_pos, &mut self.buffer[..current.len]).ok()?;
-
-        self.next_elem_pos = self
-            .queue_file
-            .wrap_pos(current.pos + Element::HEADER_LENGTH as u64 + current.len as u64);
-
-        self.queue_file.cache_elem_if_needed(self.next_elem_index, current, 1);
-        self.next_elem_index += 1;
+        self.queue_file.read_payload(&current, &mut self.buffer[..current.len]).ok()?;
+        self.advance(current);
 
         Some(&self.buffer[..current.len])
     }
 }
 
-impl Drop for Iter<'_> {
-    fn drop(&mut self) {
-        self.queue_file.write_buf = std::mem::take(&mut self.buffer);
+#[cfg(test)]
+mod tests {
+    use std::fs::OpenOptions;
+
+    use super::*;
+
+    fn create_inner(len: u64) -> (QueueFileInner, auto_delete_path::AutoDeletePath) {
+        let p = auto_delete_path::AutoDeletePath::temp();
+        let file =
+            OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&p).unwrap();
+        file.set_len(len).unwrap();
+        (
+            QueueFileInner {
+                file: Some(file),
+                file_len: len,
+                expected_seek: 0,
+                last_seek: None,
+                transfer_buf: vec![0u8; 1024].into_boxed_slice(),
+                sync_writes: false,
+                deferred_sync_phase: None,
+            },
+            p,
+        )
+    }
+
+    #[test]
+    fn test_data_ring_addressing() {
+        let (inner, _p) = create_inner(100);
+        let ring = DataRing::new(&inner, 20);
+
+        assert_eq!(ring.capacity(), 80);
+        assert_eq!(ring.phys_pos(0), 20);
+        assert_eq!(ring.phys_pos(79), 99);
+        assert_eq!(ring.phys_pos(80), 20);
+        assert_eq!(ring.phys_pos(160), 20);
+
+        assert_eq!(ring.add(10, 20), 30);
+        assert_eq!(ring.add(70, 20), 10);
+
+        assert_eq!(ring.distance(10, 30), 20);
+        assert_eq!(ring.distance(70, 10), 20);
+    }
+
+    #[test]
+    fn test_data_ring_io() {
+        let (mut inner, _p) = create_inner(100);
+        let mut ring_mut = DataRingMut::new(&mut inner, 20);
+
+        let data = b"hello world";
+        ring_mut.write_at(10, data).unwrap();
+        let mut buf = [0u8; 11];
+        ring_mut.as_read_only().read_at(10, &mut buf).unwrap();
+        assert_eq!(&buf, data);
+
+        let data2 = b"wrapmebase";
+        ring_mut.write_at(75, data2).unwrap();
+        let mut buf2 = [0u8; 10];
+        ring_mut.as_read_only().read_at(75, &mut buf2).unwrap();
+        assert_eq!(&buf2, data2);
+
+        let mut phys_buf = [0u8; 5];
+        ring_mut.inner.read_exact_at(95, &mut phys_buf).unwrap();
+        assert_eq!(&phys_buf, b"wrapm");
+        ring_mut.inner.read_exact_at(20, &mut phys_buf).unwrap();
+        assert_eq!(&phys_buf, b"ebase");
+    }
+
+    #[test]
+    fn remove_n_reindexes_cached_offsets_without_dropping_survivors() {
+        let path = auto_delete_path::AutoDeletePath::temp();
+        let mut qf = QueueFile::with_capacity(&path, 4096).unwrap();
+        qf.set_cache_offset_policy(Some(OffsetCacheKind::Linear { offset: 1 }));
+
+        for i in 0u8..8 {
+            qf.add(&[i]).unwrap();
+        }
+
+        assert_eq!(
+            qf.cache.offsets.borrow().iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            (1..8).collect::<Vec<_>>()
+        );
+
+        qf.remove_n(3).unwrap();
+
+        assert_eq!(
+            qf.cache.offsets.borrow().iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6, 7]
+        );
+        assert_eq!(qf.iter().map(|v| v[0]).collect::<Vec<_>>(), vec![3, 4, 5, 6, 7]);
+        assert_eq!(qf.iter().nth(2).map(|v| v[0]), Some(5));
+    }
+
+    #[test]
+    fn cache_respects_max_size() {
+        let path = auto_delete_path::AutoDeletePath::temp();
+        let mut qf = QueueFile::with_capacity(&path, 1024 * 1024).unwrap();
+        qf.set_cache_offset_policy(Some(OffsetCacheKind::Linear { offset: 1 }));
+
+        // MAX_CACHE_SIZE is 4096.
+        // We add more than 4096 elements.
+        for i in 0u32..5000 {
+            qf.add(&i.to_le_bytes()).unwrap();
+        }
+
+        let cache_size = qf.cache.offsets.borrow().len();
+        assert!(cache_size <= 4096);
+        assert_eq!(cache_size, 4096);
+
+        // The first elements should have been dropped from the cache.
+        // The first cached absolute index should be 5000 - 4096 = 904.
+        // Wait, index 0 is not cached. index 1 is the first one cached.
+        // So 5000 items -> indices 0..5000.
+        // Cached indices: 1, 2, ..., 4999 (total 4999).
+        // After 4096 limit, we should have the last 4096.
+        // That is 4999, 4998, ..., 4999 - 4095 = 904.
+        assert_eq!(qf.cache.offsets.borrow().front().unwrap().0, 904);
+        assert_eq!(qf.cache.offsets.borrow().back().unwrap().0, 4999);
     }
 }
